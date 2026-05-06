@@ -1,0 +1,35 @@
+services:
+  cloud-api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      OZON_SUITE_BIND: 0.0.0.0:8080
+      DATABASE_URL: postgres://ozon:${POSTGRES_PASSWORD:?set-postgres-password}@postgres:5432/ozon_rust_suite
+      OZON_SUITE_JWT_SECRET: ${OZON_SUITE_JWT_SECRET:?set-a-long-secret}
+      OZON_SUITE_ADMIN_TOKEN: ${OZON_SUITE_ADMIN_TOKEN:?set-admin-token}
+      OZON_SUITE_PORTAL_DOWNLOAD_URL: ${OZON_SUITE_PORTAL_DOWNLOAD_URL:-https://downloads.example.com/ozon-local-node.msi}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: ozon_rust_suite
+      POSTGRES_USER: ozon
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set-postgres-password}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ozon -d ozon_rust_suite"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

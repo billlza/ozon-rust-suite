@@ -1,0 +1,18 @@
+{
+  "name": "ozon-rust-suite",
+  "private": true,
+  "packageManager": "pnpm@10.24.0",
+  "scripts": {
+    "dev:nebula": "cargo run -p ozon-nebula-dev-issuer",
+    "dev:portal": "pnpm --dir apps/web-portal dev",
+    "dev:admin": "pnpm --dir apps/web-admin dev",
+    "dev:local-ui": "pnpm --dir apps/local-node dev",
+    "dev:cloud-api": "DATABASE_URL=${DATABASE_URL:-postgres://ozon:ozon@127.0.0.1:55432/ozon_rust_suite} OZON_SUITE_SKYBRIDGE_API_BASE_URL=${OZON_SUITE_SKYBRIDGE_API_BASE_URL:-http://127.0.0.1:8788} cargo run -p ozon-cloud-api",
+    "dev:local-node": "OZON_CONNECTOR_MODE=${OZON_CONNECTOR_MODE:-mock} OZON_LOCAL_TOKEN=${OZON_LOCAL_TOKEN:-dev-local-token} OZON_OPENCLAW_TOKEN=${OZON_OPENCLAW_TOKEN:-dev-openclaw-token} cargo run -p ozon-local-node",
+    "dev:local-node:real": "OZON_CONNECTOR_MODE=real cargo run -p ozon-local-node",
+    "dev:local-demo": "pnpm dev:local-node & pnpm dev:local-ui",
+    "build:web": "pnpm --dir apps/web-portal build && pnpm --dir apps/web-admin build && pnpm --dir apps/local-node build",
+    "test:rust": "cargo test --workspace",
+    "fmt": "cargo fmt --all"
+  }
+}

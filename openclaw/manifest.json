@@ -1,0 +1,58 @@
+{
+  "name": "ozon-rust-suite-local",
+  "version": "0.1.0",
+  "base_url": "http://127.0.0.1:8790",
+  "auth": {
+    "type": "header",
+    "header": "x-openclaw-token",
+    "value_source": "operator_configured_bridge_secret"
+  },
+  "tools": [
+    {
+      "name": "ozon.products.count",
+      "method": "POST",
+      "path": "/tools/ozon.products.count",
+      "risk": "read_only",
+      "approval_required": false,
+      "description": "Count products through the configured connector; real mode uses saved Ozon Seller API credentials."
+    },
+    {
+      "name": "ozon.products.list",
+      "method": "POST",
+      "path": "/tools/ozon.products.list",
+      "risk": "read_only",
+      "approval_required": false,
+      "description": "List product summaries with a bounded limit; real mode returns official Ozon Seller API data."
+    },
+    {
+      "name": "tasks.dry_run",
+      "method": "POST",
+      "path": "/tasks/dry-run",
+      "risk": "proposal_only",
+      "approval_required": true
+    },
+    {
+      "name": "tasks.get",
+      "method": "GET",
+      "path": "/tasks/{task_id}",
+      "risk": "read_only",
+      "approval_required": false
+    },
+    {
+      "name": "schedules.ecommerce_read.propose",
+      "method": "POST",
+      "path": "/schedules/ecommerce-read/propose",
+      "risk": "proposal_only",
+      "approval_required": true
+    }
+  ],
+  "safety_rules": [
+    "OpenClaw can propose tasks but cannot approve or execute write tasks.",
+    "Every write operation is dry-run first and must be approved in the local UI.",
+    "The mock executor never sends real Ozon write requests.",
+    "The local skill API must bind to 127.0.0.1 and require x-openclaw-token for bridge calls.",
+    "Operator-only actions require x-local-token and are not exposed as OpenClaw tools.",
+    "OpenClaw may propose a read-only schedule, but cannot enable, disable, or run it.",
+    "Scheduled e-commerce reads use official Ozon seller APIs only; no captcha bypass, anti-bot bypass, or live 1688 scraping."
+  ]
+}

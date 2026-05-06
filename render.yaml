@@ -1,0 +1,45 @@
+services:
+  - type: web
+    name: ozon66-cloud-api
+    runtime: docker
+    plan: free
+    region: singapore
+    branch: main
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: OZON_SUITE_BIND
+        value: 0.0.0.0:10000
+      - key: OZON_SUITE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ozon66-postgres
+          property: connectionString
+      - key: OZON_SUITE_CORS_ALLOWED_ORIGINS
+        value: https://ozon66.com,https://www.ozon66.com
+      - key: OZON_SUITE_JWT_SECRET
+        generateValue: true
+      - key: OZON_SUITE_ADMIN_TOKEN
+        generateValue: true
+      - key: OZON_SUITE_SKYBRIDGE_API_BASE_URL
+        value: https://hloqytmhjludmuhwyyzb.supabase.co/functions/v1
+      - key: OZON_SUITE_PORTAL_DOWNLOAD_URL
+        value: https://ozon66.com/downloads/ozon-local-node.msi
+      - key: OZON_SUITE_ALLOW_LOCAL_NEBULA_REGISTRATION
+        value: "false"
+      - key: RUST_LOG
+        value: ozon_cloud_api=info,tower_http=info,axum=info
+
+databases:
+  - name: ozon66-postgres
+    databaseName: ozon_rust_suite
+    user: ozon
+    plan: free
+    region: singapore
+    postgresMajorVersion: "16"
+    ipAllowList: []

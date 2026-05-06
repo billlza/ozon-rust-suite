@@ -1,0 +1,25 @@
+[package]
+name = "ozon-local-node"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-stream.workspace = true
+axum.workspace = true
+chrono.workspace = true
+futures-core.workspace = true
+ozon-connector = { path = "../../crates/ozon-connector" }
+ozon-domain = { path = "../../crates/domain" }
+ozon-secret-store = { path = "../../crates/secret-store" }
+ozon-task-engine = { path = "../../crates/task-engine" }
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

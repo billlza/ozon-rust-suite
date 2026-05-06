@@ -1,0 +1,7 @@
+{
+  "operation": "ozon_update_price_mock",
+  "source": "open_claw",
+  "shop_id": "default-shop",
+  "risk": "high",
+  "idempotency_key": "openclaw-demo-price-001"
+}
