@@ -1,0 +1,15 @@
+target/
+node_modules/
+dist/
+.git/
+.codex-run/
+.playwright-cli/
+output/
+*.tsbuildinfo
+.DS_Store
+.env
+.env.*
+*.log
+*.sqlite
+*.sqlite3
+apps/local-node/src-tauri/target/

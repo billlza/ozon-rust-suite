@@ -13,7 +13,6 @@ base64.workspace = true
 chrono.workspace = true
 jsonwebtoken.workspace = true
 ozon-domain = { path = "../../crates/domain" }
-ozon-secret-store = { path = "../../crates/secret-store" }
 rand.workspace = true
 rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest.workspace = true
