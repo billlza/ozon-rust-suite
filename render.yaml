@@ -29,7 +29,15 @@ services:
       - key: OZON_SUITE_SKYBRIDGE_API_BASE_URL
         value: https://hloqytmhjludmuhwyyzb.supabase.co/functions/v1
       - key: OZON_SUITE_PORTAL_DOWNLOAD_URL
-        value: https://ozon66.com/downloads/ozon-local-node.msi
+        value: https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/OzonRustLocal-x64.msi
+      - key: OZON_SUITE_PORTAL_DOWNLOAD_MSI_URL
+        value: https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/OzonRustLocal-x64.msi
+      - key: OZON_SUITE_PORTAL_DOWNLOAD_EXE_URL
+        value: https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/OzonRustLocalSetup-x64.exe
+      - key: OZON_SUITE_OPENCLAW_PLUGIN_URL
+        value: https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/openclaw-plugin.zip
+      - key: OZON_SUITE_OPENCLAW_MANIFEST_URL
+        value: https://ozon66.com/openclaw/manifest.json
       - key: OZON_SUITE_ALLOW_LOCAL_NEBULA_REGISTRATION
         value: "false"
       - key: RUST_LOG

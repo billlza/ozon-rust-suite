@@ -13,3 +13,4 @@ output/
 *.sqlite
 *.sqlite3
 apps/local-node/src-tauri/target/
+apps/local-node/src-tauri/binaries/ozon-local-node-*

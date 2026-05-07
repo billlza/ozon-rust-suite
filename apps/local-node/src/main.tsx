@@ -20,9 +20,19 @@ import {
 } from "lucide-react";
 import "./styles.css";
 
-const LOCAL_API = import.meta.env.VITE_LOCAL_SKILL_API ?? "http://127.0.0.1:8790";
-const AGENT_API = import.meta.env.VITE_LOCAL_AGENT_API ?? "http://127.0.0.1:17870";
-const LOCAL_TOKEN = import.meta.env.VITE_LOCAL_TOKEN ?? "dev-local-token";
+const DEFAULT_LOCAL_API = import.meta.env.VITE_LOCAL_SKILL_API ?? "http://127.0.0.1:8790";
+const DEFAULT_AGENT_API = import.meta.env.VITE_LOCAL_AGENT_API ?? "http://127.0.0.1:17870";
+const DEFAULT_LOCAL_TOKEN = import.meta.env.VITE_LOCAL_TOKEN ?? "dev-local-token";
+const DEFAULT_OPENCLAW_TOKEN = import.meta.env.VITE_OPENCLAW_TOKEN ?? "dev-openclaw-token";
+
+type RuntimeConfig = {
+  skill_api: string;
+  agent_api: string;
+  local_token: string;
+  openclaw_token: string;
+  connector_mode: "mock" | "real" | string;
+  sidecar_pid: number | null;
+};
 
 type Health = {
   service: string;
@@ -141,6 +151,8 @@ type ScheduleStatus = {
 };
 
 function App() {
+  const [runtime, setRuntime] = useState<RuntimeConfig>(() => defaultRuntimeConfig());
+  const [runtimeReady, setRuntimeReady] = useState(false);
   const [health, setHealth] = useState<Health | null>(null);
   const [manifest, setManifest] = useState<Manifest | null>(null);
   const [configStatus, setConfigStatus] = useState<ConfigStatus | null>(null);
@@ -166,11 +178,11 @@ function App() {
   }, [tasks]);
 
   async function api(path: string, init: RequestInit = {}) {
-    return fetch(`${LOCAL_API}${path}`, {
+    return fetch(`${runtime.skill_api}${path}`, {
       ...init,
       headers: {
         "Content-Type": "application/json",
-        "x-local-token": LOCAL_TOKEN,
+        "x-local-token": runtime.local_token,
         ...(init.headers ?? {})
       }
     });
@@ -195,8 +207,8 @@ function App() {
   async function checkHealth() {
     try {
       const [healthResponse, manifestResponse, configResponse] = await Promise.all([
-        fetch(`${LOCAL_API}/health`),
-        fetch(`${LOCAL_API}/openclaw/manifest`),
+        fetch(`${runtime.skill_api}/health`),
+        fetch(`${runtime.skill_api}/openclaw/manifest`),
         api("/config/status")
       ]);
       setHealth(healthResponse.ok ? await healthResponse.json() : null);
@@ -328,19 +340,41 @@ function App() {
   }
 
   async function copyManifest() {
-    await navigator.clipboard.writeText(`${LOCAL_API}/openclaw/manifest`);
+    await navigator.clipboard.writeText(`${runtime.skill_api}/openclaw/manifest`);
     setMessage("OpenClaw manifest URL 已复制");
   }
 
+  async function copyOpenClawToken() {
+    await navigator.clipboard.writeText(runtime.openclaw_token);
+    setMessage("OpenClaw bridge token 已复制");
+  }
+
   useEffect(() => {
+    let cancelled = false;
+    loadRuntimeConfig().then((nextRuntime) => {
+      if (!cancelled) {
+        setRuntime(nextRuntime);
+        setRuntimeReady(true);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!runtimeReady) {
+      return;
+    }
+
     checkHealth();
     refresh();
     let cancelled = false;
 
     async function connectEvents() {
       try {
-        const response = await fetch(`${AGENT_API}/events`, {
-          headers: { "x-local-token": LOCAL_TOKEN }
+        const response = await fetch(`${runtime.agent_api}/events`, {
+          headers: { "x-local-token": runtime.local_token }
         });
         if (!response.ok || !response.body) {
           setEventState("offline");
@@ -366,7 +400,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [runtimeReady, runtime.skill_api, runtime.agent_api, runtime.local_token]);
 
   return (
     <main>
@@ -382,7 +416,7 @@ function App() {
         <div>
           <Activity />
           <span>Skill API</span>
-          <strong>{LOCAL_API.replace("http://", "")}</strong>
+          <strong>{runtime.skill_api.replace("http://", "")}</strong>
         </div>
         <div>
           <Radio />
@@ -402,7 +436,12 @@ function App() {
         <div>
           <SlidersHorizontal />
           <span>Ozon mode</span>
-          <strong>{configStatus?.connector_mode === "real" ? "real API" : (configStatus?.connector_mode ?? "checking")}</strong>
+          <strong>{configStatus?.connector_mode === "real" ? "real API" : (configStatus?.connector_mode ?? runtime.connector_mode)}</strong>
+        </div>
+        <div>
+          <TerminalSquare />
+          <span>Sidecar</span>
+          <strong>{runtime.sidecar_pid ? `pid ${runtime.sidecar_pid}` : "external"}</strong>
         </div>
         <div>
           <Repeat2 />
@@ -421,8 +460,14 @@ function App() {
             </div>
           </div>
           <div className="bridge-endpoint">
-            <code>{LOCAL_API}/openclaw/manifest</code>
+            <code>{runtime.skill_api}/openclaw/manifest</code>
             <button className="icon-button" onClick={copyManifest} title="复制 manifest URL">
+              <Clipboard size={18} />
+            </button>
+          </div>
+          <div className="bridge-endpoint token-endpoint">
+            <code>x-openclaw-token: {maskSecret(runtime.openclaw_token)}</code>
+            <button className="icon-button" onClick={copyOpenClawToken} title="复制 OpenClaw bridge token">
               <Clipboard size={18} />
             </button>
           </div>
@@ -675,6 +720,33 @@ function App() {
       </footer>
     </main>
   );
+}
+
+function defaultRuntimeConfig(): RuntimeConfig {
+  return {
+    skill_api: DEFAULT_LOCAL_API,
+    agent_api: DEFAULT_AGENT_API,
+    local_token: DEFAULT_LOCAL_TOKEN,
+    openclaw_token: DEFAULT_OPENCLAW_TOKEN,
+    connector_mode: import.meta.env.DEV ? "mock" : "real",
+    sidecar_pid: null
+  };
+}
+
+async function loadRuntimeConfig(): Promise<RuntimeConfig> {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return await invoke<RuntimeConfig>("local_node_runtime");
+  } catch {
+    return defaultRuntimeConfig();
+  }
+}
+
+function maskSecret(value: string) {
+  if (value.length <= 12) {
+    return "configured";
+  }
+  return `${value.slice(0, 4)}...${value.slice(-4)}`;
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

@@ -90,7 +90,7 @@ nav > span {
   color: #f8fff9;
   display: grid;
   gap: 1px;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   margin-bottom: 20px;
   overflow: hidden;
 }

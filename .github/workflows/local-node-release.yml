@@ -1,0 +1,127 @@
+name: Local Node Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the leading v
+        required: true
+        default: 0.1.0
+  push:
+    tags:
+      - "local-node-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  windows-installers:
+    name: Build Windows MSI and EXE
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            apps/local-node/src-tauri -> apps/local-node/src-tauri/target
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build local-node sidecar
+        run: cargo build -p ozon-local-node --release --target x86_64-pc-windows-msvc
+
+      - name: Stage sidecar for Tauri
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force apps/local-node/src-tauri/binaries | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/ozon-local-node.exe apps/local-node/src-tauri/binaries/ozon-local-node-x86_64-pc-windows-msvc.exe
+
+      - name: Build Tauri installers
+        run: pnpm --dir apps/local-node tauri:build -- --target x86_64-pc-windows-msvc --bundles msi,nsis
+
+      - name: Collect installers
+        id: collect
+        shell: pwsh
+        run: |
+          $version = "${{ github.event.inputs.version }}"
+          if (-not $version) {
+            $version = "${{ github.ref_name }}".Replace("local-node-v", "")
+          }
+          New-Item -ItemType Directory -Force dist/release | Out-Null
+          $msi = Get-ChildItem -Path target,apps/local-node/src-tauri/target -Recurse -Filter *.msi | Select-Object -First 1
+          $exe = Get-ChildItem -Path target,apps/local-node/src-tauri/target -Recurse -Filter *.exe |
+            Where-Object { $_.FullName -match "bundle" -and $_.Name -notmatch "ozon-local-node" } |
+            Select-Object -First 1
+          if (-not $msi) { throw "MSI artifact was not produced" }
+          if (-not $exe) { throw "NSIS EXE artifact was not produced" }
+          Copy-Item $msi.FullName dist/release/OzonRustLocal-x64.msi
+          Copy-Item $exe.FullName dist/release/OzonRustLocalSetup-x64.exe
+          Copy-Item $msi.FullName "dist/release/OzonRustLocal-$version-x64.msi"
+          Copy-Item $exe.FullName "dist/release/OzonRustLocalSetup-$version-x64.exe"
+          Get-FileHash dist/release/OzonRustLocal-x64.msi -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLowerInvariant())  OzonRustLocal-x64.msi" } |
+            Set-Content dist/release/SHA256SUMS.txt
+          Get-FileHash dist/release/OzonRustLocalSetup-x64.exe -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLowerInvariant())  OzonRustLocalSetup-x64.exe" } |
+            Add-Content dist/release/SHA256SUMS.txt
+
+      - name: Upload Windows installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-node-windows-x64
+          path: dist/release/*
+          if-no-files-found: error
+
+  openclaw-plugin:
+    name: Package OpenClaw plugin
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Package plugin
+        run: |
+          set -euo pipefail
+          mkdir -p dist/openclaw-plugin
+          cp openclaw/manifest.json dist/openclaw-plugin/manifest.json
+          cp openclaw/tools.md dist/openclaw-plugin/tools.md
+          cp apps/web-portal/public/openclaw/manifest.json dist/openclaw-plugin/portal-manifest.json
+          cat > dist/openclaw-plugin/INSTALL.md <<'EOF'
+          # Ozon Rust Suite OpenClaw Plugin
+
+          1. Install and start Ozon Rust Local.
+          2. Open the local UI and copy the OpenClaw bridge token.
+          3. Add `http://127.0.0.1:8790/openclaw/manifest` to OpenClaw.
+          4. Configure the auth header as `x-openclaw-token: <bridge token>`.
+
+          OpenClaw can read and propose tasks only. Approval and execution remain in the local UI with `x-local-token`.
+          EOF
+          (cd dist && zip -r openclaw-plugin.zip openclaw-plugin)
+
+      - name: Upload OpenClaw plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-plugin
+          path: dist/openclaw-plugin.zip
+          if-no-files-found: error

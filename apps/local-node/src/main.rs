@@ -76,6 +76,7 @@ async fn run_server(addr: SocketAddr, router: Router) -> anyhow::Result<()> {
 fn skill_router(state: LocalState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/portal/status", get(portal_status))
         .route("/openclaw/manifest", get(openclaw_manifest))
         .route("/config/status", get(config_status))
         .route("/config/ozon", post(save_ozon_config))
@@ -123,12 +124,15 @@ fn local_cors() -> CorsLayer {
                 .map(|origin| {
                     origin == "http://localhost:5173"
                         || origin == "http://127.0.0.1:5173"
+                        || origin == "https://ozon66.com"
+                        || origin == "https://www.ozon66.com"
                         || origin.starts_with("tauri://")
                 })
                 .unwrap_or(false)
         }))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(tower_http::cors::Any)
+        .allow_private_network(true)
 }
 
 #[derive(Clone)]
@@ -264,6 +268,29 @@ async fn health(State(state): State<LocalState>) -> Json<HealthResponse> {
             Feature::LocalApproval,
         ],
         real_ozon_enabled: state.config.use_real_ozon,
+    })
+}
+
+async fn portal_status(State(state): State<LocalState>) -> Json<PortalStatusResponse> {
+    Json(PortalStatusResponse {
+        service: "ozon-local-node",
+        status: "online",
+        checked_at: Utc::now().to_rfc3339(),
+        skill_api: local_http_url(&state.config.skill_bind),
+        agent_api: local_http_url(&state.config.agent_bind),
+        manifest_url: format!(
+            "{}/openclaw/manifest",
+            local_http_url(&state.config.skill_bind)
+        ),
+        bridge_auth_header: "x-openclaw-token",
+        real_ozon_enabled: state.config.use_real_ozon,
+        features: vec![
+            Feature::OzonRead,
+            Feature::OzonWriteMock,
+            Feature::DraftImport1688Mock,
+            Feature::OpenClawBridge,
+            Feature::LocalApproval,
+        ],
     })
 }
 
@@ -1091,6 +1118,19 @@ struct HealthResponse {
     agent_port: u16,
     features: Vec<Feature>,
     real_ozon_enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PortalStatusResponse {
+    service: &'static str,
+    status: &'static str,
+    checked_at: String,
+    skill_api: String,
+    agent_api: String,
+    manifest_url: String,
+    bridge_auth_header: &'static str,
+    real_ozon_enabled: bool,
+    features: Vec<Feature>,
 }
 
 #[derive(Debug, Serialize)]

@@ -111,6 +111,12 @@ struct AppConfig {
     jwt_secret: String,
     admin_token: String,
     download_url: String,
+    download_msi_url: String,
+    download_exe_url: String,
+    download_sha256: String,
+    local_node_version: String,
+    openclaw_plugin_url: String,
+    openclaw_manifest_url: String,
     skybridge_api_base_urls: Vec<String>,
     allow_local_nebula_registration: bool,
     cors_allowed_origins: Vec<String>,
@@ -137,8 +143,25 @@ impl AppConfig {
             admin_token: env::var("OZON_SUITE_ADMIN_TOKEN")
                 .unwrap_or_else(|_| DEFAULT_DEV_ADMIN_TOKEN.to_string()),
             download_url: env::var("OZON_SUITE_PORTAL_DOWNLOAD_URL").unwrap_or_else(|_| {
-                "https://downloads.example.com/ozon-local-node.msi".to_string()
+                "https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/OzonRustLocal-x64.msi".to_string()
             }),
+            download_msi_url: env::var("OZON_SUITE_PORTAL_DOWNLOAD_MSI_URL").unwrap_or_else(|_| {
+                env::var("OZON_SUITE_PORTAL_DOWNLOAD_URL").unwrap_or_else(|_| {
+                    "https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/OzonRustLocal-x64.msi".to_string()
+                })
+            }),
+            download_exe_url: env::var("OZON_SUITE_PORTAL_DOWNLOAD_EXE_URL").unwrap_or_else(|_| {
+                "https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/OzonRustLocalSetup-x64.exe".to_string()
+            }),
+            download_sha256: env::var("OZON_SUITE_PORTAL_DOWNLOAD_SHA256")
+                .unwrap_or_else(|_| "pending-release-sha256".to_string()),
+            local_node_version: env::var("OZON_SUITE_LOCAL_NODE_VERSION")
+                .unwrap_or_else(|_| "0.1.0".to_string()),
+            openclaw_plugin_url: env::var("OZON_SUITE_OPENCLAW_PLUGIN_URL").unwrap_or_else(|_| {
+                "https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/openclaw-plugin.zip".to_string()
+            }),
+            openclaw_manifest_url: env::var("OZON_SUITE_OPENCLAW_MANIFEST_URL")
+                .unwrap_or_else(|_| "https://ozon66.com/openclaw/manifest.json".to_string()),
             skybridge_api_base_urls: skybridge_api_base_urls_from_env(),
             allow_local_nebula_registration: env::var("OZON_SUITE_ALLOW_LOCAL_NEBULA_REGISTRATION")
                 .ok()
@@ -707,7 +730,14 @@ async fn revoke_entitlement(
 async fn downloads(State(state): State<AppState>) -> Json<DownloadsResponse> {
     Json(DownloadsResponse {
         local_node: state.config.download_url,
-        checksum: "publish-checksum-after-building-installer".to_string(),
+        local_node_msi: state.config.download_msi_url,
+        local_node_exe: state.config.download_exe_url,
+        version: state.config.local_node_version,
+        checksum: state.config.download_sha256.clone(),
+        checksum_sha256: state.config.download_sha256,
+        openclaw_plugin: state.config.openclaw_plugin_url,
+        openclaw_manifest: state.config.openclaw_manifest_url,
+        local_manifest_url: "http://127.0.0.1:8790/openclaw/manifest".to_string(),
     })
 }
 
@@ -2297,7 +2327,14 @@ struct EntitlementResponse {
 #[derive(Debug, Serialize)]
 struct DownloadsResponse {
     local_node: String,
+    local_node_msi: String,
+    local_node_exe: String,
+    version: String,
     checksum: String,
+    checksum_sha256: String,
+    openclaw_plugin: String,
+    openclaw_manifest: String,
+    local_manifest_url: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2548,6 +2585,13 @@ mod tests {
             jwt_secret: DEFAULT_DEV_JWT_SECRET.to_string(),
             admin_token: DEFAULT_DEV_ADMIN_TOKEN.to_string(),
             download_url: "https://downloads.example.com/ozon-local-node.msi".to_string(),
+            download_msi_url: "https://downloads.example.com/ozon-local-node.msi".to_string(),
+            download_exe_url: "https://downloads.example.com/ozon-local-node.exe".to_string(),
+            download_sha256: "test-sha256".to_string(),
+            local_node_version: "0.1.0".to_string(),
+            openclaw_plugin_url: "https://downloads.example.com/openclaw-plugin.zip".to_string(),
+            openclaw_manifest_url: "https://downloads.example.com/openclaw/manifest.json"
+                .to_string(),
             skybridge_api_base_urls: vec![],
             allow_local_nebula_registration: false,
             cors_allowed_origins: DEV_CORS_ORIGINS

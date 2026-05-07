@@ -26,6 +26,7 @@ import {
 import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_CLOUD_API ?? "http://127.0.0.1:8080";
+const LOCAL_NODE_API = normalizeBaseUrl(import.meta.env.VITE_LOCAL_NODE_API ?? "http://127.0.0.1:8790");
 const SESSION_KEY = "ozon-rust-suite.portal.session";
 const NEBULA_OAUTH_STORAGE_KEY = "ozon-rust-suite.nebula.oauth";
 const DEFAULT_NEBULA_SCOPE = "openid profile email offline_access";
@@ -104,12 +105,68 @@ type Lease = {
 
 type Downloads = {
   local_node: string;
+  local_node_msi?: string;
+  local_node_exe?: string;
+  version?: string;
   checksum: string;
+  checksum_sha256?: string;
+  openclaw_plugin?: string;
+  openclaw_manifest?: string;
+  local_manifest_url?: string;
 };
 
 type Session = {
   token: string;
   user: User;
+};
+
+type LocalNodePhase = "idle" | "checking" | "online" | "offline" | "blocked";
+
+type LocalNodeHealth = {
+  service: string;
+  status: string;
+  skill_port: number;
+  agent_port: number;
+  features: string[];
+  real_ozon_enabled: boolean;
+};
+
+type LocalNodeManifest = {
+  name: string;
+  version: string;
+  base_url: string;
+  auth: {
+    header: string;
+    source: string;
+  };
+  tools: Array<{
+    name: string;
+    path: string;
+    risk: string;
+    approval_required: boolean;
+  }>;
+  safety_rules: string[];
+};
+
+type LocalPortalStatus = {
+  service: string;
+  status: string;
+  checked_at: string;
+  skill_api: string;
+  agent_api: string;
+  manifest_url: string;
+  bridge_auth_header: string;
+  real_ozon_enabled: boolean;
+  features: string[];
+};
+
+type LocalNodeProbe = {
+  phase: LocalNodePhase;
+  message: string;
+  checkedAt?: string;
+  health?: LocalNodeHealth;
+  manifest?: LocalNodeManifest;
+  portal?: LocalPortalStatus;
 };
 
 type ApiError = {
@@ -226,6 +283,10 @@ function App() {
   const [device, setDevice] = useState<Device | null>(null);
   const [lease, setLease] = useState<Lease | null>(null);
   const [downloads, setDownloads] = useState<Downloads | null>(null);
+  const [localNode, setLocalNode] = useState<LocalNodeProbe>({
+    phase: "idle",
+    message: "登录后会检测 127.0.0.1:8790 本机节点"
+  });
 
   const activeEntitlement = useMemo(
     () => entitlements.find((entitlement) => !entitlement.revoked_at) ?? null,
@@ -237,6 +298,12 @@ function App() {
   const captchaBlocked = isCaptchaProtectionMessage(authState.message);
   const directAuthNeedsTurnstile = SKYBRIDGE_TURNSTILE_CONFIGURED && !turnstileToken;
   const authDialogOpen = authDialogMode !== null;
+  const localPairingStatus = localNodePairingStatus(localNode, activeEntitlement, device, lease);
+  const localNodeMsiUrl = downloads?.local_node_msi ?? downloads?.local_node ?? "";
+  const localNodeExeUrl = downloads?.local_node_exe ?? "";
+  const openclawPluginUrl = downloads?.openclaw_plugin ?? "/downloads/openclaw-plugin.zip";
+  const openclawManifestUrl = downloads?.openclaw_manifest ?? "/openclaw/manifest.json";
+  const localManifestUrl = downloads?.local_manifest_url ?? `${LOCAL_NODE_API}/openclaw/manifest`;
   const directAuthUnavailableMessage =
     "当前部署未配置门户内账号登录环境，请检查 VITE_SKYBRIDGE_SUPABASE_URL 和 VITE_SKYBRIDGE_SUPABASE_ANON_KEY。";
   const authSubmitText =
@@ -739,6 +806,45 @@ function App() {
     }
   }
 
+  async function probeLocalNode() {
+    setLocalNode({
+      phase: "checking",
+      message: "正在检测本机 127.0.0.1:8790 节点"
+    });
+    try {
+      const [health, manifest, portal] = await Promise.all([
+        localNodeJson<LocalNodeHealth>("/health"),
+        localNodeJson<LocalNodeManifest>("/openclaw/manifest"),
+        localNodeJson<LocalPortalStatus>("/portal/status").catch(() => null)
+      ]);
+      setLocalNode({
+        phase: "online",
+        message: health.real_ozon_enabled ? "本机节点在线，当前是真实 Ozon API 模式" : "本机节点在线，当前是开发 mock 模式",
+        checkedAt: new Date().toISOString(),
+        health,
+        manifest,
+        portal: portal ?? undefined
+      });
+    } catch (error) {
+      setLocalNode({
+        phase: isLocalNodeBrowserBlock(error) ? "blocked" : "offline",
+        message: localNodeFailureMessage(error),
+        checkedAt: new Date().toISOString()
+      });
+    }
+  }
+
+  async function copyLocalManifestUrl() {
+    await navigator.clipboard.writeText(localManifestUrl);
+    setOperationStatus("本机 OpenClaw manifest URL 已复制");
+  }
+
+  async function copyStaticManifestUrl() {
+    const url = absolutePortalUrl(openclawManifestUrl);
+    await navigator.clipboard.writeText(url);
+    setOperationStatus("门户 OpenClaw manifest URL 已复制");
+  }
+
   useEffect(() => {
     let cancelled = false;
     async function bootPortal() {
@@ -756,6 +862,17 @@ function App() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (session) {
+      probeLocalNode();
+    } else {
+      setLocalNode({
+        phase: "idle",
+        message: "登录后会检测 127.0.0.1:8790 本机节点"
+      });
+    }
+  }, [session?.token]);
 
   useEffect(() => {
     if (authMode === "register" && authMethod === "nebula") {
@@ -1184,11 +1301,73 @@ function App() {
                   <KeyRound size={18} /> 兑换授权
                 </button>
                 {downloads && (
-                  <a className="download" href={downloads.local_node}>
+                  <a className="download" href={localNodeMsiUrl || downloads.local_node}>
                     <Download size={18} /> 下载本地节点
                   </a>
                 )}
               </div>
+            </div>
+
+            <div className="op-section local-node-section">
+              <div className="section-title">
+                <MonitorCheck />
+                <div>
+                  <h2>本机节点与 OpenClaw</h2>
+                  <p>登录后检测本机 127.0.0.1:8790；安装包启动本地服务，OpenClaw 通过 manifest 接入。</p>
+                </div>
+              </div>
+              <div className="local-node-grid">
+                <div className={`local-node-card ${localNode.phase}`}>
+                  <span>本机服务</span>
+                  <strong>{localNodeStatusLabel(localNode.phase)}</strong>
+                  <p>{localNode.message}</p>
+                </div>
+                <div className={`local-node-card ${localPairingStatus.kind}`}>
+                  <span>配对/授权</span>
+                  <strong>{localPairingStatus.title}</strong>
+                  <p>{localPairingStatus.message}</p>
+                </div>
+                <div className="local-node-card">
+                  <span>OpenClaw manifest</span>
+                  <strong>{localNode.manifest?.version ?? downloads?.version ?? "待检测"}</strong>
+                  <p>{localManifestUrl}</p>
+                </div>
+              </div>
+              <div className="command-row">
+                <button disabled={!session || localNode.phase === "checking"} onClick={probeLocalNode}>
+                  <RefreshCcw size={18} /> 检测本机节点
+                </button>
+                {localNodeMsiUrl && (
+                  <a className="download" href={localNodeMsiUrl}>
+                    <Download size={18} /> MSI 安装包
+                  </a>
+                )}
+                {localNodeExeUrl && (
+                  <a className="download" href={localNodeExeUrl}>
+                    <Download size={18} /> EXE 安装包
+                  </a>
+                )}
+                <a className="download" href={openclawPluginUrl}>
+                  <Download size={18} /> OpenClaw 插件
+                </a>
+                <button className="secondary" onClick={copyLocalManifestUrl}>
+                  <Clipboard size={18} /> 复制本机 manifest
+                </button>
+                <button className="secondary" onClick={copyStaticManifestUrl}>
+                  <ExternalLink size={18} /> 复制安装 manifest
+                </button>
+              </div>
+              {localNode.manifest && (
+                <div className="manifest-tools">
+                  {localNode.manifest.tools.map((tool) => (
+                    <div key={tool.name}>
+                      <span>{tool.risk}</span>
+                      <strong>{tool.name}</strong>
+                      <em>{tool.approval_required ? "本地审批" : "只读"}</em>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             <div className="op-section">
@@ -1498,6 +1677,77 @@ async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}
   } finally {
     window.clearTimeout(timeout);
   }
+}
+
+async function localNodeJson<T>(path: string): Promise<T> {
+  const response = await fetchWithTimeout(`${LOCAL_NODE_API}${path}`, {}, 4_000);
+  return parseResponse<T>(response);
+}
+
+function localNodeFailureMessage(error: unknown) {
+  const message = errorMessage(error);
+  if (isLocalNodeBrowserBlock(error)) {
+    return "浏览器没拿到本机节点响应。请安装/启动新版本地节点；旧版本可能缺少 ozon66.com 的本地网络预检允许。";
+  }
+  return `未检测到本机节点：${message}`;
+}
+
+function isLocalNodeBrowserBlock(error: unknown) {
+  const message = errorMessage(error).toLowerCase();
+  return message.includes("failed to fetch") || message.includes("networkerror") || message.includes("load failed");
+}
+
+function localNodeStatusLabel(phase: LocalNodePhase) {
+  switch (phase) {
+    case "checking":
+      return "checking";
+    case "online":
+      return "online";
+    case "blocked":
+      return "blocked";
+    case "offline":
+      return "offline";
+    default:
+      return "waiting";
+  }
+}
+
+function localNodePairingStatus(
+  localNode: LocalNodeProbe,
+  entitlement: Entitlement | null,
+  device: Device | null,
+  lease: Lease | null
+) {
+  if (!entitlement) {
+    return {
+      kind: "warn",
+      title: "未授权",
+      message: "先兑换卡密或完成付款确认，才可签发本地节点租约。"
+    };
+  }
+  if (!device) {
+    return {
+      kind: "warn",
+      title: "待绑定设备",
+      message: "授权已存在；下一步绑定本机设备，再签发租约。"
+    };
+  }
+  if (!lease) {
+    return {
+      kind: localNode.phase === "online" ? "warn" : "offline",
+      title: "待签发租约",
+      message: "设备已绑定；点击签发租约后，本机节点可展示授权状态。"
+    };
+  }
+  return {
+    kind: localNode.phase === "online" ? "online" : "warn",
+    title: localNode.phase === "online" ? "已配对" : "云端已授权",
+    message: `Lease ${lease.lease_id} 已签发，过期时间 ${lease.expires_at}。`
+  };
+}
+
+function absolutePortalUrl(pathOrUrl: string) {
+  return new URL(pathOrUrl, window.location.origin).toString();
 }
 
 async function skybridgePasswordAuth(input: {

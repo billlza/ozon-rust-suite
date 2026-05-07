@@ -1007,6 +1007,83 @@ input[readonly] {
   white-space: nowrap;
 }
 
+.local-node-section {
+  background: #fbfcf8;
+}
+
+.local-node-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.local-node-card {
+  background: #ffffff;
+  border: 1px solid #d2dad2;
+  border-radius: 8px;
+  display: grid;
+  gap: 7px;
+  min-height: 118px;
+  padding: 14px;
+}
+
+.local-node-card span,
+.manifest-tools span,
+.manifest-tools em {
+  color: #64726b;
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.local-node-card strong {
+  font-size: 18px;
+}
+
+.local-node-card p {
+  color: #526057;
+  font-size: 13px;
+  font-weight: 760;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.local-node-card.online {
+  border-color: #8ed9bd;
+}
+
+.local-node-card.warn,
+.local-node-card.blocked {
+  border-color: #efd4a1;
+}
+
+.local-node-card.offline {
+  border-color: #f0b3a4;
+}
+
+.manifest-tools {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.manifest-tools div {
+  background: #ffffff;
+  border: 1px solid #d2dad2;
+  border-radius: 8px;
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 11px;
+}
+
+.manifest-tools strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 @media (max-width: 980px) {
   .site-nav,
   .hero-section,
@@ -1017,6 +1094,7 @@ input[readonly] {
   .auth-grid,
   .skybridge-auth-grid,
   .skybridge-grid,
+  .local-node-grid,
   .lease-line {
     grid-template-columns: 1fr;
   }
