@@ -6,8 +6,8 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 5173",
     "build": "tsc -b && vite build",
-    "tauri:dev": "cargo tauri dev",
-    "tauri:build": "cargo tauri build"
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",
