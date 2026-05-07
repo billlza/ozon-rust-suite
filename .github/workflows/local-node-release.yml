@@ -58,7 +58,7 @@ jobs:
           Copy-Item target/x86_64-pc-windows-msvc/release/ozon-local-node.exe apps/local-node/src-tauri/binaries/ozon-local-node-x86_64-pc-windows-msvc.exe
 
       - name: Build Tauri installers
-        run: pnpm --dir apps/local-node tauri:build --target x86_64-pc-windows-msvc --bundles msi,nsis
+        run: pnpm --dir apps/local-node tauri:build --target x86_64-pc-windows-msvc --bundles msi nsis
 
       - name: Collect installers
         id: collect
