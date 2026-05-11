@@ -4279,6 +4279,9 @@ mod tests {
         unverified_email.email_verified_at = None;
         assert!(!test_full_access_matches(&config, &unverified_email));
 
+        config.test_full_access_identities = vec!["nebula-2026-a1b2c3d4e5f6".to_string()];
+        assert!(test_full_access_matches(&config, &unverified_email));
+
         let mut local_user = user.clone();
         local_user.nebula_source = NebulaSource::LocalDev;
         assert!(!test_full_access_matches(&config, &local_user));

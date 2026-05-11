@@ -77,7 +77,7 @@ services:
       - key: OZON_SUITE_WECHAT_STANDARD_30D_AMOUNT_MINOR
         value: "4000"
       - key: OZON_SUITE_TEST_FULL_ACCESS_IDENTITIES
-        value: 2403871950@qq.com
+        value: 2403871950@qq.com,nebula-2026-16drj8pqaqhs
       - key: OZON_SUITE_TEST_FULL_ACCESS_DURATION_DAYS
         value: "365"
       - key: OZON_SUITE_TEST_FULL_ACCESS_MAX_DEVICES
