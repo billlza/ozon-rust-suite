@@ -153,6 +153,12 @@ key. `OZON_SUITE_PAYMENT_PROVIDER=stripe` creates a real Stripe Checkout
 Session from `POST /orders`; the browser is redirected to Stripe and
 `POST /webhooks/stripe` verifies `Stripe-Signature`, checks the session amount
 and currency against the stored order, then activates the entitlement server-side.
+`OZON_SUITE_PAYMENT_PROVIDER=wechat_pay` creates a WeChat Pay API v3 Native
+prepay order from `POST /orders`; the portal renders the returned `code_url` as
+a QR code, and `POST /webhooks/wechatpay` verifies the WeChat Pay signature,
+decrypts the AES-256-GCM resource with the API v3 key, checks app id, merchant
+id, trade type, amount, currency and `out_trade_no`, then activates the
+entitlement server-side.
 
 Required Stripe settings:
 
@@ -168,6 +174,27 @@ OZON_SUITE_STRIPE_STANDARD_30D_AMOUNT_MINOR=4000
 
 If you enable additional payment methods through Stripe Checkout, keep
 `OZON_SUITE_PAYMENT_PROVIDER=stripe` and manage those payment methods in Stripe.
+
+Required WeChat Pay Native settings:
+
+```bash
+OZON_SUITE_PAYMENT_PROVIDER=wechat_pay
+OZON_SUITE_WECHAT_API_BASE_URL=https://api.mch.weixin.qq.com
+OZON_SUITE_WECHAT_APP_ID=wx...
+OZON_SUITE_WECHAT_MCH_ID=1900000000
+OZON_SUITE_WECHAT_MERCHANT_SERIAL_NO=...
+OZON_SUITE_WECHAT_MERCHANT_PRIVATE_KEY_PEM="-----BEGIN PRIVATE KEY-----..."
+OZON_SUITE_WECHAT_API_V3_KEY=32-byte-api-v3-key
+OZON_SUITE_WECHATPAY_PUBLIC_KEY_ID=PUB_KEY_ID_...
+OZON_SUITE_WECHATPAY_PUBLIC_KEY_PEM="-----BEGIN PUBLIC KEY-----..."
+OZON_SUITE_WECHAT_NOTIFY_URL=https://api.ozon66.com/webhooks/wechatpay
+OZON_SUITE_WECHAT_CURRENCY=CNY
+OZON_SUITE_WECHAT_STANDARD_30D_AMOUNT_MINOR=4000
+```
+
+The WeChat login phone or personal WeChat ID is not a payment API credential.
+Use it only to sign in to the WeChat Pay merchant platform, then copy the
+merchant parameters above into the deployment environment.
 
 ## OpenClaw bridge
 

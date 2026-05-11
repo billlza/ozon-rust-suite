@@ -1,5 +1,9 @@
 use std::{collections::HashMap, env, net::SocketAddr};
 
+use aes_gcm::{
+    Aes256Gcm, KeyInit, Nonce,
+    aead::{Aead, Payload},
+};
 use argon2::{
     Argon2,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -15,6 +19,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
@@ -25,6 +30,13 @@ use ozon_domain::{
 };
 use rand::{Rng, distr::Alphanumeric};
 use rand_core::OsRng;
+use rsa::{
+    RsaPrivateKey, RsaPublicKey,
+    pkcs1::DecodeRsaPrivateKey,
+    pkcs1v15::{Signature as RsaPkcs1v15Signature, SigningKey, VerifyingKey},
+    pkcs8::{DecodePrivateKey, DecodePublicKey},
+    signature::{RandomizedSigner, SignatureEncoding, Verifier},
+};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -88,6 +100,7 @@ fn app_router(state: AppState) -> Router {
         .route("/orders", post(create_order))
         .route("/orders/{id}", get(get_order))
         .route("/webhooks/stripe", post(stripe_webhook))
+        .route("/webhooks/wechatpay", post(wechatpay_webhook))
         .route("/admin/orders/{id}/confirm", post(confirm_order))
         .route(
             "/admin/orders/by-reference/{payment_reference}/confirm",
@@ -127,6 +140,17 @@ struct AppConfig {
     stripe_cancel_url: String,
     stripe_currency: String,
     stripe_standard_amount_minor: i64,
+    wechat_api_base_url: String,
+    wechat_app_id: Option<String>,
+    wechat_mch_id: Option<String>,
+    wechat_merchant_serial_no: Option<String>,
+    wechat_merchant_private_key_pem: Option<SecretString>,
+    wechat_api_v3_key: Option<SecretString>,
+    wechat_pay_public_key_id: Option<String>,
+    wechat_pay_public_key_pem: Option<String>,
+    wechat_notify_url: String,
+    wechat_currency: String,
+    wechat_standard_amount_minor: i64,
     skybridge_api_base_urls: Vec<String>,
     allow_local_nebula_registration: bool,
     cors_allowed_origins: Vec<String>,
@@ -225,6 +249,29 @@ impl AppConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(4000),
+            wechat_api_base_url: env::var("OZON_SUITE_WECHAT_API_BASE_URL")
+                .unwrap_or_else(|_| "https://api.mch.weixin.qq.com".to_string()),
+            wechat_app_id: optional_env("OZON_SUITE_WECHAT_APP_ID"),
+            wechat_mch_id: optional_env("OZON_SUITE_WECHAT_MCH_ID"),
+            wechat_merchant_serial_no: optional_env("OZON_SUITE_WECHAT_MERCHANT_SERIAL_NO"),
+            wechat_merchant_private_key_pem: optional_env("OZON_SUITE_WECHAT_MERCHANT_PRIVATE_KEY_PEM")
+                .map(SecretString::from),
+            wechat_api_v3_key: optional_env("OZON_SUITE_WECHAT_API_V3_KEY").map(SecretString::from),
+            wechat_pay_public_key_id: optional_env("OZON_SUITE_WECHATPAY_PUBLIC_KEY_ID"),
+            wechat_pay_public_key_pem: optional_env("OZON_SUITE_WECHATPAY_PUBLIC_KEY_PEM"),
+            wechat_notify_url: env::var("OZON_SUITE_WECHAT_NOTIFY_URL")
+                .unwrap_or_else(|_| "https://api.ozon66.com/webhooks/wechatpay".to_string()),
+            wechat_currency: env::var("OZON_SUITE_WECHAT_CURRENCY")
+                .unwrap_or_else(|_| "CNY".to_string()),
+            wechat_standard_amount_minor: env::var("OZON_SUITE_WECHAT_STANDARD_30D_AMOUNT_MINOR")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .or_else(|| {
+                    env::var("OZON_SUITE_STRIPE_STANDARD_30D_AMOUNT_MINOR")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                })
+                .unwrap_or(4000),
             skybridge_api_base_urls: skybridge_api_base_urls_from_env(),
             allow_local_nebula_registration: env::var("OZON_SUITE_ALLOW_LOCAL_NEBULA_REGISTRATION")
                 .ok()
@@ -310,11 +357,72 @@ impl AppConfig {
                 )?;
                 validate_currency("OZON_SUITE_STRIPE_CURRENCY", &self.stripe_currency)?;
             }
-            ConfiguredPaymentProvider::Alipay | ConfiguredPaymentProvider::WechatPay => {
+            ConfiguredPaymentProvider::Alipay => {
                 anyhow::bail!(
-                    "payment provider '{}' is fail-closed until merchant credentials and signing are implemented; use manual or stripe",
+                    "payment provider '{}' is fail-closed until merchant credentials and signing are implemented; use manual, stripe, or wechat_pay",
                     self.payment_provider.as_str()
                 );
+            }
+            ConfiguredPaymentProvider::WechatPay => {
+                validate_required_config(
+                    "OZON_SUITE_WECHAT_APP_ID",
+                    self.wechat_app_id.as_deref(),
+                )?;
+                validate_required_config(
+                    "OZON_SUITE_WECHAT_MCH_ID",
+                    self.wechat_mch_id.as_deref(),
+                )?;
+                validate_required_config(
+                    "OZON_SUITE_WECHAT_MERCHANT_SERIAL_NO",
+                    self.wechat_merchant_serial_no.as_deref(),
+                )?;
+                validate_required_secret(
+                    "OZON_SUITE_WECHAT_MERCHANT_PRIVATE_KEY_PEM",
+                    self.wechat_merchant_private_key_pem.as_ref(),
+                )?;
+                validate_required_secret(
+                    "OZON_SUITE_WECHAT_API_V3_KEY",
+                    self.wechat_api_v3_key.as_ref(),
+                )?;
+                validate_required_config(
+                    "OZON_SUITE_WECHATPAY_PUBLIC_KEY_ID",
+                    self.wechat_pay_public_key_id.as_deref(),
+                )?;
+                validate_required_config(
+                    "OZON_SUITE_WECHATPAY_PUBLIC_KEY_PEM",
+                    self.wechat_pay_public_key_pem.as_deref(),
+                )?;
+                validate_checkout_return_url(
+                    "OZON_SUITE_WECHAT_NOTIFY_URL",
+                    &self.wechat_notify_url,
+                    production_like,
+                )?;
+                validate_checkout_return_url(
+                    "OZON_SUITE_WECHAT_API_BASE_URL",
+                    &self.wechat_api_base_url,
+                    production_like,
+                )?;
+                validate_currency("OZON_SUITE_WECHAT_CURRENCY", &self.wechat_currency)?;
+                if self.wechat_currency.trim().to_ascii_uppercase() != "CNY" {
+                    anyhow::bail!("OZON_SUITE_WECHAT_CURRENCY must be CNY for WeChat Pay Native");
+                }
+                if self.wechat_standard_amount_minor <= 0 {
+                    anyhow::bail!("OZON_SUITE_WECHAT_STANDARD_30D_AMOUNT_MINOR must be positive");
+                }
+                if self
+                    .wechat_api_v3_key
+                    .as_ref()
+                    .map(|value| value.expose_secret().as_bytes().len())
+                    != Some(32)
+                {
+                    anyhow::bail!("OZON_SUITE_WECHAT_API_V3_KEY must be exactly 32 bytes");
+                }
+                parse_wechat_merchant_private_key(self).map_err(|_| {
+                    anyhow::anyhow!("OZON_SUITE_WECHAT_MERCHANT_PRIVATE_KEY_PEM is invalid")
+                })?;
+                parse_wechatpay_public_key(self).map_err(|_| {
+                    anyhow::anyhow!("OZON_SUITE_WECHATPAY_PUBLIC_KEY_PEM is invalid")
+                })?;
             }
             ConfiguredPaymentProvider::Unknown(value) => {
                 anyhow::bail!(
@@ -346,6 +454,20 @@ fn validate_currency(name: &str, value: &str) -> anyhow::Result<()> {
     let normalized = value.trim();
     if normalized.len() != 3 || !normalized.bytes().all(|byte| byte.is_ascii_alphabetic()) {
         anyhow::bail!("{name} must be a three-letter currency code");
+    }
+    Ok(())
+}
+
+fn validate_required_config(name: &str, value: Option<&str>) -> anyhow::Result<()> {
+    if value.is_none_or(|value| value.trim().is_empty()) {
+        anyhow::bail!("{name} must be set when OZON_SUITE_PAYMENT_PROVIDER=wechat_pay");
+    }
+    Ok(())
+}
+
+fn validate_required_secret(name: &str, value: Option<&SecretString>) -> anyhow::Result<()> {
+    if value.is_none_or(|value| value.expose_secret().trim().is_empty()) {
+        anyhow::bail!("{name} must be set when OZON_SUITE_PAYMENT_PROVIDER=wechat_pay");
     }
     Ok(())
 }
@@ -390,6 +512,10 @@ fn validate_production_download_config(config: &AppConfig) -> anyhow::Result<()>
 
 fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
 fn cors_allowed_origins_from_env() -> Option<Vec<String>> {
@@ -597,15 +723,18 @@ async fn create_order(
     let claims = require_user(&state, &headers)?;
     let plan = plan_definition(&state.config, input.plan_code.as_deref())?;
     let provider = order_payment_provider(&state.config.payment_provider)?;
+    let order_id = OrderId::new();
     let mut order = Order {
-        id: OrderId::new(),
+        id: order_id,
         tenant_id: claims.tenant_id,
         user_id: claims.sub,
         plan_code: plan.code.clone(),
         status: match provider {
             PaymentProvider::Manual => OrderStatus::PendingManualPayment,
-            PaymentProvider::Stripe => OrderStatus::PendingProviderPayment,
-            PaymentProvider::Alipay | PaymentProvider::WechatPay => {
+            PaymentProvider::Stripe | PaymentProvider::WechatPay => {
+                OrderStatus::PendingProviderPayment
+            }
+            PaymentProvider::Alipay => {
                 return Err(ApiError::service_unavailable(
                     "selected payment provider is not wired yet",
                 ));
@@ -615,7 +744,8 @@ async fn create_order(
         payment_reference: match provider {
             PaymentProvider::Manual => format!("OZON-{}", Uuid::new_v4().simple()),
             PaymentProvider::Stripe => format!("stripe:{}", Uuid::new_v4().simple()),
-            PaymentProvider::Alipay | PaymentProvider::WechatPay => unreachable!(),
+            PaymentProvider::WechatPay => wechat_out_trade_no(order_id),
+            PaymentProvider::Alipay => unreachable!(),
         },
         amount_minor: plan.amount_minor,
         currency: plan.currency.clone(),
@@ -645,6 +775,7 @@ async fn create_order(
             provider: payment_provider_to_db(provider).to_string(),
             checkout_url: None,
             checkout_session_id: None,
+            native_code_url: None,
             payment_reference: order.payment_reference.clone(),
             amount_minor: order.amount_minor,
             currency: order.currency.clone(),
@@ -657,13 +788,29 @@ async fn create_order(
                 provider: payment_provider_to_db(provider).to_string(),
                 checkout_url: Some(session.url),
                 checkout_session_id: Some(session.id),
+                native_code_url: None,
                 payment_reference: order.payment_reference.clone(),
                 amount_minor: order.amount_minor,
                 currency: order.currency.clone(),
                 message: "正在打开 Stripe Checkout。支付成功后会自动开通授权。".to_string(),
             })
         }
-        PaymentProvider::Alipay | PaymentProvider::WechatPay => unreachable!(),
+        PaymentProvider::WechatPay => {
+            let session = create_wechat_native_prepay(&state, &order, &plan).await?;
+            Some(PaymentSessionResponse {
+                provider: payment_provider_to_db(provider).to_string(),
+                checkout_url: None,
+                checkout_session_id: None,
+                native_code_url: Some(session.code_url),
+                payment_reference: order.payment_reference.clone(),
+                amount_minor: order.amount_minor,
+                currency: order.currency.clone(),
+                message:
+                    "请用微信扫码完成支付。支付成功后，授权会自动开通；如果页面未变化，点刷新状态。"
+                        .to_string(),
+            })
+        }
+        PaymentProvider::Alipay => unreachable!(),
     };
 
     Ok(Json(OrderResponse { order, payment }))
@@ -679,10 +826,27 @@ async fn get_order(
         .await?
         .filter(|order| order.user_id == claims.sub || claims.role == UserRole::Admin)
         .ok_or_else(|| ApiError::not_found("order not found"))?;
-    Ok(Json(OrderResponse {
-        order,
-        payment: None,
-    }))
+    let payment = if order.payment_provider == PaymentProvider::WechatPay
+        && order.status == OrderStatus::PendingProviderPayment
+    {
+        let plan = plan_definition(&state.config, Some(order.plan_code.0.as_str()))?;
+        let session = create_wechat_native_prepay(&state, &order, &plan).await?;
+        Some(PaymentSessionResponse {
+            provider: payment_provider_to_db(order.payment_provider).to_string(),
+            checkout_url: None,
+            checkout_session_id: None,
+            native_code_url: Some(session.code_url),
+            payment_reference: order.payment_reference.clone(),
+            amount_minor: order.amount_minor,
+            currency: order.currency.clone(),
+            message:
+                "请用微信扫码完成支付。支付成功后，授权会自动开通；如果页面未变化，点刷新状态。"
+                    .to_string(),
+        })
+    } else {
+        None
+    };
+    Ok(Json(OrderResponse { order, payment }))
 }
 
 #[derive(Clone, Debug)]
@@ -702,12 +866,24 @@ fn plan_definition(
         .filter(|value| !value.is_empty())
         .unwrap_or("standard_30d");
     match code {
-        "standard_30d" => Ok(PlanDefinition {
-            code: PlanCode::standard_30d(),
-            display_name: "Ozon Rust Suite Standard 30 days",
-            amount_minor: config.stripe_standard_amount_minor,
-            currency: config.stripe_currency.trim().to_ascii_lowercase(),
-        }),
+        "standard_30d" => {
+            let (amount_minor, currency) = match config.payment_provider {
+                ConfiguredPaymentProvider::WechatPay => (
+                    config.wechat_standard_amount_minor,
+                    config.wechat_currency.trim().to_ascii_uppercase(),
+                ),
+                _ => (
+                    config.stripe_standard_amount_minor,
+                    config.stripe_currency.trim().to_ascii_lowercase(),
+                ),
+            };
+            Ok(PlanDefinition {
+                code: PlanCode::standard_30d(),
+                display_name: "Ozon Rust Suite Standard 30 days",
+                amount_minor,
+                currency,
+            })
+        }
         _ => Err(ApiError::bad_request("unsupported plan code")),
     }
 }
@@ -721,13 +897,143 @@ fn order_payment_provider(
         ConfiguredPaymentProvider::Alipay => Err(ApiError::service_unavailable(
             "Alipay is not wired yet; configure Stripe or manual payments",
         )),
-        ConfiguredPaymentProvider::WechatPay => Err(ApiError::service_unavailable(
-            "WeChat Pay is not wired yet; configure Stripe or manual payments",
-        )),
+        ConfiguredPaymentProvider::WechatPay => Ok(PaymentProvider::WechatPay),
         ConfiguredPaymentProvider::Unknown(provider) => Err(ApiError::service_unavailable(
             format!("unknown payment provider: {provider}"),
         )),
     }
+}
+
+async fn create_wechat_native_prepay(
+    state: &AppState,
+    order: &Order,
+    plan: &PlanDefinition,
+) -> Result<WechatNativePrepayResponse, ApiError> {
+    let app_id = required_wechat_config(&state.config.wechat_app_id, "WeChat app id")?;
+    let mch_id = required_wechat_config(&state.config.wechat_mch_id, "WeChat merchant id")?;
+    let endpoint_path = "/v3/pay/transactions/native";
+    let endpoint = format!(
+        "{}{}",
+        state.config.wechat_api_base_url.trim_end_matches('/'),
+        endpoint_path
+    );
+    let body = serde_json::json!({
+        "appid": app_id,
+        "mchid": mch_id,
+        "description": plan.display_name,
+        "out_trade_no": order.payment_reference,
+        "notify_url": state.config.wechat_notify_url,
+        "amount": {
+            "total": order.amount_minor,
+            "currency": order.currency.to_ascii_uppercase()
+        }
+    });
+    let body = serde_json::to_string(&body)
+        .map_err(|_| ApiError::internal("WeChat Pay request could not be encoded"))?;
+    let authorization = wechatpay_authorization(&state.config, "POST", endpoint_path, &body)?;
+    let response = state
+        .http_client
+        .post(&endpoint)
+        .header(AUTHORIZATION, authorization)
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "WeChat Pay native prepay request failed");
+            ApiError::bad_gateway("WeChat Pay is temporarily unavailable")
+        })?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| {
+        tracing::warn!(%error, "WeChat Pay native prepay response could not be read");
+        ApiError::bad_gateway("WeChat Pay response could not be read")
+    })?;
+    if !status.is_success() {
+        let message = serde_json::from_str::<WechatPayErrorEnvelope>(&body)
+            .ok()
+            .and_then(|error| error.message)
+            .unwrap_or_else(|| "WeChat Pay rejected native prepay request".to_string());
+        tracing::warn!(status = %status, %message, "WeChat Pay native prepay failed");
+        return Err(ApiError::bad_gateway(message));
+    }
+    let session = serde_json::from_str::<WechatNativePrepayResponse>(&body).map_err(|error| {
+        tracing::warn!(%error, "WeChat Pay native prepay response was invalid");
+        ApiError::bad_gateway("WeChat Pay response was invalid")
+    })?;
+    if session.code_url.trim().is_empty() {
+        return Err(ApiError::bad_gateway(
+            "WeChat Pay response did not include a code_url",
+        ));
+    }
+    Ok(session)
+}
+
+fn wechatpay_authorization(
+    config: &AppConfig,
+    method: &str,
+    canonical_url: &str,
+    body: &str,
+) -> Result<String, ApiError> {
+    let mch_id = required_wechat_config(&config.wechat_mch_id, "WeChat merchant id")?;
+    let serial_no = required_wechat_config(
+        &config.wechat_merchant_serial_no,
+        "WeChat merchant certificate serial number",
+    )?;
+    let timestamp = Utc::now().timestamp().to_string();
+    let nonce = random_nonce(32);
+    let message = format!("{method}\n{canonical_url}\n{timestamp}\n{nonce}\n{body}\n");
+    let signature = sign_wechat_message(config, &message)?;
+    Ok(format!(
+        "WECHATPAY2-SHA256-RSA2048 mchid=\"{mch_id}\",nonce_str=\"{nonce}\",signature=\"{signature}\",timestamp=\"{timestamp}\",serial_no=\"{serial_no}\""
+    ))
+}
+
+fn sign_wechat_message(config: &AppConfig, message: &str) -> Result<String, ApiError> {
+    let private_key = parse_wechat_merchant_private_key(config)?;
+    let signing_key = SigningKey::<Sha256>::new(private_key);
+    let signature = signing_key.sign_with_rng(&mut OsRng, message.as_bytes());
+    Ok(BASE64_STANDARD.encode(signature.to_bytes()))
+}
+
+fn parse_wechat_merchant_private_key(config: &AppConfig) -> Result<RsaPrivateKey, ApiError> {
+    let pem = config
+        .wechat_merchant_private_key_pem
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError::service_unavailable("WeChat Pay merchant private key is not configured")
+        })?
+        .expose_secret();
+    RsaPrivateKey::from_pkcs8_pem(pem)
+        .or_else(|_| RsaPrivateKey::from_pkcs1_pem(pem))
+        .map_err(|_| ApiError::service_unavailable("WeChat Pay merchant private key is invalid"))
+}
+
+fn parse_wechatpay_public_key(config: &AppConfig) -> Result<RsaPublicKey, ApiError> {
+    let pem = config
+        .wechat_pay_public_key_pem
+        .as_deref()
+        .ok_or_else(|| ApiError::service_unavailable("WeChat Pay public key is not configured"))?;
+    RsaPublicKey::from_public_key_pem(pem)
+        .map_err(|_| ApiError::service_unavailable("WeChat Pay public key is invalid"))
+}
+
+fn required_wechat_config<'a>(value: &'a Option<String>, label: &str) -> Result<&'a str, ApiError> {
+    value
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::service_unavailable(format!("{label} is not configured")))
+}
+
+fn random_nonce(length: usize) -> String {
+    rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(length)
+        .map(char::from)
+        .collect()
+}
+
+fn wechat_out_trade_no(order_id: OrderId) -> String {
+    order_id.0.simple().to_string()
 }
 
 async fn create_stripe_checkout_session(
@@ -836,6 +1142,23 @@ async fn stripe_webhook(
     }))
 }
 
+async fn wechatpay_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<WechatPayWebhookResponse>, ApiError> {
+    verify_wechatpay_webhook_signature(&state.config, &headers, &body)?;
+    let event: WechatPayWebhookEvent = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::bad_request("invalid WeChat Pay webhook payload"))?;
+    let transaction = decrypt_wechatpay_resource(&state.config, &event.resource)?;
+    let processed = process_wechatpay_transaction(&state, &event, &transaction, &body).await?;
+    Ok(Json(WechatPayWebhookResponse {
+        code: "SUCCESS".to_string(),
+        message: "success".to_string(),
+        processed,
+    }))
+}
+
 async fn fulfill_stripe_checkout_session(
     state: &AppState,
     event: &StripeWebhookEvent,
@@ -888,6 +1211,77 @@ async fn fulfill_stripe_checkout_session(
     Ok(true)
 }
 
+async fn process_wechatpay_transaction(
+    state: &AppState,
+    event: &WechatPayWebhookEvent,
+    transaction: &WechatPayTransaction,
+    body: &[u8],
+) -> Result<bool, ApiError> {
+    let payload_hash = sha256_hex(body);
+    if event.event_type != "TRANSACTION.SUCCESS" || transaction.trade_state != "SUCCESS" {
+        let mut tx = state.db.begin().await.map_err(db_internal)?;
+        insert_payment_event(
+            &mut tx,
+            PaymentProvider::WechatPay,
+            &event.id,
+            &event.event_type,
+            None,
+            &payload_hash,
+        )
+        .await?;
+        tx.commit().await.map_err(db_internal)?;
+        return Ok(false);
+    }
+
+    let mut tx = state.db.begin().await.map_err(db_internal)?;
+    let order = find_provider_order_by_reference_for_update(
+        &mut tx,
+        PaymentProvider::WechatPay,
+        &transaction.out_trade_no,
+    )
+    .await?
+    .ok_or_else(|| ApiError::not_found("WeChat Pay order not found"))?;
+    validate_wechatpay_transaction_for_order(&state.config, &order, transaction)?;
+    let inserted = insert_payment_event(
+        &mut tx,
+        PaymentProvider::WechatPay,
+        &event.id,
+        &event.event_type,
+        Some(order.id),
+        &payload_hash,
+    )
+    .await?;
+    if !inserted || order.status == OrderStatus::Confirmed {
+        tx.commit().await.map_err(db_internal)?;
+        return Ok(false);
+    }
+    if order.status != OrderStatus::PendingProviderPayment {
+        return Err(ApiError::conflict("order is not awaiting provider payment"));
+    }
+
+    let paid_at = transaction
+        .success_time
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now);
+    let payment_intent_id = transaction
+        .transaction_id
+        .as_deref()
+        .unwrap_or(transaction.out_trade_no.as_str());
+    let paid_order =
+        confirm_provider_order(&mut tx, order.id, Some(payment_intent_id), paid_at).await?;
+    provision_paid_order_entitlement(
+        &mut tx,
+        &paid_order,
+        "wechat_pay",
+        "WeChat Pay native payment paid and entitlement activated",
+    )
+    .await?;
+    tx.commit().await.map_err(db_internal)?;
+    Ok(true)
+}
+
 async fn record_ignored_stripe_event(
     state: &AppState,
     event: &StripeWebhookEvent,
@@ -907,6 +1301,128 @@ async fn record_ignored_stripe_event(
     Ok(false)
 }
 
+fn verify_wechatpay_webhook_signature(
+    config: &AppConfig,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(), ApiError> {
+    let timestamp = required_header(headers, "wechatpay-timestamp")?;
+    let nonce = required_header(headers, "wechatpay-nonce")?;
+    let signature = required_header(headers, "wechatpay-signature")?;
+    let serial = required_header(headers, "wechatpay-serial")?;
+    let expected_serial =
+        required_wechat_config(&config.wechat_pay_public_key_id, "WeChat Pay public key id")?;
+    if serial != expected_serial {
+        return Err(ApiError::bad_request(
+            "unexpected WeChat Pay signature serial",
+        ));
+    }
+
+    let mut message = Vec::new();
+    message.extend_from_slice(timestamp.as_bytes());
+    message.push(b'\n');
+    message.extend_from_slice(nonce.as_bytes());
+    message.push(b'\n');
+    message.extend_from_slice(body);
+    message.push(b'\n');
+
+    let signature_bytes = BASE64_STANDARD
+        .decode(signature)
+        .map_err(|_| ApiError::bad_request("invalid WeChat Pay signature encoding"))?;
+    let signature = RsaPkcs1v15Signature::try_from(signature_bytes.as_slice())
+        .map_err(|_| ApiError::bad_request("invalid WeChat Pay signature"))?;
+    let public_key = parse_wechatpay_public_key(config)?;
+    let verifying_key = VerifyingKey::<Sha256>::new(public_key);
+    verifying_key
+        .verify(&message, &signature)
+        .map_err(|_| ApiError::bad_request("invalid WeChat Pay webhook signature"))
+}
+
+fn decrypt_wechatpay_resource(
+    config: &AppConfig,
+    resource: &WechatPayResource,
+) -> Result<WechatPayTransaction, ApiError> {
+    if resource.algorithm != "AEAD_AES_256_GCM" {
+        return Err(ApiError::bad_request(
+            "unsupported WeChat Pay resource algorithm",
+        ));
+    }
+    let api_v3_key = config
+        .wechat_api_v3_key
+        .as_ref()
+        .ok_or_else(|| ApiError::service_unavailable("WeChat Pay API v3 key is not configured"))?
+        .expose_secret();
+    let cipher = Aes256Gcm::new_from_slice(api_v3_key.as_bytes())
+        .map_err(|_| ApiError::service_unavailable("WeChat Pay API v3 key is invalid"))?;
+    let ciphertext = BASE64_STANDARD
+        .decode(&resource.ciphertext)
+        .map_err(|_| ApiError::bad_request("invalid WeChat Pay resource ciphertext"))?;
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(resource.nonce.as_bytes()),
+            Payload {
+                msg: &ciphertext,
+                aad: resource.associated_data.as_deref().unwrap_or("").as_bytes(),
+            },
+        )
+        .map_err(|_| ApiError::bad_request("WeChat Pay resource decryption failed"))?;
+    serde_json::from_slice(&plaintext)
+        .map_err(|_| ApiError::bad_request("invalid WeChat Pay transaction payload"))
+}
+
+fn validate_wechatpay_transaction_for_order(
+    config: &AppConfig,
+    order: &Order,
+    transaction: &WechatPayTransaction,
+) -> Result<(), ApiError> {
+    let app_id = required_wechat_config(&config.wechat_app_id, "WeChat app id")?;
+    let mch_id = required_wechat_config(&config.wechat_mch_id, "WeChat merchant id")?;
+    if transaction.appid != app_id {
+        return Err(ApiError::bad_request("WeChat Pay app id does not match"));
+    }
+    if transaction.mchid != mch_id {
+        return Err(ApiError::bad_request(
+            "WeChat Pay merchant id does not match",
+        ));
+    }
+    if transaction.trade_type.as_deref() != Some("NATIVE") {
+        return Err(ApiError::bad_request("WeChat Pay trade type is not NATIVE"));
+    }
+    if order.payment_provider != PaymentProvider::WechatPay {
+        return Err(ApiError::bad_request("order is not a WeChat Pay order"));
+    }
+    if order.payment_reference != transaction.out_trade_no {
+        return Err(ApiError::bad_request(
+            "WeChat Pay out_trade_no does not match order",
+        ));
+    }
+    if transaction.amount.total != order.amount_minor {
+        return Err(ApiError::bad_request(
+            "WeChat Pay amount does not match order",
+        ));
+    }
+    let currency = transaction
+        .amount
+        .currency
+        .as_deref()
+        .unwrap_or("CNY")
+        .to_ascii_uppercase();
+    if currency != order.currency.to_ascii_uppercase() {
+        return Err(ApiError::bad_request(
+            "WeChat Pay currency does not match order",
+        ));
+    }
+    Ok(())
+}
+
+fn required_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, ApiError> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request(format!("missing {name} header")))
+}
+
 fn verify_stripe_signature(header: &str, body: &[u8], secret: &str) -> Result<(), ApiError> {
     let (timestamp, signatures) = parse_stripe_signature_header(header)?;
     let now = Utc::now().timestamp();
@@ -917,7 +1433,7 @@ fn verify_stripe_signature(header: &str, body: &[u8], secret: &str) -> Result<()
     payload.push(b'.');
     payload.extend_from_slice(body);
 
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
         .map_err(|_| ApiError::internal("invalid Stripe webhook secret"))?;
     mac.update(&payload);
     let expected = hex_lower(&mac.finalize().into_bytes());
@@ -1721,6 +2237,30 @@ async fn find_order_by_id_for_update(
         "#,
     )
     .bind(order_id.0)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_internal)?
+    .map(row_to_order)
+    .transpose()
+}
+
+async fn find_provider_order_by_reference_for_update(
+    tx: &mut Transaction<'_, Postgres>,
+    provider: PaymentProvider,
+    payment_reference: &str,
+) -> Result<Option<Order>, ApiError> {
+    sqlx::query(
+        r#"
+        SELECT id, tenant_id, user_id, plan_code, status, payment_provider, payment_reference,
+               amount_minor, currency, checkout_session_id, payment_intent_id, paid_at,
+               created_at, confirmed_at
+        FROM orders
+        WHERE payment_provider = $1 AND payment_reference = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(payment_provider_to_db(provider))
+    .bind(payment_reference)
     .fetch_optional(&mut **tx)
     .await
     .map_err(db_internal)?
@@ -3033,6 +3573,7 @@ struct PaymentSessionResponse {
     provider: String,
     checkout_url: Option<String>,
     checkout_session_id: Option<String>,
+    native_code_url: Option<String>,
     payment_reference: String,
     amount_minor: i64,
     currency: String,
@@ -3062,6 +3603,49 @@ struct StripeErrorBody {
 }
 
 #[derive(Debug, Deserialize)]
+struct WechatNativePrepayResponse {
+    code_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WechatPayErrorEnvelope {
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WechatPayWebhookEvent {
+    id: String,
+    event_type: String,
+    resource: WechatPayResource,
+}
+
+#[derive(Debug, Deserialize)]
+struct WechatPayResource {
+    algorithm: String,
+    ciphertext: String,
+    nonce: String,
+    associated_data: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WechatPayTransaction {
+    appid: String,
+    mchid: String,
+    out_trade_no: String,
+    transaction_id: Option<String>,
+    trade_type: Option<String>,
+    trade_state: String,
+    success_time: Option<String>,
+    amount: WechatPayTransactionAmount,
+}
+
+#[derive(Debug, Deserialize)]
+struct WechatPayTransactionAmount {
+    total: i64,
+    currency: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct StripeWebhookEvent {
     id: String,
     #[serde(rename = "type")]
@@ -3088,6 +3672,13 @@ struct StripeCheckoutSessionObject {
 #[derive(Debug, Serialize)]
 struct StripeWebhookResponse {
     received: bool,
+    processed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct WechatPayWebhookResponse {
+    code: String,
+    message: String,
     processed: bool,
 }
 
@@ -3333,6 +3924,14 @@ mod tests {
             "pending_provider_payment"
         );
         assert_eq!(payment_provider_to_db(PaymentProvider::Stripe), "stripe");
+        assert_eq!(
+            payment_provider_to_db(PaymentProvider::WechatPay),
+            "wechat_pay"
+        );
+        assert_eq!(
+            payment_provider_from_db("wechat_pay").unwrap(),
+            PaymentProvider::WechatPay
+        );
         assert_eq!(feature_to_db(Feature::OpenClawBridge), "open_claw_bridge");
     }
 
@@ -3402,6 +4001,54 @@ mod tests {
         assert!(validate_card_key_limits(30, 0).is_err());
     }
 
+    #[test]
+    fn wechat_out_trade_no_is_wechat_safe() {
+        let value = wechat_out_trade_no(OrderId::new());
+        assert_eq!(value.len(), 32);
+        assert!(value.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn wechat_transaction_must_match_order() {
+        let mut config = config_for_security_tests();
+        config.wechat_app_id = Some("wx-app".to_string());
+        config.wechat_mch_id = Some("1900000000".to_string());
+        let order = Order {
+            id: OrderId::new(),
+            tenant_id: TenantId::new(),
+            user_id: UserId::new(),
+            plan_code: PlanCode::standard_30d(),
+            status: OrderStatus::PendingProviderPayment,
+            payment_provider: PaymentProvider::WechatPay,
+            payment_reference: "abcd1234abcd1234abcd1234abcd1234".to_string(),
+            amount_minor: 4000,
+            currency: "CNY".to_string(),
+            checkout_session_id: None,
+            payment_intent_id: None,
+            paid_at: None,
+            created_at: Utc::now(),
+            confirmed_at: None,
+        };
+        let transaction = WechatPayTransaction {
+            appid: "wx-app".to_string(),
+            mchid: "1900000000".to_string(),
+            out_trade_no: order.payment_reference.clone(),
+            transaction_id: Some("4200000000000000000".to_string()),
+            trade_type: Some("NATIVE".to_string()),
+            trade_state: "SUCCESS".to_string(),
+            success_time: Some("2026-05-11T12:00:00+08:00".to_string()),
+            amount: WechatPayTransactionAmount {
+                total: 4000,
+                currency: Some("CNY".to_string()),
+            },
+        };
+        assert!(validate_wechatpay_transaction_for_order(&config, &order, &transaction).is_ok());
+
+        let mut wrong_amount = transaction;
+        wrong_amount.amount.total = 1;
+        assert!(validate_wechatpay_transaction_for_order(&config, &order, &wrong_amount).is_err());
+    }
+
     fn config_for_security_tests() -> AppConfig {
         AppConfig {
             bind: "127.0.0.1:8080".to_string(),
@@ -3425,6 +4072,17 @@ mod tests {
             stripe_cancel_url: "https://ozon66.com/?checkout=cancelled#console".to_string(),
             stripe_currency: "cny".to_string(),
             stripe_standard_amount_minor: 4000,
+            wechat_api_base_url: "https://api.mch.weixin.qq.com".to_string(),
+            wechat_app_id: None,
+            wechat_mch_id: None,
+            wechat_merchant_serial_no: None,
+            wechat_merchant_private_key_pem: None,
+            wechat_api_v3_key: None,
+            wechat_pay_public_key_id: None,
+            wechat_pay_public_key_pem: None,
+            wechat_notify_url: "https://api.ozon66.com/webhooks/wechatpay".to_string(),
+            wechat_currency: "CNY".to_string(),
+            wechat_standard_amount_minor: 4000,
             skybridge_api_base_urls: vec![],
             allow_local_nebula_registration: false,
             cors_allowed_origins: DEV_CORS_ORIGINS
@@ -3468,7 +4126,7 @@ mod tests {
         let mut payload = timestamp.to_string().into_bytes();
         payload.push(b'.');
         payload.extend_from_slice(body);
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"whsec_test").unwrap();
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(b"whsec_test").unwrap();
         mac.update(&payload);
         let signature = hex_lower(&mac.finalize().into_bytes());
         let header = format!("t={timestamp},v1={signature}");
@@ -3482,6 +4140,15 @@ mod tests {
         let mut config = config_for_security_tests();
         config.payment_provider = ConfiguredPaymentProvider::Stripe;
         config.stripe_secret_key = Some(SecretString::from("sk_test_123"));
+        let bind: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        assert!(config.validate(bind).is_err());
+    }
+
+    #[test]
+    fn wechat_pay_config_requires_merchant_credentials() {
+        let mut config = config_for_security_tests();
+        config.payment_provider = ConfiguredPaymentProvider::WechatPay;
         let bind: SocketAddr = "127.0.0.1:8080".parse().unwrap();
 
         assert!(config.validate(bind).is_err());

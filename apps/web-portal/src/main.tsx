@@ -23,6 +23,7 @@ import {
   UserPlus,
   X
 } from "lucide-react";
+import { QRCodeSVG } from "qrcode.react";
 import "./styles.css";
 
 const API_BASE = normalizeBaseUrl(import.meta.env.VITE_CLOUD_API ?? defaultCloudApiBase());
@@ -105,6 +106,7 @@ type PaymentSession = {
   provider: string;
   checkout_url?: string | null;
   checkout_session_id?: string | null;
+  native_code_url?: string | null;
   payment_reference: string;
   amount_minor: number;
   currency: string;
@@ -1467,12 +1469,26 @@ function App() {
               {paymentSession && (
                 <div className="payment-note">
                   <CheckCircle2 size={18} />
-                  <span>{paymentSession.message}</span>
-                  {paymentSession.checkout_url && (
-                    <a href={paymentSession.checkout_url}>
-                      <ExternalLink size={16} /> 打开支付页
-                    </a>
-                  )}
+                  <div className="payment-note-body">
+                    <span>{paymentSession.message}</span>
+                    {paymentSession.native_code_url && (
+                      <div className="wechat-pay-box">
+                        <QRCodeSVG value={paymentSession.native_code_url} size={148} marginSize={2} />
+                        <div>
+                          <strong>微信扫码支付</strong>
+                          <p>
+                            支付备注：{paymentSession.payment_reference} ·{" "}
+                            {formatMoney(paymentSession.amount_minor, paymentSession.currency)}
+                          </p>
+                        </div>
+                      </div>
+                    )}
+                    {paymentSession.checkout_url && (
+                      <a href={paymentSession.checkout_url}>
+                        <ExternalLink size={16} /> 打开支付页
+                      </a>
+                    )}
+                  </div>
                 </div>
               )}
               <div className="command-row">

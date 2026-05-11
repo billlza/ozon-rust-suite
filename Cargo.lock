@@ -4028,6 +4028,7 @@ checksum = "c1b04fb49957986fdce4d6ee7a65027d55d4b6d2265e5848bbb507b58ccfdb6f"
 name = "ozon-cloud-api"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "argon2",
  "axum",
@@ -4039,6 +4040,7 @@ dependencies = [
  "rand 0.9.4",
  "rand_core 0.6.4",
  "reqwest 0.12.28",
+ "rsa",
  "secrecy",
  "serde",
  "serde_json",
@@ -5135,6 +5137,7 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rand_core 0.6.4",
+ "sha2",
  "signature",
  "spki",
  "subtle",

@@ -54,6 +54,28 @@ services:
         value: cny
       - key: OZON_SUITE_STRIPE_STANDARD_30D_AMOUNT_MINOR
         value: "4000"
+      - key: OZON_SUITE_WECHAT_API_BASE_URL
+        value: https://api.mch.weixin.qq.com
+      - key: OZON_SUITE_WECHAT_APP_ID
+        sync: false
+      - key: OZON_SUITE_WECHAT_MCH_ID
+        sync: false
+      - key: OZON_SUITE_WECHAT_MERCHANT_SERIAL_NO
+        sync: false
+      - key: OZON_SUITE_WECHAT_MERCHANT_PRIVATE_KEY_PEM
+        sync: false
+      - key: OZON_SUITE_WECHAT_API_V3_KEY
+        sync: false
+      - key: OZON_SUITE_WECHATPAY_PUBLIC_KEY_ID
+        sync: false
+      - key: OZON_SUITE_WECHATPAY_PUBLIC_KEY_PEM
+        sync: false
+      - key: OZON_SUITE_WECHAT_NOTIFY_URL
+        value: https://api.ozon66.com/webhooks/wechatpay
+      - key: OZON_SUITE_WECHAT_CURRENCY
+        value: CNY
+      - key: OZON_SUITE_WECHAT_STANDARD_30D_AMOUNT_MINOR
+        value: "4000"
       - key: RUST_LOG
         value: ozon_cloud_api=info,tower_http=info,axum=info
 

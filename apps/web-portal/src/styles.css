@@ -1063,18 +1063,23 @@ input[readonly] {
 }
 
 .payment-note {
-  align-items: center;
+  align-items: flex-start;
   background: #f2fbf6;
   border: 1px solid #b9e4ce;
   border-radius: 8px;
   color: #0c6445;
   display: flex;
-  flex-wrap: wrap;
   font-size: 13px;
   font-weight: 850;
   gap: 10px;
   min-height: 42px;
   padding: 10px 12px;
+}
+
+.payment-note-body {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
 }
 
 .payment-note a {
@@ -1083,6 +1088,36 @@ input[readonly] {
   display: inline-flex;
   gap: 6px;
   text-decoration: none;
+}
+
+.wechat-pay-box {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #cde0d4;
+  border-radius: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 12px;
+}
+
+.wechat-pay-box svg {
+  background: #ffffff;
+  border: 1px solid #edf2ed;
+  border-radius: 6px;
+  flex: 0 0 auto;
+}
+
+.wechat-pay-box strong {
+  display: block;
+  font-size: 15px;
+}
+
+.wechat-pay-box p {
+  color: #526057;
+  font-weight: 760;
+  line-height: 1.45;
+  margin: 4px 0 0;
 }
 
 .section-hint {
