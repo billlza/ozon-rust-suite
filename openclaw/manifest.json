@@ -36,7 +36,7 @@
       "name": "tasks.dry_run",
       "method": "POST",
       "path": "/tasks/dry-run",
-      "risk": "proposal_only",
+      "risk": "requires_local_approval",
       "approval_required": true
     },
     {
@@ -50,17 +50,16 @@
       "name": "schedules.ecommerce_read.propose",
       "method": "POST",
       "path": "/schedules/ecommerce-read/propose",
-      "risk": "proposal_only",
+      "risk": "requires_local_approval",
       "approval_required": true
     }
   ],
   "safety_rules": [
-    "OpenClaw can propose tasks but cannot approve or execute write tasks.",
-    "Every write operation is dry-run first and must be approved in the local UI.",
-    "The mock executor never sends real Ozon write requests.",
-    "The local skill API must bind to 127.0.0.1 and require x-openclaw-token for bridge calls.",
-    "Operator-only actions require x-local-token and are not exposed as OpenClaw tools.",
-    "OpenClaw may propose a read-only schedule, but cannot enable, disable, or run it.",
-    "Scheduled e-commerce reads use official Ozon seller APIs only; no captcha bypass, anti-bot bypass, or live 1688 scraping."
+    "Read tools use the Ozon credentials saved in the local node.",
+    "Changes that could affect store data require local operator approval.",
+    "The local skill API binds to 127.0.0.1 and requires x-openclaw-token for bridge calls.",
+    "Operator-only configuration and approval actions require x-local-token.",
+    "Scheduled reads use official Ozon seller APIs with bounded intervals and limits.",
+    "No captcha bypass, anti-bot bypass, live 1688 scraping, or unattended store writes."
   ]
 }

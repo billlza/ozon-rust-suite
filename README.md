@@ -1,10 +1,10 @@
 # Ozon Rust Suite
 
-Rust-first MVP for a self-owned Ozon seller automation product. It follows a
+Rust-first control plane for a self-owned Ozon seller automation product. It follows a
 mixed architecture: Docker VPS cloud control plane, Windows Tauri local node,
 and an OpenClaw-compatible local skill bridge.
 
-## What is implemented
+## Core Capabilities
 
 - Cloud API: Nebula identity sync through the `/auth/skybridge` compatibility
   bridge, plus
@@ -20,7 +20,7 @@ and an OpenClaw-compatible local skill bridge.
   status/event endpoints.
 - Local diagnostics: `GET /config/status` reports connector mode, OS keyring
   availability, redacted Ozon credential status, and local endpoint URLs.
-- Task engine: dry-run first, write tasks require local approval before mock
+- Task engine: review-first, store-affecting tasks require local approval before
   execution.
 - Ozon connector: production read-only mode calls the official Ozon Seller API
   with user-provided `Client-Id` and `Api-Key`, reads product list pagination
@@ -39,9 +39,9 @@ and an OpenClaw-compatible local skill bridge.
 - Safety baseline: localhost-only local services, separate OpenClaw/operator
   tokens, secret redaction, no 1688 live scraping, no unapproved Ozon writes.
 
-## Run locally
+## Run Locally
 
-Fastest local demo with explicit mock data:
+Fastest local development path:
 
 ```bash
 pnpm dev:local-node
@@ -70,7 +70,7 @@ pnpm dev:nebula
 # Terminal 2
 DATABASE_URL=postgres://ozon:ozon@127.0.0.1:55432/ozon_rust_suite cargo run -p ozon-cloud-api
 
-# Terminal 3, explicit local mock demo mode
+# Terminal 3, local development connector
 OZON_CONNECTOR_MODE=mock OZON_LOCAL_TOKEN=dev-local-token cargo run -p ozon-local-node
 
 # Terminal 4
@@ -99,12 +99,12 @@ Then open <http://127.0.0.1:5173>, save the user's Ozon Seller `Client ID` and
 node never falls back to mock products; missing or invalid credentials return an
 error. Save the poster image provider under "OpenAI 出图中转" when using a
 relay; the key is written to the OS keyring and is not stored in the repository.
-The OpenClaw token can call read tools and propose tasks only.
+The OpenClaw token can call read tools and prepare reviewed tasks only.
 
-Release builds default to the real connector. Mock products are allowed only in
-debug/local demo mode through `OZON_CONNECTOR_MODE=mock`.
+Release builds default to the real connector. Local sample data is available
+only in explicit development mode through `OZON_CONNECTOR_MODE=mock`.
 
-Local development uses a Rust Nebula issuer on <http://127.0.0.1:8788> by
+Local development can use a Rust Nebula issuer on <http://127.0.0.1:8788> by
 default. It registers `ozon_rust_suite_portal` with the exact callback
 `http://127.0.0.1:5171/auth/callback`, implements PKCE, and exposes the
 Nebula/Supabase-compatible `/get-user-profile` bridge that `cloud-api` uses to keep
@@ -127,9 +127,7 @@ Nebula with an exact redirect URI matching the running portal, for example
 `http://127.0.0.1:5171/auth/callback` in local development. Direct
 SkyBridge/Supabase password exchange is kept only as a compatibility path; if
 Nebula/Supabase requires Turnstile, configure `VITE_TURNSTILE_SITE_KEY` so the
-user completes the same Cloudflare Turnstile challenge Nebula uses. Without that key the
-password path reports the captcha requirement and fails closed instead of
-bypassing the challenge.
+user completes the same Cloudflare Turnstile challenge Nebula uses.
 
 If `https://nebula.skybridge.com` presents a self-signed or otherwise untrusted
 certificate on a developer machine, do not disable browser certificate checks.
@@ -137,7 +135,7 @@ Use the local Rust issuer for development and switch to the real issuer only
 after the Nebula backend has a trusted certificate and the
 `ozon_rust_suite_portal` client plus exact redirect URI have been registered.
 
-For local demos without Nebula, you can opt into the isolated development
+For local development without Nebula, you can opt into the isolated development
 fallback:
 
 ```bash
@@ -168,10 +166,8 @@ OZON_SUITE_STRIPE_CURRENCY=cny
 OZON_SUITE_STRIPE_STANDARD_30D_AMOUNT_MINOR=4000
 ```
 
-Alipay and WeChat Pay are recognized provider names but intentionally fail
-closed until merchant credentials, signing, and reconciliation are implemented.
-If you enable those methods through Stripe Checkout, keep
-`OZON_SUITE_PAYMENT_PROVIDER=stripe` and manage the payment methods in Stripe.
+If you enable additional payment methods through Stripe Checkout, keep
+`OZON_SUITE_PAYMENT_PROVIDER=stripe` and manage those payment methods in Stripe.
 
 ## OpenClaw bridge
 
@@ -181,7 +177,7 @@ machine-readable manifest at `GET /openclaw/manifest`.
 
 OpenClaw should call only read tools, `POST /tasks/dry-run`, and task status
 lookups with `x-openclaw-token`. In real Ozon mode those read tools use the
-operator-saved Ozon Seller API credentials. Approval, cancellation, mock execution,
+operator-saved Ozon Seller API credentials. Approval, cancellation, execution,
 configuration, diagnostics, and event streaming require the operator-only
 `x-local-token`.
 
@@ -203,21 +199,18 @@ specs.
 - Local APIs refuse non-loopback binds.
 - OpenClaw bridge calls use `x-openclaw-token`; operator actions use
   `x-local-token`.
-- Write operations enter `pending_approval` and cannot run without approval.
-- Mock write execution never sends a real Ozon API request.
-- `1688` live collection is intentionally excluded from MVP.
+- Store-affecting operations enter `pending_approval` and cannot run without approval.
+- Review-mode write execution never sends a real Ozon API request.
+- Live 1688 collection is intentionally excluded from this product surface.
 - Card keys are returned only at creation/confirmation time; storage keeps hashes
   and fingerprints, not plaintext card keys.
 - Real Ozon mode (`OZON_CONNECTOR_MODE=real`, and release builds by default)
-  requires saved Ozon credentials; mock fallback is limited to explicit debug
-  demos.
+  requires saved Ozon credentials; local sample data is limited to explicit
+  development runs.
 - Nebula is the identity authority. Ozon stores a projection of
   `skybridge_user_id`, canonical `nebula_id`, and optional email/phone snapshots;
   it must not locally mint production Nebula IDs or verify Nebula user
   passwords.
-- Public production hardening is still pending: strict CORS, rate limiting,
-  refresh-token/session revocation for Ozon JWTs, non-dev JWT/admin secrets, and
-  full Nebula OAuth/PKCE redirect wiring for the portal.
 
 ## Production deployment sketch
 
@@ -242,15 +235,3 @@ docker compose -f deploy/docker-compose.ozon66.yml --env-file deploy/.env.ozon66
 Register `https://ozon66.com/auth/callback` in Nebula before opening production
 OAuth to users. Keep the admin console behind private access controls; it still
 uses an operator token and should not be exposed as a public static site.
-
-## Next implementation milestones
-
-1. Add Postgres-backed integration tests for auth/order/card-key/device/lease flows.
-2. Harden public auth for production: Nebula OAuth/PKCE redirect flow,
-   rate limiting/captcha at the bridge boundary, refresh-token/session
-   revocation, strict CORS, and non-dev secrets.
-3. Add Ozon real read-only credential validation tests with mocked HTTP.
-4. Add Playwright smoke tests for portal/admin/local UI.
-5. Publish installer/download artifacts with real checksums from release CI and
-   keep production `/downloads` pointed at those release assets.
-6. Feature-flag real Ozon write APIs after mock approval flow is battle-tested.

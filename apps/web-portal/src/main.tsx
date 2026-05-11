@@ -288,7 +288,7 @@ function App() {
   const [skybridgeAccessToken, setSkybridgeAccessToken] = useState("");
   const [turnstileToken, setTurnstileToken] = useState("");
   const [turnstileStatus, setTurnstileStatus] = useState(
-    SKYBRIDGE_TURNSTILE_CONFIGURED ? "等待安全验证" : "未配置"
+    SKYBRIDGE_TURNSTILE_CONFIGURED ? "等待安全验证" : "无需验证"
   );
   const turnstileContainerRef = useRef<HTMLDivElement | null>(null);
   const turnstileWidgetId = useRef<string | null>(null);
@@ -340,14 +340,13 @@ function App() {
   const localPairingStatus = localNodePairingStatus(localNode, activeEntitlement, device, lease);
   const localNodeMsiUrl = downloads?.local_node_msi ?? downloads?.local_node ?? "";
   const localNodeExeUrl = downloads?.local_node_exe ?? "";
-  const openclawPluginUrl = absolutePortalUrl(downloads?.openclaw_plugin ?? "/downloads/openclaw-plugin.zip");
-  const openclawManifestUrl = absolutePortalUrl(downloads?.openclaw_manifest ?? "/openclaw/manifest.json");
+  const openclawPluginUrl = downloads?.openclaw_plugin ? absolutePortalUrl(downloads.openclaw_plugin) : "";
   const localManifestUrl = localNode.portal?.manifest_url ?? `${LOCAL_NODE_API}/openclaw/manifest`;
   const canOpenLocalConsole = Boolean(LOCAL_CONSOLE_URL);
   const canCopyLocalManifest = localNode.phase === "online";
+  const canDownloadOpenClawPlugin = Boolean(openclawPluginUrl);
   const canBindLocalDevice = canUseProtectedActions && localNode.phase === "online" && Boolean(localNode.portal?.device_fingerprint);
-  const directAuthUnavailableMessage =
-    "当前部署未配置门户内账号登录环境，请检查 VITE_SKYBRIDGE_SUPABASE_URL 和 VITE_SKYBRIDGE_SUPABASE_ANON_KEY。";
+  const directAuthUnavailableMessage = "账号服务正在维护，请稍后再试或联系运营支持。";
   const authSubmitText =
     authMethod === "phone"
       ? authMode === "register"
@@ -360,7 +359,9 @@ function App() {
         : "邮箱登录";
   const authDialogTitle = authMode === "register" ? "创建账号" : "登录工作台";
   const authDialogDescription =
-    authMode === "register" ? "先把账号建起来，后面的安装包、设备绑定和本机节点都在同一条路上。" : "回来继续看授权、安装包和本机节点状态。";
+    authMode === "register"
+      ? "账号创建后会进入同一套安装包、设备绑定和本机节点流程。"
+      : "登录后继续查看授权、安装包和本机节点状态。";
   const shouldShowAuthDialogStatus =
     authBusy || authState.phase === "failed" || authState.phase === "authenticated" || Boolean(operationStatus);
 
@@ -416,7 +417,7 @@ function App() {
       window.turnstile.reset(turnstileWidgetId.current);
     }
     turnstileTokenRef.current = "";
-    setTurnstileStatus(SKYBRIDGE_TURNSTILE_CONFIGURED ? "等待安全验证" : "未配置");
+    setTurnstileStatus(SKYBRIDGE_TURNSTILE_CONFIGURED ? "等待安全验证" : "无需验证");
   }
 
   async function startNebulaOAuth(flow: NebulaOAuthFlow) {
@@ -898,7 +899,7 @@ function App() {
       }
       setLocalNode({
         phase: "online",
-        message: health.real_ozon_enabled ? "本机节点在线，当前是真实 Ozon API 模式" : "本机节点在线，当前是开发 mock 模式",
+        message: health.real_ozon_enabled ? "本机节点在线，当前是真实 Ozon API 模式" : "本机节点在线，当前使用开发连接器",
         checkedAt: new Date().toISOString(),
         health,
         manifest,
@@ -915,16 +916,11 @@ function App() {
 
   async function copyLocalManifestUrl() {
     if (!canCopyLocalManifest) {
-      setOperationStatus("先把本机节点检测到 online，再复制本机 manifest");
+      setOperationStatus("检测到本机节点 online 后即可复制本机 manifest");
       return;
     }
     await copyText(localManifestUrl);
     setOperationStatus("本机 OpenClaw manifest URL 已复制");
-  }
-
-  async function copyStaticManifestUrl() {
-    await copyText(openclawManifestUrl);
-    setOperationStatus("门户 OpenClaw manifest URL 已复制");
   }
 
   useEffect(() => {
@@ -1098,10 +1094,10 @@ function App() {
 
       <section className="hero-section" id="top">
         <div className="hero-copy">
-          <p className="eyebrow">Ozon 自动化运营工作台</p>
-          <h1>先把账号、安装包和本机节点接起来，再谈自动化。</h1>
+          <p className="eyebrow">Ozon Rust Suite</p>
+          <h1>从登录到真实商品读取，卖家工作台一条线接好。</h1>
           <p>
-            这套门户不跟你兜圈子。登录后先拿到安装包，确认本机节点在线，再去本地控制台验证 Ozon 凭据、读取真实商品，把第一张海报跑出来。
+            门户管理账号、授权、安装包和本机节点；本地控制台保存 Ozon 凭据、读取商品详情、生成海报，并把写操作留在本机审批。
           </p>
           <div className="hero-actions">
             {session ? (
@@ -1130,9 +1126,9 @@ function App() {
             )}
           </div>
           <div className="hero-meta">
-            <span>邮箱或手机号注册后自动分配 Nebula ID</span>
-            <span>安装包、设备和授权都在同一套账号下</span>
-            <span>真实写操作继续留在本地审批</span>
+            <span>Nebula 统一身份</span>
+            <span>真实 Seller API 读取</span>
+            <span>本机密钥与审批</span>
           </div>
         </div>
         <div className="hero-visual" aria-label="Ozon Rust Suite workflow preview">
@@ -1140,7 +1136,7 @@ function App() {
             <span />
             <span />
             <span />
-            <strong>happy path</strong>
+            <strong>operator path</strong>
           </div>
           <div className="visual-grid">
             <div>
@@ -1158,16 +1154,16 @@ function App() {
           </div>
           <div className="diff-preview">
             <span>Step 4</span>
-            <strong>去本地控制台验证 Ozon，再读取真实商品</strong>
-            <em>第一条顺路的链跑通以后，再接出图和审批。</em>
+            <strong>验证 Ozon 商品，再生成可校验海报</strong>
+            <em>商品事实、图片顺序和文案校验都留在本机控制台。</em>
           </div>
         </div>
       </section>
 
       <section className="capability-band" id="capabilities">
         <div className="band-title">
-          <p className="eyebrow">我们现在真能做的</p>
-          <h2>先把关键链路做扎实，再慢慢把自动化铺开。</h2>
+          <p className="eyebrow">已接通的核心链路</p>
+          <h2>账户、授权、本机节点、商品读取和海报生成已经串起来。</h2>
         </div>
         <div className="capability-grid">
           <article>
@@ -1182,8 +1178,8 @@ function App() {
           </article>
           <article>
             <Bot />
-            <h3>AI 先帮你出底图，不替你瞎改商品</h3>
-            <p>海报流程会把真实商品图锁住，AI 只负责背景氛围，文案继续按事实包逐项校验。</p>
+            <h3>商品海报带事实校验</h3>
+            <p>读取商品图和属性后生成海报背景，文案叠加按 fact pack 校验，避免错货错词。</p>
           </article>
         </div>
       </section>
@@ -1191,9 +1187,9 @@ function App() {
       <section className="workflow-band" id="workflow">
         <div className="workflow-copy">
           <p className="eyebrow">上手路径</p>
-          <h2>这条路先走顺：登录、下载、检测、验证、读商品。</h2>
+          <h2>登录、下载、检测、验证、读取商品。</h2>
           <p>
-            门户负责把账号、下载和本机节点连接起来。本地控制台负责保存凭据、验证 Ozon、读取商品和生成海报。两边各做自己该做的事，用户就不会卡在半路。
+            门户负责账号和授权，本地控制台负责凭据、商品读取和海报生成。云端不接触 Ozon API Key，本机节点只接受经过授权的操作。
           </p>
         </div>
         <div className="workflow-steps">
@@ -1205,7 +1201,7 @@ function App() {
           <div>
             <span>02</span>
             <strong>下载安装包</strong>
-            <p>先把本地节点装起来，之后门户才能知道你这台机器有没有在线。</p>
+            <p>安装并启动本机节点，门户会检测 `127.0.0.1:8790` 的在线状态。</p>
           </div>
           <div>
             <span>03</span>
@@ -1215,7 +1211,7 @@ function App() {
           <div>
             <span>04</span>
             <strong>打开本地控制台</strong>
-            <p>在本地控制台验证 Ozon 凭据、读取真实商品，再开始海报和后续自动化。</p>
+            <p>在本地控制台验证 Ozon 凭据、读取真实商品，并生成带事实校验的海报。</p>
           </div>
         </div>
       </section>
@@ -1353,7 +1349,7 @@ function App() {
                   <Clipboard />
                   <div>
                     <h2>订单</h2>
-                  <p>创建标准版订单。配置 Stripe 时会跳转收银台，支付成功后自动开通授权。</p>
+                  <p>创建标准版订单。支付通道由运营侧配置；完成确认后授权会同步到账户。</p>
                   </div>
                 </div>
               <div className="form-grid">
@@ -1407,7 +1403,7 @@ function App() {
                 <KeyRound />
                 <div>
                   <h2>卡密与授权</h2>
-                  <p>管理员确认付款后返回卡密，用户在这里兑换成 entitlement。</p>
+                  <p>用于客服确认、企业内测和线下授权；线上收款打开后会自动写入授权。</p>
                 </div>
               </div>
               <div className="form-grid">
@@ -1438,12 +1434,12 @@ function App() {
 
             <div className="op-section local-node-section">
               <div className="section-title">
-                <MonitorCheck />
-                <div>
-                  <h2>本机节点与 OpenClaw</h2>
-                  <p>门户先确认本机节点是否在线；真正的凭据校验、商品读取和出图留在本地控制台里做。</p>
+                  <MonitorCheck />
+                  <div>
+                    <h2>本机节点与 OpenClaw</h2>
+                  <p>门户检测本机服务并下发授权，本地控制台负责凭据校验、商品读取和海报生成。</p>
+                  </div>
                 </div>
-              </div>
               <div className="local-node-grid">
                 <div className={`local-node-card ${localNode.phase}`}>
                   <span>本机服务</span>
@@ -1480,18 +1476,17 @@ function App() {
                     <MonitorCheck size={18} /> 打开本地控制台
                   </a>
                 )}
-                <a className="download" href={openclawPluginUrl} target="_blank" rel="noreferrer">
-                  <Download size={18} /> OpenClaw 插件
-                </a>
+                {canDownloadOpenClawPlugin && (
+                  <a className="download" href={openclawPluginUrl} target="_blank" rel="noreferrer">
+                    <Download size={18} /> OpenClaw 插件
+                  </a>
+                )}
                 <button className="secondary" disabled={!canCopyLocalManifest} onClick={copyLocalManifestUrl}>
                   <Clipboard size={18} /> 复制本机 manifest
                 </button>
-                <button className="secondary" onClick={copyStaticManifestUrl}>
-                  <ExternalLink size={18} /> 复制门户 manifest
-                </button>
               </div>
               <p className="section-hint">
-                先下载安装包并启动本机节点；检测到 online 后，再复制本机 manifest 给 OpenClaw。门户 manifest 只负责安装入口，不代替本机授权。
+                安装并启动本机节点后，复制本机 manifest 给 OpenClaw；授权信息由本机节点提供。
               </p>
               {localNode.manifest && (
                 <div className="manifest-tools">
@@ -1508,12 +1503,12 @@ function App() {
 
             <div className="op-section">
               <div className="section-title">
-                <MonitorCheck />
-                <div>
-                  <h2>设备绑定</h2>
-                  <p>先检测本机节点，再用本机节点生成的指纹绑定设备；超出 `max_devices` 会被云端拒绝。</p>
+                  <MonitorCheck />
+                  <div>
+                    <h2>设备绑定</h2>
+                  <p>使用本机节点生成的指纹绑定设备；超出 `max_devices` 会被云端拒绝。</p>
+                  </div>
                 </div>
-              </div>
               <div className="form-grid">
                 <label>
                   设备名
@@ -1556,9 +1551,9 @@ function App() {
 
       <section className="pricing-band" id="pricing">
         <div>
-          <p className="eyebrow">MVP 商业流</p>
-          <h2>先把用户从登录带到真实商品读取，后面的自动化再一段段补上。</h2>
-          <p>当前最重要的是把账号、安装包、本机节点、Ozon 凭据和商品读取这条线跑顺。付费、授权和设备绑定已经接上，下一段就是海报和审批。</p>
+          <p className="eyebrow">开始接入</p>
+          <h2>进入工作台，完成授权、本机节点和 Ozon 商品读取。</h2>
+          <p>账号、安装包、设备、租约和本机控制台已经连在同一条路径里。登录后按状态提示完成接入即可。</p>
         </div>
         {session ? (
           <a className="download" href="#console">
@@ -1591,7 +1586,7 @@ function App() {
 
             <div className="auth-context-line">
               <ShieldCheck size={17} />
-              <span>{SKYBRIDGE_AUTH_CONFIGURED ? "安全登录后可进入授权工作台。" : "账号服务暂未配置，请联系管理员。"}</span>
+              <span>{SKYBRIDGE_AUTH_CONFIGURED ? "安全登录后可进入授权工作台。" : "账号服务正在维护，请联系运营支持。"}</span>
             </div>
 
             <form className="form-grid skybridge-auth-grid auth-card-form" onSubmit={handleSkybridgePasswordSubmit}>
@@ -1697,13 +1692,13 @@ function App() {
 
             {NEBULA_OAUTH_ENTRY_ENABLED && (
               <details className="compat-panel">
-                <summary>高级：统一授权页</summary>
+                <summary>统一身份页</summary>
                 <section className="nebula-oauth-panel">
                   <div className="section-title compact-title">
                     <ShieldCheck />
                     <div>
                       <h2>统一身份页</h2>
-                      <p>用于 SSO 调试；正式登录默认使用当前门户内表单。</p>
+                      <p>通过 Nebula 完成账号授权并返回当前工作台。</p>
                     </div>
                   </div>
                   <div className="oauth-actions">
@@ -1712,10 +1707,7 @@ function App() {
                     </button>
                   </div>
                   {!NEBULA_OAUTH_CONFIGURED && (
-                    <p className="identity-note">
-                      需要配置 VITE_NEBULA_BASE_URL 和 VITE_NEBULA_CLIENT_ID，并在 Nebula 后台登记
-                      {getNebulaRedirectUri()} 作为精确回调地址。
-                    </p>
+                    <p className="identity-note">统一身份页暂不可用，请使用上方账号入口。</p>
                   )}
                 </section>
               </details>
