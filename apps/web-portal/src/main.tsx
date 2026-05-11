@@ -411,6 +411,24 @@ function App() {
     setAuthDialogMode(null);
   }
 
+  function resetSessionState() {
+    localStorage.removeItem(SESSION_KEY);
+    setSession(null);
+    setEntitlements([]);
+    setOrder(null);
+    setPaymentSession(null);
+    setDevice(null);
+    setLease(null);
+  }
+
+  function expireSession(requestId: number) {
+    resetSessionState();
+    setAuthMode("login");
+    setAuthDialogMode("login");
+    setOperationStatus(null);
+    dispatchAuth({ type: "failure", message: "登录已过期，请重新登录", requestId });
+  }
+
   function openAuthDialog(mode: AuthMode) {
     setAuthMode(mode);
     setAuthDialogMode(mode);
@@ -764,6 +782,10 @@ function App() {
       dispatchAuth({ type: "success", message: "账户状态已刷新", requestId: currentRequestId });
     } catch (error) {
       if (isCurrentAuth(currentRequestId)) {
+        if (isInvalidSessionError(error)) {
+          expireSession(currentRequestId);
+          return;
+        }
         dispatchAuth({
           type: "failure",
           message: `账户刷新失败：${errorMessage(error)}`,
@@ -776,13 +798,7 @@ function App() {
   function logout() {
     const requestId = authRequestId.current + 1;
     authRequestId.current = requestId;
-    localStorage.removeItem(SESSION_KEY);
-    setSession(null);
-    setEntitlements([]);
-    setOrder(null);
-    setPaymentSession(null);
-    setDevice(null);
-    setLease(null);
+    resetSessionState();
     setOperationStatus(null);
     dispatchAuth({ type: "signed_out", message: "已退出登录", requestId });
   }
@@ -2576,6 +2592,16 @@ function normalizeBaseUrl(value: string) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "unknown error";
+}
+
+function isInvalidSessionError(error: unknown) {
+  const normalized = errorMessage(error).toLowerCase();
+  return (
+    normalized.includes("invalid bearer token") ||
+    normalized.includes("missing bearer token") ||
+    normalized.includes("expired bearer token") ||
+    normalized.includes("jwt expired")
+  );
 }
 
 function skybridgeDirectAuthFailureMessage(error: unknown) {
