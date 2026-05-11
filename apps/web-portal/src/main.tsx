@@ -59,6 +59,10 @@ const NEBULA_OAUTH_CONFIGURED = Boolean(NEBULA_OAUTH_BASE && NEBULA_CLIENT_ID);
 const SKYBRIDGE_TURNSTILE_SITE_KEY = (import.meta.env.VITE_TURNSTILE_SITE_KEY ?? "").trim();
 const SKYBRIDGE_TURNSTILE_CONFIGURED = Boolean(SKYBRIDGE_TURNSTILE_SITE_KEY);
 const REQUEST_TIMEOUT_MS = 15_000;
+const DEFAULT_LOCAL_NODE_MSI_URL =
+  "https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/OzonRustLocal-x64.msi";
+const DEFAULT_LOCAL_NODE_EXE_URL =
+  "https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/OzonRustLocalSetup-x64.exe";
 
 type User = {
   id: string;
@@ -338,8 +342,8 @@ function App() {
   const directAuthNeedsTurnstile = SKYBRIDGE_TURNSTILE_CONFIGURED && !turnstileToken;
   const authDialogOpen = authDialogMode !== null;
   const localPairingStatus = localNodePairingStatus(localNode, activeEntitlement, device, lease);
-  const localNodeMsiUrl = downloads?.local_node_msi ?? downloads?.local_node ?? "";
-  const localNodeExeUrl = downloads?.local_node_exe ?? "";
+  const localNodeMsiUrl = downloads?.local_node_msi ?? downloads?.local_node ?? DEFAULT_LOCAL_NODE_MSI_URL;
+  const localNodeExeUrl = downloads?.local_node_exe ?? DEFAULT_LOCAL_NODE_EXE_URL;
   const openclawPluginUrl = downloads?.openclaw_plugin ? absolutePortalUrl(downloads.openclaw_plugin) : "";
   const localManifestUrl = localNode.portal?.manifest_url ?? `${LOCAL_NODE_API}/openclaw/manifest`;
   const canOpenLocalConsole = Boolean(LOCAL_CONSOLE_URL);
@@ -364,6 +368,13 @@ function App() {
       : "登录后继续查看授权、安装包和本机节点状态。";
   const shouldShowAuthDialogStatus =
     authBusy || authState.phase === "failed" || authState.phase === "authenticated" || Boolean(operationStatus);
+  const setupStatus = setupStatusModel({
+    activeEntitlement,
+    device,
+    lease,
+    localNode,
+    order
+  });
 
   async function api<T>(path: string, init: RequestInit = {}, token = session?.token): Promise<T> {
     const response = await fetchWithTimeout(`${API_BASE}${path}`, {
@@ -375,6 +386,11 @@ function App() {
       }
     });
     return parseResponse<T>(response);
+  }
+
+  async function fetchDownloads() {
+    const response = await fetchWithTimeout(`${API_BASE}/downloads`);
+    return parseResponse<Downloads>(response);
   }
 
   function beginAuth(phase: AuthPhase, message: string) {
@@ -737,12 +753,14 @@ function App() {
         fetchWithTimeout(`${API_BASE}/me`, {
           headers: { Authorization: `Bearer ${token}` }
         }).then(async (response) => parseResponse<{ user: User; entitlements: Entitlement[] }>(response)),
-        fetchWithTimeout(`${API_BASE}/downloads`).then(async (response) => parseResponse<Downloads>(response))
+        fetchDownloads().catch(() => null)
       ]);
       if (!isCurrentAuth(currentRequestId)) return;
       setSession((current) => (current ? { ...current, user: me.user } : { token, user: me.user }));
       setEntitlements(me.entitlements);
-      setDownloads(downloadData);
+      if (downloadData) {
+        setDownloads(downloadData);
+      }
       dispatchAuth({ type: "success", message: "账户状态已刷新", requestId: currentRequestId });
     } catch (error) {
       if (isCurrentAuth(currentRequestId)) {
@@ -815,7 +833,7 @@ function App() {
       setPaymentSession(data.payment ?? null);
       setOperationStatus(
         data.order.status === "confirmed"
-          ? "订单已确认，授权状态会在账户刷新后生效"
+          ? confirmedOrderMessage(data.order)
           : `订单状态已刷新：${data.order.status}`
       );
     } catch (error) {
@@ -926,6 +944,13 @@ function App() {
   useEffect(() => {
     let cancelled = false;
     async function bootPortal() {
+      fetchDownloads()
+        .then((downloadData) => {
+          if (!cancelled) setDownloads(downloadData);
+        })
+        .catch(() => {
+          // Download links have stable release fallbacks; keep the account flow usable.
+        });
       const handledCallback = await completeNebulaOAuthCallback();
       if (cancelled || handledCallback) return;
 
@@ -1344,36 +1369,85 @@ function App() {
           </div>
 
           <section className="operations">
+            <div className={`setup-panel ${setupStatus.kind}`}>
+              <div>
+                <span>当前下一步</span>
+                <h2>{setupStatus.title}</h2>
+                <p>{setupStatus.message}</p>
+              </div>
+              <div className="setup-actions">
+                {!activeEntitlement && (
+                  <button disabled={!canUseProtectedActions} onClick={createOrder}>
+                    <ArrowRight size={18} /> 提交开通申请
+                  </button>
+                )}
+                {localNode.phase !== "online" && (
+                  <>
+                    <a className="download" href={localNodeMsiUrl}>
+                      <Download size={18} /> 下载 MSI
+                    </a>
+                    <a className="download secondary" href={localNodeExeUrl}>
+                      <Download size={18} /> 下载 EXE
+                    </a>
+                    <button className="secondary" disabled={localNode.phase === "checking"} onClick={probeLocalNode}>
+                      <RefreshCcw size={18} /> 检测本机节点
+                    </button>
+                  </>
+                )}
+                {activeEntitlement && localNode.phase === "online" && !device && (
+                  <button disabled={!canBindLocalDevice} onClick={activateDevice}>
+                    <MonitorCheck size={18} /> 绑定设备
+                  </button>
+                )}
+                {activeEntitlement && device && !lease && (
+                  <button className="secondary" onClick={issueLease} disabled={authBusy}>
+                    <Radio size={18} /> 签发租约
+                  </button>
+                )}
+                {setupStatus.kind === "online" && canOpenLocalConsole && (
+                  <a className="download" href={LOCAL_CONSOLE_URL} target="_blank" rel="noreferrer">
+                    <MonitorCheck size={18} /> 打开本地控制台
+                  </a>
+                )}
+              </div>
+            </div>
+
             <div className="op-section">
               <div className="section-title">
                   <Clipboard />
                   <div>
-                    <h2>订单</h2>
-                  <p>创建标准版订单。支付通道由运营侧配置；完成确认后授权会同步到账户。</p>
+                    <h2>开通申请</h2>
+                  <p>收款通道打开前，这里用于提交授权申请；运营确认后会发送卡密，兑换后授权同步到账户。</p>
                   </div>
                 </div>
-              <div className="form-grid">
-                <label>
-                  订单 UUID
-                  <input value={order?.id ?? ""} readOnly placeholder="创建订单后生成" />
-                </label>
-                <label>
-                  支付备注
-                  <input value={order?.payment_reference ?? ""} readOnly placeholder="OZON-..." />
-                </label>
-                <label>
-                  订单状态
-                  <input value={order?.status ?? "none"} readOnly />
-                </label>
-                <label>
-                  支付方式
-                  <input value={order?.payment_provider ?? "未创建"} readOnly />
-                </label>
-                <label>
-                  金额
-                  <input value={order ? formatMoney(order.amount_minor, order.currency) : "未创建"} readOnly />
-                </label>
-              </div>
+              {order ? (
+                <div className="form-grid">
+                  <label>
+                    申请编号
+                    <input value={order.id} readOnly />
+                  </label>
+                  <label>
+                    支付备注
+                    <input value={order.payment_reference} readOnly />
+                  </label>
+                  <label>
+                    开通状态
+                    <input value={order.status} readOnly />
+                  </label>
+                  <label>
+                    通道
+                    <input value={order.payment_provider} readOnly />
+                  </label>
+                  <label>
+                    金额
+                    <input value={formatMoney(order.amount_minor, order.currency)} readOnly />
+                  </label>
+                </div>
+              ) : (
+                <p className="section-hint">
+                  当前账号还没有开通记录。提交申请后会生成编号；如果你已有卡密，也可以直接在下方兑换。
+                </p>
+              )}
               {paymentSession && (
                 <div className="payment-note">
                   <CheckCircle2 size={18} />
@@ -1387,25 +1461,25 @@ function App() {
               )}
               <div className="command-row">
                 <button disabled={!canUseProtectedActions} onClick={createOrder}>
-                  <ArrowRight size={18} /> 创建订单
+                  <ArrowRight size={18} /> 提交开通申请
                 </button>
                 <button className="secondary" onClick={copyOrderInfo} disabled={!order}>
-                  复制订单信息
+                  复制申请信息
                 </button>
                 <button className="secondary" onClick={refreshOrder} disabled={!order || authBusy}>
-                  <RefreshCcw size={18} /> 刷新订单
+                  <RefreshCcw size={18} /> 刷新状态
                 </button>
               </div>
             </div>
 
-            <div className="op-section">
-              <div className="section-title">
-                <KeyRound />
+            <details className="op-section support-section">
+              <summary>
+                <KeyRound size={20} />
                 <div>
-                  <h2>卡密与授权</h2>
-                  <p>用于客服确认、企业内测和线下授权；线上收款打开后会自动写入授权。</p>
+                  <strong>已有卡密？兑换授权</strong>
+                  <span>客服确认、企业内测或线下开通时使用。</span>
                 </div>
-              </div>
+              </summary>
               <div className="form-grid">
                 <label>
                   卡密
@@ -1424,13 +1498,8 @@ function App() {
                 <button disabled={!canUseProtectedActions} onClick={redeem}>
                   <KeyRound size={18} /> 兑换授权
                 </button>
-                {downloads && (
-                  <a className="download" href={localNodeMsiUrl || downloads.local_node}>
-                    <Download size={18} /> 下载本地节点
-                  </a>
-                )}
               </div>
-            </div>
+            </details>
 
             <div className="op-section local-node-section">
               <div className="section-title">
@@ -1485,6 +1554,9 @@ function App() {
                   <Clipboard size={18} /> 复制本机 manifest
                 </button>
               </div>
+              {localNode.phase !== "online" && (
+                <p className="action-reason">安装并启动本机节点后，回到这里点击“检测本机节点”。检测到 online 后才能复制 manifest、绑定设备和签发租约。</p>
+              )}
               <p className="section-hint">
                 安装并启动本机节点后，复制本机 manifest 给 OpenClaw；授权信息由本机节点提供。
               </p>
@@ -1536,6 +1608,13 @@ function App() {
                   <Radio size={18} /> 签发租约
                 </button>
               </div>
+              {!activeEntitlement && <p className="action-reason">设备绑定需要有效授权。请先提交开通申请，或兑换已有卡密。</p>}
+              {activeEntitlement && localNode.phase !== "online" && (
+                <p className="action-reason">设备绑定需要本机节点 online。请先启动本机节点并重新检测。</p>
+              )}
+              {activeEntitlement && localNode.phase === "online" && !device && (
+                <p className="action-reason">本机节点已在线，可以绑定这台设备。</p>
+              )}
               {lease && (
                 <div className="lease-line">
                   <span>Lease</span>
@@ -1877,6 +1956,13 @@ function localNodeStatusLabel(phase: LocalNodePhase) {
   }
 }
 
+function confirmedOrderMessage(order: Order) {
+  if (order.payment_provider === "manual") {
+    return "申请已人工确认。请使用运营发送的卡密兑换授权。";
+  }
+  return "订单已确认，授权状态会在账户刷新后生效";
+}
+
 function localNodePairingStatus(
   localNode: LocalNodeProbe,
   entitlement: Entitlement | null,
@@ -1908,6 +1994,59 @@ function localNodePairingStatus(
     kind: localNode.phase === "online" ? "online" : "warn",
     title: localNode.phase === "online" ? "已配对" : "云端已授权",
     message: `Lease ${lease.lease_id} 已签发，过期时间 ${lease.expires_at}。`
+  };
+}
+
+function setupStatusModel(input: {
+  activeEntitlement: Entitlement | null;
+  device: Device | null;
+  lease: Lease | null;
+  localNode: LocalNodeProbe;
+  order: Order | null;
+}) {
+  const nodeOnline = input.localNode.phase === "online";
+  if (!input.activeEntitlement && !nodeOnline) {
+    return {
+      kind: "warn",
+      title: "本机节点和授权都还没接上",
+      message:
+        "下载安装包并启动本机节点，同时提交开通申请或兑换已有卡密。两件事完成后，设备绑定和租约会自动变成可操作。"
+    };
+  }
+  if (!nodeOnline) {
+    return {
+      kind: "warn",
+      title: "启动本机节点",
+      message: "授权已经存在。现在下载安装包并启动本机节点，检测到 online 后即可绑定设备。"
+    };
+  }
+  if (!input.activeEntitlement) {
+    return {
+      kind: input.order ? "warn" : "offline",
+      title: input.order ? "等待授权开通" : "开通账户授权",
+      message: input.order
+        ? "开通申请已生成。收到卡密并兑换后，设备绑定和租约会变成可操作。"
+        : "本机节点已经在线。提交开通申请或兑换已有卡密后，就能绑定设备并签发本机租约。"
+    };
+  }
+  if (!input.device) {
+    return {
+      kind: "warn",
+      title: "绑定这台设备",
+      message: "本机节点在线且授权有效。使用本机节点生成的设备指纹完成绑定。"
+    };
+  }
+  if (!input.lease) {
+    return {
+      kind: "warn",
+      title: "签发本机租约",
+      message: "设备已绑定。签发租约后，本机控制台会显示云端授权状态。"
+    };
+  }
+  return {
+    kind: "online",
+    title: "工作台已接通",
+    message: "账号授权、设备绑定和本机租约都已就绪，可以打开本地控制台读取 Ozon 商品并生成海报。"
   };
 }
 
