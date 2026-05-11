@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, net::SocketAddr};
+use std::{collections::HashMap, env, net::SocketAddr, str::FromStr};
 
 use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let config = AppConfig::from_env();
+    let config = AppConfig::from_env()?;
     let bind: SocketAddr = config.bind.parse()?;
     config.validate(bind)?;
     let db = PgPoolOptions::new()
@@ -151,6 +151,9 @@ struct AppConfig {
     wechat_notify_url: String,
     wechat_currency: String,
     wechat_standard_amount_minor: i64,
+    test_full_access_identities: Vec<String>,
+    test_full_access_duration_days: u16,
+    test_full_access_max_devices: u8,
     skybridge_api_base_urls: Vec<String>,
     allow_local_nebula_registration: bool,
     cors_allowed_origins: Vec<String>,
@@ -192,11 +195,11 @@ impl ConfiguredPaymentProvider {
 }
 
 impl AppConfig {
-    fn from_env() -> Self {
+    fn from_env() -> anyhow::Result<Self> {
         let bind = env::var("OZON_SUITE_BIND")
             .or_else(|_| env::var("PORT").map(|port| format!("0.0.0.0:{port}")))
             .unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-        Self {
+        Ok(Self {
             bind,
             database_url: env::var("DATABASE_URL").unwrap_or_else(|_| {
                 "postgres://ozon:ozon@127.0.0.1:5432/ozon_rust_suite".to_string()
@@ -272,6 +275,18 @@ impl AppConfig {
                         .and_then(|value| value.parse().ok())
                 })
                 .unwrap_or(4000),
+            test_full_access_identities: csv_env("OZON_SUITE_TEST_FULL_ACCESS_IDENTITIES")
+                .into_iter()
+                .map(|value| value.to_ascii_lowercase())
+                .collect(),
+            test_full_access_duration_days: parse_env_or_default(
+                "OZON_SUITE_TEST_FULL_ACCESS_DURATION_DAYS",
+                365,
+            )?,
+            test_full_access_max_devices: parse_env_or_default(
+                "OZON_SUITE_TEST_FULL_ACCESS_MAX_DEVICES",
+                10,
+            )?,
             skybridge_api_base_urls: skybridge_api_base_urls_from_env(),
             allow_local_nebula_registration: env::var("OZON_SUITE_ALLOW_LOCAL_NEBULA_REGISTRATION")
                 .ok()
@@ -284,7 +299,7 @@ impl AppConfig {
                     .collect()
             }),
             cors_allowed_origins_configured: env::var("OZON_SUITE_CORS_ALLOWED_ORIGINS").is_ok(),
-        }
+        })
     }
 
     fn validate(&self, bind: SocketAddr) -> anyhow::Result<()> {
@@ -325,6 +340,11 @@ impl AppConfig {
                 .map_err(|_| anyhow::anyhow!("invalid CORS origin: {origin}"))?;
         }
         self.validate_payment_provider(production_like)?;
+        validate_card_key_limits(
+            self.test_full_access_duration_days,
+            self.test_full_access_max_devices,
+        )
+        .map_err(|error| anyhow::anyhow!("invalid test full access limits: {}", error.message))?;
         Ok(())
     }
 
@@ -403,7 +423,7 @@ impl AppConfig {
                     production_like,
                 )?;
                 validate_currency("OZON_SUITE_WECHAT_CURRENCY", &self.wechat_currency)?;
-                if self.wechat_currency.trim().to_ascii_uppercase() != "CNY" {
+                if !self.wechat_currency.trim().eq_ignore_ascii_case("CNY") {
                     anyhow::bail!("OZON_SUITE_WECHAT_CURRENCY must be CNY for WeChat Pay Native");
                 }
                 if self.wechat_standard_amount_minor <= 0 {
@@ -412,7 +432,7 @@ impl AppConfig {
                 if self
                     .wechat_api_v3_key
                     .as_ref()
-                    .map(|value| value.expose_secret().as_bytes().len())
+                    .map(|value| value.expose_secret().len())
                     != Some(32)
                 {
                     anyhow::bail!("OZON_SUITE_WECHAT_API_V3_KEY must be exactly 32 bytes");
@@ -516,6 +536,34 @@ fn is_sha256_hex(value: &str) -> bool {
 
 fn optional_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn parse_env_or_default<T>(name: &str, default: T) -> anyhow::Result<T>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    optional_env(name)
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|error| anyhow::anyhow!("{name} has invalid value: {error}"))
+        })
+        .unwrap_or(Ok(default))
+}
+
+fn csv_env(name: &str) -> Vec<String> {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn cors_allowed_origins_from_env() -> Option<Vec<String>> {
@@ -626,7 +674,7 @@ async fn register(
     insert_tenant(&mut tx, tenant_id).await?;
     insert_user(&mut tx, &user)
         .await
-        .map_err(|error| map_identity_unique_conflict(error))?;
+        .map_err(map_identity_unique_conflict)?;
     insert_audit(
         &mut tx,
         &audit(
@@ -708,6 +756,7 @@ async fn me(
     let user = find_user_by_id(&state.db, claims.sub)
         .await?
         .ok_or_else(|| ApiError::unauthorized("user not found"))?;
+    ensure_test_full_access_entitlement(&state, &user).await?;
     let entitlements = list_entitlements_for_user(&state.db, user.id).await?;
     Ok(Json(MeResponse {
         user: UserResponse::from_user(&user),
@@ -1752,6 +1801,7 @@ async fn activate_device(
     Json(input): Json<ActivateDeviceRequest>,
 ) -> Result<Json<DeviceResponse>, ApiError> {
     let claims = require_user(&state, &headers)?;
+    ensure_test_full_access_for_user_id(&state, claims.sub).await?;
     if input.name.trim().is_empty() {
         return Err(ApiError::bad_request("device name is required"));
     }
@@ -1814,6 +1864,7 @@ async fn issue_lease(
     Json(input): Json<IssueLeaseRequest>,
 ) -> Result<Json<LeaseResponse>, ApiError> {
     let claims = require_user(&state, &headers)?;
+    ensure_test_full_access_for_user_id(&state, claims.sub).await?;
     let mut tx = state.db.begin().await.map_err(db_internal)?;
     let device = find_active_device(&mut tx, DeviceId(input.device_id), claims.sub)
         .await?
@@ -1941,7 +1992,7 @@ async fn upsert_skybridge_user(db: &PgPool, profile: SkybridgeProfile) -> Result
         insert_tenant(&mut tx, tenant_id).await?;
         insert_user(&mut tx, &user)
             .await
-            .map_err(|error| map_identity_unique_conflict(error))?;
+            .map_err(map_identity_unique_conflict)?;
         user
     };
     tx.commit().await.map_err(db_internal)?;
@@ -2437,6 +2488,154 @@ async fn insert_entitlement(
     Ok(())
 }
 
+async fn ensure_test_full_access_entitlement(
+    state: &AppState,
+    user: &User,
+) -> Result<(), ApiError> {
+    if !test_full_access_matches(&state.config, user) {
+        return Ok(());
+    }
+
+    let mut tx = state.db.begin().await.map_err(db_internal)?;
+    lock_user_for_update(&mut tx, user.id).await?;
+    if has_active_full_access_entitlement(
+        &mut tx,
+        user.id,
+        state.config.test_full_access_max_devices,
+    )
+    .await?
+    {
+        tx.commit().await.map_err(db_internal)?;
+        return Ok(());
+    }
+
+    let plan_code = PlanCode::standard_30d();
+    let duration_days = state.config.test_full_access_duration_days;
+    let max_devices = state.config.test_full_access_max_devices;
+    let generated = generate_card_key(&plan_code, user.tenant_id, duration_days, max_devices)?;
+    insert_card_key(&mut tx, &generated.card_key, None)
+        .await
+        .map_err(db_internal)?;
+    let redeemed_at = Utc::now();
+    mark_card_key_redeemed(&mut tx, generated.card_key.id, user.id, redeemed_at).await?;
+    let entitlement = Entitlement {
+        id: EntitlementId::new(),
+        tenant_id: user.tenant_id,
+        user_id: user.id,
+        plan_code,
+        source_card_key_id: generated.card_key.id,
+        features: default_features(),
+        expires_at: redeemed_at + Duration::days(i64::from(duration_days)),
+        revoked_at: None,
+    };
+    insert_entitlement(&mut tx, &entitlement)
+        .await
+        .map_err(db_internal)?;
+    let actor = test_full_access_actor(user);
+    insert_audit(
+        &mut tx,
+        &audit(
+            Some(user.tenant_id),
+            &actor,
+            "test_entitlement.granted",
+            &format!("{:?}", entitlement.id),
+            "test full-access entitlement granted from allowlist",
+        ),
+    )
+    .await?;
+    tx.commit().await.map_err(db_internal)?;
+    Ok(())
+}
+
+async fn ensure_test_full_access_for_user_id(
+    state: &AppState,
+    user_id: UserId,
+) -> Result<(), ApiError> {
+    if state.config.test_full_access_identities.is_empty() {
+        return Ok(());
+    }
+    let user = find_user_by_id(&state.db, user_id)
+        .await?
+        .ok_or_else(|| ApiError::unauthorized("user not found"))?;
+    ensure_test_full_access_entitlement(state, &user).await
+}
+
+async fn has_active_full_access_entitlement(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: UserId,
+    min_max_devices: u8,
+) -> Result<bool, ApiError> {
+    let features: Vec<String> = default_features()
+        .iter()
+        .copied()
+        .map(feature_to_db)
+        .map(str::to_string)
+        .collect();
+    let exists = sqlx::query(
+        r#"
+        SELECT e.id
+        FROM entitlements e
+        JOIN card_keys c ON c.id = e.source_card_key_id
+        WHERE e.user_id = $1
+          AND e.plan_code = $2
+          AND e.revoked_at IS NULL
+          AND e.expires_at > $3
+          AND c.max_devices >= $4
+          AND e.features @> $5
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id.0)
+    .bind(PlanCode::standard_30d().0)
+    .bind(Utc::now())
+    .bind(i32::from(min_max_devices))
+    .bind(features)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_internal)?
+    .is_some();
+    Ok(exists)
+}
+
+fn test_full_access_matches(config: &AppConfig, user: &User) -> bool {
+    if config.test_full_access_identities.is_empty()
+        || user.nebula_source != NebulaSource::Skybridge
+    {
+        return false;
+    }
+    test_full_access_candidates(user)
+        .iter()
+        .any(|candidate| config.test_full_access_identities.contains(candidate))
+}
+
+fn test_full_access_candidates(user: &User) -> Vec<String> {
+    let mut candidates = vec![
+        user.id.0.to_string().to_ascii_lowercase(),
+        user.nebula_id.as_str().to_ascii_lowercase(),
+    ];
+    if let Some(email) = &user.email
+        && user.email_verified_at.is_some()
+    {
+        candidates.push(email.as_str().to_ascii_lowercase());
+    }
+    if let Some(phone) = &user.phone
+        && user.phone_verified_at.is_some()
+    {
+        candidates.push(phone.as_str().to_ascii_lowercase());
+    }
+    if let Some(skybridge_user_id) = user.skybridge_user_id {
+        candidates.push(skybridge_user_id.to_string().to_ascii_lowercase());
+    }
+    candidates
+}
+
+fn test_full_access_actor(user: &User) -> String {
+    user.email
+        .as_ref()
+        .map(|email| email.as_str().to_string())
+        .unwrap_or_else(|| user.nebula_id.as_str().to_string())
+}
+
 async fn list_entitlements_for_user(
     db: &PgPool,
     user_id: UserId,
@@ -2585,10 +2784,11 @@ async fn find_active_entitlement_for_user(
 ) -> Result<Option<Entitlement>, ApiError> {
     sqlx::query(
         r#"
-        SELECT id, tenant_id, user_id, plan_code, source_card_key_id, features, expires_at, revoked_at
-        FROM entitlements
-        WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > $2
-        ORDER BY expires_at DESC
+        SELECT e.id, e.tenant_id, e.user_id, e.plan_code, e.source_card_key_id, e.features, e.expires_at, e.revoked_at
+        FROM entitlements e
+        JOIN card_keys c ON c.id = e.source_card_key_id
+        WHERE e.user_id = $1 AND e.revoked_at IS NULL AND e.expires_at > $2
+        ORDER BY cardinality(e.features) DESC, c.max_devices DESC, e.expires_at DESC
         LIMIT 1
         "#,
     )
@@ -2611,7 +2811,7 @@ async fn find_active_entitlement_with_card_limit_for_user(
         FROM entitlements e
         JOIN card_keys c ON c.id = e.source_card_key_id
         WHERE e.user_id = $1 AND e.revoked_at IS NULL AND e.expires_at > $2
-        ORDER BY e.expires_at DESC
+        ORDER BY cardinality(e.features) DESC, c.max_devices DESC, e.expires_at DESC
         LIMIT 1
         "#,
     )
@@ -3040,10 +3240,10 @@ async fn resolve_skybridge_profile_from_provider(
     base_url: &str,
     access_token: &SecretString,
 ) -> Result<SkybridgeProfile, ApiError> {
-    let mut profile = fetch_skybridge_profile(&client, base_url, access_token).await?;
+    let mut profile = fetch_skybridge_profile(client, base_url, access_token).await?;
     if profile.nebula_id.is_none() {
-        generate_skybridge_nebula_id(&client, base_url, access_token).await?;
-        profile = fetch_skybridge_profile(&client, base_url, access_token).await?;
+        generate_skybridge_nebula_id(client, base_url, access_token).await?;
+        profile = fetch_skybridge_profile(client, base_url, access_token).await?;
     }
     SkybridgeProfile::try_from_response(profile)
 }
@@ -3289,10 +3489,10 @@ fn db_internal(error: sqlx::Error) -> ApiError {
 }
 
 fn map_unique_conflict(error: sqlx::Error, constraint: &str, message: &'static str) -> ApiError {
-    if let Some(db_error) = error.as_database_error() {
-        if db_error.constraint() == Some(constraint) {
-            return ApiError::conflict(message);
-        }
+    if let Some(db_error) = error.as_database_error()
+        && db_error.constraint() == Some(constraint)
+    {
+        return ApiError::conflict(message);
     }
     db_internal(error)
 }
@@ -4049,6 +4249,41 @@ mod tests {
         assert!(validate_wechatpay_transaction_for_order(&config, &order, &wrong_amount).is_err());
     }
 
+    #[test]
+    fn test_full_access_matches_allowlisted_email() {
+        let mut config = config_for_security_tests();
+        config.test_full_access_identities = vec!["2403871950@qq.com".to_string()];
+        let user = User {
+            id: UserId::new(),
+            tenant_id: TenantId::new(),
+            nebula_id: NebulaId::parse("NEBULA-2026-A1B2C3D4E5F6").unwrap(),
+            nebula_source: NebulaSource::Skybridge,
+            skybridge_user_id: Some(Uuid::new_v4()),
+            email: Some(Email::parse("2403871950@qq.com").unwrap()),
+            phone: None,
+            name: None,
+            password_hash: skybridge_password_sentinel(),
+            role: UserRole::User,
+            email_verified_at: Some(Utc::now()),
+            phone_verified_at: None,
+            created_at: Utc::now(),
+        };
+
+        assert!(test_full_access_matches(&config, &user));
+
+        config.test_full_access_identities = vec!["other@example.com".to_string()];
+        assert!(!test_full_access_matches(&config, &user));
+
+        config.test_full_access_identities = vec!["2403871950@qq.com".to_string()];
+        let mut unverified_email = user.clone();
+        unverified_email.email_verified_at = None;
+        assert!(!test_full_access_matches(&config, &unverified_email));
+
+        let mut local_user = user.clone();
+        local_user.nebula_source = NebulaSource::LocalDev;
+        assert!(!test_full_access_matches(&config, &local_user));
+    }
+
     fn config_for_security_tests() -> AppConfig {
         AppConfig {
             bind: "127.0.0.1:8080".to_string(),
@@ -4083,6 +4318,9 @@ mod tests {
             wechat_notify_url: "https://api.ozon66.com/webhooks/wechatpay".to_string(),
             wechat_currency: "CNY".to_string(),
             wechat_standard_amount_minor: 4000,
+            test_full_access_identities: vec![],
+            test_full_access_duration_days: 365,
+            test_full_access_max_devices: 10,
             skybridge_api_base_urls: vec![],
             allow_local_nebula_registration: false,
             cors_allowed_origins: DEV_CORS_ORIGINS

@@ -76,6 +76,12 @@ services:
         value: CNY
       - key: OZON_SUITE_WECHAT_STANDARD_30D_AMOUNT_MINOR
         value: "4000"
+      - key: OZON_SUITE_TEST_FULL_ACCESS_IDENTITIES
+        value: 2403871950@qq.com
+      - key: OZON_SUITE_TEST_FULL_ACCESS_DURATION_DAYS
+        value: "365"
+      - key: OZON_SUITE_TEST_FULL_ACCESS_MAX_DEVICES
+        value: "10"
       - key: RUST_LOG
         value: ozon_cloud_api=info,tower_http=info,axum=info
 

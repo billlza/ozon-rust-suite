@@ -58,9 +58,7 @@ impl PhoneNumber {
         let raw = value.into();
         let mut normalized = String::with_capacity(raw.len());
         for (index, ch) in raw.trim().chars().enumerate() {
-            if ch.is_ascii_digit() {
-                normalized.push(ch);
-            } else if ch == '+' && index == 0 {
+            if ch.is_ascii_digit() || (ch == '+' && index == 0) {
                 normalized.push(ch);
             } else if matches!(ch, ' ' | '-' | '(' | ')') {
                 continue;
