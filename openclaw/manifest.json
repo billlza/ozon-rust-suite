@@ -25,6 +25,14 @@
       "description": "List product summaries with a bounded limit; real mode returns official Ozon Seller API data."
     },
     {
+      "name": "ozon.products.get",
+      "method": "POST",
+      "path": "/tools/ozon.products.get",
+      "risk": "read_only",
+      "approval_required": false,
+      "description": "Read one product fact pack with stable Ozon details, attributes, and image URLs."
+    },
+    {
       "name": "tasks.dry_run",
       "method": "POST",
       "path": "/tasks/dry-run",

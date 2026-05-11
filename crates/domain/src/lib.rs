@@ -146,7 +146,13 @@ pub struct Order {
     pub user_id: UserId,
     pub plan_code: PlanCode,
     pub status: OrderStatus,
+    pub payment_provider: PaymentProvider,
     pub payment_reference: String,
+    pub amount_minor: i64,
+    pub currency: String,
+    pub checkout_session_id: Option<String>,
+    pub payment_intent_id: Option<String>,
+    pub paid_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub confirmed_at: Option<DateTime<Utc>>,
 }
@@ -164,8 +170,18 @@ impl PlanCode {
 #[serde(rename_all = "snake_case")]
 pub enum OrderStatus {
     PendingManualPayment,
+    PendingProviderPayment,
     Confirmed,
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaymentProvider {
+    Manual,
+    Stripe,
+    Alipay,
+    WechatPay,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -314,6 +330,7 @@ pub enum TaskSource {
 pub enum OperationKind {
     OzonProductsCount,
     OzonProductsList,
+    OzonProductsGet,
     OzonUpdatePriceMock,
     OzonUpdateInventoryMock,
     OzonJoinPromotionMock,
@@ -323,7 +340,10 @@ pub enum OperationKind {
 
 impl OperationKind {
     pub fn is_write(self) -> bool {
-        !matches!(self, Self::OzonProductsCount | Self::OzonProductsList)
+        !matches!(
+            self,
+            Self::OzonProductsCount | Self::OzonProductsList | Self::OzonProductsGet
+        )
     }
 }
 
@@ -429,6 +449,7 @@ mod tests {
     #[test]
     fn write_operations_are_detected() {
         assert!(!OperationKind::OzonProductsList.is_write());
+        assert!(!OperationKind::OzonProductsGet.is_write());
         assert!(OperationKind::OzonUpdatePriceMock.is_write());
     }
 

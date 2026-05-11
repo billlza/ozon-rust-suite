@@ -40,6 +40,20 @@ services:
         value: https://ozon66.com/openclaw/manifest.json
       - key: OZON_SUITE_ALLOW_LOCAL_NEBULA_REGISTRATION
         value: "false"
+      - key: OZON_SUITE_PAYMENT_PROVIDER
+        value: manual
+      - key: OZON_SUITE_STRIPE_SECRET_KEY
+        sync: false
+      - key: OZON_SUITE_STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: OZON_SUITE_STRIPE_SUCCESS_URL
+        value: https://ozon66.com/?checkout=success#console
+      - key: OZON_SUITE_STRIPE_CANCEL_URL
+        value: https://ozon66.com/?checkout=cancelled#console
+      - key: OZON_SUITE_STRIPE_CURRENCY
+        value: cny
+      - key: OZON_SUITE_STRIPE_STANDARD_30D_AMOUNT_MINOR
+        value: "4000"
       - key: RUST_LOG
         value: ozon_cloud_api=info,tower_http=info,axum=info
 

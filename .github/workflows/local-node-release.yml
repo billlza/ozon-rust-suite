@@ -12,7 +12,7 @@ on:
       - "local-node-v*"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   windows-installers:
@@ -93,6 +93,14 @@ jobs:
           path: dist/release/*
           if-no-files-found: error
 
+      - name: Publish Windows installers
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && format('local-node-v{0}', github.event.inputs.version) || github.ref_name }}
+          name: Ozon Rust Local ${{ github.event.inputs.version || github.ref_name }}
+          make_latest: true
+          files: dist/release/*
+
   openclaw-plugin:
     name: Package OpenClaw plugin
     runs-on: ubuntu-latest
@@ -125,3 +133,11 @@ jobs:
           name: openclaw-plugin
           path: dist/openclaw-plugin.zip
           if-no-files-found: error
+
+      - name: Publish OpenClaw plugin
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && format('local-node-v{0}', github.event.inputs.version) || github.ref_name }}
+          name: Ozon Rust Local ${{ github.event.inputs.version || github.ref_name }}
+          make_latest: true
+          files: dist/openclaw-plugin.zip

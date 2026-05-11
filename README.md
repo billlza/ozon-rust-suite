@@ -9,11 +9,13 @@ and an OpenClaw-compatible local skill bridge.
 - Cloud API: Nebula identity sync through the `/auth/skybridge` compatibility
   bridge, plus
   local-only `local_dev` auth fallback when explicitly enabled; manual orders,
-  admin confirmation, card keys, redeem, device activation, entitlement leases,
-  downloads, audit.
+  Stripe Checkout orders, signed Stripe webhook fulfillment, card keys, redeem,
+  device activation, entitlement leases, downloads, audit.
 - Commercial flow hardening: order confirmation works by order UUID or payment
-  reference, and card-key `max_devices` is enforced during device activation and
-  lease issuance.
+  reference for support/manual flows; Stripe orders record provider, amount,
+  currency, checkout session, payment intent, and webhook event IDs before
+  entitlement activation. Card-key `max_devices` is enforced during device
+  activation and lease issuance.
 - Local node API: `127.0.0.1:8790` skill endpoints and `127.0.0.1:17870`
   status/event endpoints.
 - Local diagnostics: `GET /config/status` reports connector mode, OS keyring
@@ -95,7 +97,9 @@ VITE_LOCAL_TOKEN=<same-strong-local-operator-token> pnpm dev:local-ui
 Then open <http://127.0.0.1:5173>, save the user's Ozon Seller `Client ID` and
 `API Key`, run credential validation, and read products. In this mode the local
 node never falls back to mock products; missing or invalid credentials return an
-error. The OpenClaw token can call read tools and propose tasks only.
+error. Save the poster image provider under "OpenAI 出图中转" when using a
+relay; the key is written to the OS keyring and is not stored in the repository.
+The OpenClaw token can call read tools and propose tasks only.
 
 Release builds default to the real connector. Mock products are allowed only in
 debug/local demo mode through `OZON_CONNECTOR_MODE=mock`.
@@ -143,6 +147,32 @@ OZON_SUITE_ALLOW_LOCAL_NEBULA_REGISTRATION=true
 Production should leave that fallback disabled so Ozon never becomes a second
 Nebula account authority.
 
+## Payments
+
+`OZON_SUITE_PAYMENT_PROVIDER=manual` keeps the existing support workflow:
+create an order, confirm it from the admin side, and redeem the returned card
+key. `OZON_SUITE_PAYMENT_PROVIDER=stripe` creates a real Stripe Checkout
+Session from `POST /orders`; the browser is redirected to Stripe and
+`POST /webhooks/stripe` verifies `Stripe-Signature`, checks the session amount
+and currency against the stored order, then activates the entitlement server-side.
+
+Required Stripe settings:
+
+```bash
+OZON_SUITE_PAYMENT_PROVIDER=stripe
+OZON_SUITE_STRIPE_SECRET_KEY=sk_live_...
+OZON_SUITE_STRIPE_WEBHOOK_SECRET=whsec_...
+OZON_SUITE_STRIPE_SUCCESS_URL=https://ozon66.com/?checkout=success#console
+OZON_SUITE_STRIPE_CANCEL_URL=https://ozon66.com/?checkout=cancelled#console
+OZON_SUITE_STRIPE_CURRENCY=cny
+OZON_SUITE_STRIPE_STANDARD_30D_AMOUNT_MINOR=4000
+```
+
+Alipay and WeChat Pay are recognized provider names but intentionally fail
+closed until merchant credentials, signing, and reconciliation are implemented.
+If you enable those methods through Stripe Checkout, keep
+`OZON_SUITE_PAYMENT_PROVIDER=stripe` and manage the payment methods in Stripe.
+
 ## OpenClaw bridge
 
 Static package: [openclaw/manifest.json](openclaw/manifest.json) and
@@ -154,6 +184,19 @@ lookups with `x-openclaw-token`. In real Ozon mode those read tools use the
 operator-saved Ozon Seller API credentials. Approval, cancellation, mock execution,
 configuration, diagnostics, and event streaming require the operator-only
 `x-local-token`.
+
+The public portal can issue a cloud lease and deliver it to
+`POST /portal/lease` on the local node after the browser has detected
+`127.0.0.1:8790`. The local node validates expiry/features, persists the lease
+through the OS keyring, and reports it from `GET /portal/status`.
+
+Product detail reads use `POST /tools/ozon.products.get` with exactly one of
+`offer_id`, `product_id`, or `sku`. Real mode reads Ozon `/v3/product/info/list`
+for the canonical product record and image order, then enriches attributes and
+backup image fields from `/v4/product/info/attributes` when available. The
+response is a product fact pack suitable for downstream poster generation: text
+facts and image URLs stay separate so generated artwork does not invent product
+specs.
 
 ## API safety notes
 
@@ -208,5 +251,6 @@ uses an operator token and should not be exposed as a public static site.
    revocation, strict CORS, and non-dev secrets.
 3. Add Ozon real read-only credential validation tests with mocked HTTP.
 4. Add Playwright smoke tests for portal/admin/local UI.
-5. Package installer/download artifacts with real checksums.
+5. Publish installer/download artifacts with real checksums from release CI and
+   keep production `/downloads` pointed at those release assets.
 6. Feature-flag real Ozon write APIs after mock approval flow is battle-tested.

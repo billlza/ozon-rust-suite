@@ -5,6 +5,7 @@ import {
   CheckCircle2,
   Clipboard,
   DatabaseZap,
+  Image as ImageIcon,
   KeyRound,
   ListChecks,
   PauseCircle,
@@ -12,6 +13,7 @@ import {
   Radio,
   RefreshCcw,
   Repeat2,
+  Sparkles,
   ShieldCheck,
   SlidersHorizontal,
   TerminalSquare,
@@ -56,6 +58,96 @@ type ProductListResult = {
   products: Product[];
   total: number;
   last_id: string | null;
+};
+
+type ProductImage = {
+  url: string;
+  role: "primary" | "gallery" | "color" | "spin360";
+  position: number;
+};
+
+type ProductAttribute = {
+  id: number | null;
+  name: string | null;
+  values: string[];
+};
+
+type ProductDetail = {
+  lookup: {
+    product_id: string | null;
+    offer_id: string | null;
+    sku: string | null;
+  };
+  product_id: string;
+  offer_id: string;
+  sku: string | null;
+  name: string | null;
+  description_category_id: number | null;
+  type_id: number | null;
+  barcodes: string[];
+  primary_image: string | null;
+  images: ProductImage[];
+  gallery_images: string[];
+  images360: string[];
+  color_image: string | null;
+  attributes: ProductAttribute[];
+  visibility: string | null;
+  archived: boolean | null;
+  autoarchived: boolean | null;
+  created_at: string | null;
+  updated_at: string | null;
+  warnings: string[];
+};
+
+type ProductDetailResult = {
+  connector_mode: "mock" | "real";
+  product: ProductDetail;
+};
+
+type PosterBrief = {
+  theme: string;
+  headline: string;
+  subheadline: string;
+  selling_points: string[];
+  cta_line: string;
+  compliance_note: string;
+  background_prompt: string;
+};
+
+type PosterBriefResult = {
+  connector_mode: "mock" | "real";
+  product: ProductDetail;
+  brief: PosterBrief;
+};
+
+type PosterGenerateResult = {
+  connector_mode: "mock" | "real";
+  product: ProductDetail;
+  brief: PosterBrief;
+  image_model: string;
+  prompt: string;
+  revised_prompt?: string | null;
+  background_data_url: string;
+};
+
+type PosterCopyMismatch = {
+  field: string;
+  expected: string;
+  actual: string;
+};
+
+type PosterVerifyResult = {
+  ok: boolean;
+  checked_at: string;
+  approved_copy: {
+    headline: string;
+    subheadline: string;
+    selling_points: string[];
+    cta_line: string;
+    compliance_note: string;
+  };
+  mismatches: PosterCopyMismatch[];
+  warnings: string[];
 };
 
 type Task = {
@@ -111,6 +203,23 @@ type ConfigStatus = {
     api_key_fingerprint: string | null;
     issue: string | null;
   };
+  openai: {
+    configured: boolean;
+    source: string;
+    base_url: string;
+    image_model: string;
+    api_key_fingerprint: string | null;
+    issue: string | null;
+  };
+  lease: {
+    configured: boolean;
+    valid: boolean;
+    lease_id: string | null;
+    device_id: string | null;
+    features: string[];
+    expires_at: string | null;
+    issue: string | null;
+  };
   endpoints: {
     skill_api: string;
     agent_api: string;
@@ -158,9 +267,23 @@ function App() {
   const [configStatus, setConfigStatus] = useState<ConfigStatus | null>(null);
   const [clientId, setClientId] = useState("");
   const [apiKey, setApiKey] = useState("");
+  const [openAiBaseUrl, setOpenAiBaseUrl] = useState("https://api.openai.com");
+  const [openAiImageModel, setOpenAiImageModel] = useState("gpt-image-1");
+  const [openAiApiKey, setOpenAiApiKey] = useState("");
   const [products, setProducts] = useState<Product[]>([]);
   const [productCount, setProductCount] = useState<number | null>(null);
   const [productListMeta, setProductListMeta] = useState<ProductListResult | null>(null);
+  const [productLookup, setProductLookup] = useState("");
+  const [productDetail, setProductDetail] = useState<ProductDetailResult | null>(null);
+  const [posterTheme, setPosterTheme] = useState("studio");
+  const [posterBrief, setPosterBrief] = useState<PosterBriefResult | null>(null);
+  const [posterBackground, setPosterBackground] = useState<PosterGenerateResult | null>(null);
+  const [posterVerification, setPosterVerification] = useState<PosterVerifyResult | null>(null);
+  const [posterHeadline, setPosterHeadline] = useState("");
+  const [posterSubheadline, setPosterSubheadline] = useState("");
+  const [posterSellingPoints, setPosterSellingPoints] = useState(["", "", ""]);
+  const [posterCtaLine, setPosterCtaLine] = useState("");
+  const [posterComplianceNote, setPosterComplianceNote] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [selectedOperation, setSelectedOperation] = useState("ozon_update_price_mock");
   const [eventState, setEventState] = useState("connecting");
@@ -213,7 +336,14 @@ function App() {
       ]);
       setHealth(healthResponse.ok ? await healthResponse.json() : null);
       setManifest(manifestResponse.ok ? await manifestResponse.json() : null);
-      setConfigStatus(configResponse.ok ? await configResponse.json() : null);
+      if (configResponse.ok) {
+        const nextConfig: ConfigStatus = await configResponse.json();
+        setConfigStatus(nextConfig);
+        setOpenAiBaseUrl(nextConfig.openai.base_url);
+        setOpenAiImageModel(nextConfig.openai.image_model);
+      } else {
+        setConfigStatus(null);
+      }
       setMessage(healthResponse.ok ? "本地服务已连接" : "本地服务未就绪");
     } catch {
       setHealth(null);
@@ -234,6 +364,31 @@ function App() {
     const data = await response.json();
     setMessage(response.ok ? `Ozon 凭据已保存：${data.client_id} / ${data.api_key}` : `保存失败：${data.error}`);
     if (response.ok) {
+      await checkHealth();
+    }
+  }
+
+  async function saveOpenAiConfig() {
+    if (!openAiApiKey.trim()) {
+      setMessage("请填写 OpenAI 或中转服务 API Key");
+      return;
+    }
+    const response = await api("/config/openai", {
+      method: "POST",
+      body: JSON.stringify({
+        api_key: openAiApiKey.trim(),
+        base_url: openAiBaseUrl.trim(),
+        image_model: openAiImageModel.trim()
+      })
+    });
+    const data = await response.json();
+    setMessage(
+      response.ok
+        ? `OpenAI 中转已保存：${data.base_url} / ${data.image_model} / ${data.api_key_fingerprint}`
+        : `OpenAI 配置保存失败：${data.error}`
+    );
+    if (response.ok) {
+      setOpenAiApiKey("");
       await checkHealth();
     }
   }
@@ -273,6 +428,176 @@ function App() {
         ? `真实 Ozon 商品读取完成：总数 ${countData.count}，当前样本 ${listData.products.length}`
         : "开发模式 mock 商品读取完成；上线请使用 OZON_CONNECTOR_MODE=real"
     );
+  }
+
+  async function loadProductDetail(lookup: { offer_id?: string; product_id?: string; sku?: string }) {
+    const cleanLookup = Object.fromEntries(
+      Object.entries(lookup).filter(([, value]) => value && value.trim())
+    );
+    if (Object.keys(cleanLookup).length !== 1) {
+      setMessage("请填写一个 offer_id、product_id 或 sku 来读取详情");
+      return;
+    }
+    const response = await api("/tools/ozon.products.get", {
+      method: "POST",
+      body: JSON.stringify(cleanLookup)
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      setProductDetail(null);
+      setMessage(`Ozon 商品详情读取失败：${data.error}`);
+      return;
+    }
+    setProductDetail(data);
+    resetPosterWorkbench();
+    setMessage(
+      data.connector_mode === "real"
+        ? `真实商品详情读取完成：${data.product.offer_id}，图片 ${data.product.images.length} 张`
+        : `Mock 商品详情读取完成：${data.product.offer_id}`
+    );
+  }
+
+  function resetPosterWorkbench() {
+    setPosterBrief(null);
+    setPosterBackground(null);
+    setPosterVerification(null);
+    setPosterHeadline("");
+    setPosterSubheadline("");
+    setPosterSellingPoints(["", "", ""]);
+    setPosterCtaLine("");
+    setPosterComplianceNote("");
+  }
+
+  function applyPosterBrief(nextBrief: PosterBrief) {
+    const paddedPoints = [...nextBrief.selling_points];
+    while (paddedPoints.length < 3) {
+      paddedPoints.push("");
+    }
+    setPosterHeadline(nextBrief.headline);
+    setPosterSubheadline(nextBrief.subheadline);
+    setPosterSellingPoints(paddedPoints.slice(0, 3));
+    setPosterCtaLine(nextBrief.cta_line);
+    setPosterComplianceNote(nextBrief.compliance_note);
+  }
+
+  function currentLookupPayload() {
+    if (productDetail) {
+      if (productDetail.product.lookup.offer_id) {
+        return { offer_id: productDetail.product.lookup.offer_id };
+      }
+      if (productDetail.product.lookup.product_id) {
+        return { product_id: productDetail.product.lookup.product_id };
+      }
+      if (productDetail.product.lookup.sku) {
+        return { sku: productDetail.product.lookup.sku };
+      }
+      return { offer_id: productDetail.product.offer_id };
+    }
+    const value = productLookup.trim();
+    if (!value) {
+      return null;
+    }
+    return /^\d+$/.test(value) ? { product_id: value } : { offer_id: value };
+  }
+
+  async function buildPosterBrief() {
+    const lookup = currentLookupPayload();
+    if (!lookup) {
+      setMessage("先读取一个真实商品，再生成海报简报");
+      return;
+    }
+    const response = await api("/poster/brief", {
+      method: "POST",
+      body: JSON.stringify({ ...lookup, theme: posterTheme, locale: "zh-CN" })
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      setPosterBrief(null);
+      setMessage(`海报简报生成失败：${data.error}`);
+      return;
+    }
+    setProductDetail({ connector_mode: data.connector_mode, product: data.product });
+    setPosterBrief(data);
+    setPosterBackground(null);
+    setPosterVerification(null);
+    applyPosterBrief(data.brief);
+    setMessage("海报简报已生成，接下来可以直接生成背景图");
+  }
+
+  async function generatePosterBackground() {
+    const lookup = currentLookupPayload();
+    if (!lookup) {
+      setMessage("先读取一个真实商品，再生成海报背景");
+      return;
+    }
+    const response = await api("/poster/generate", {
+      method: "POST",
+      body: JSON.stringify({ ...lookup, theme: posterTheme, locale: "zh-CN" })
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      setPosterBackground(null);
+      setMessage(`海报背景生成失败：${data.error}`);
+      return;
+    }
+    setProductDetail({ connector_mode: data.connector_mode, product: data.product });
+    setPosterBrief({ connector_mode: data.connector_mode, product: data.product, brief: data.brief });
+    setPosterBackground(data);
+    setPosterVerification(null);
+    applyPosterBrief(data.brief);
+    setMessage(`背景图已生成，模型 ${data.image_model}`);
+  }
+
+  async function verifyPosterCopy() {
+    const lookup = currentLookupPayload();
+    if (!lookup) {
+      setMessage("先读取商品，再校验海报文案");
+      return;
+    }
+    const response = await api("/poster/verify", {
+      method: "POST",
+      body: JSON.stringify({
+        ...lookup,
+        theme: posterTheme,
+        locale: "zh-CN",
+        headline: posterHeadline,
+        subheadline: posterSubheadline,
+        selling_points: posterSellingPoints.filter((value) => value.trim()),
+        cta_line: posterCtaLine,
+        compliance_note: posterComplianceNote
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      setPosterVerification(null);
+      setMessage(`海报校验失败：${data.error}`);
+      return;
+    }
+    setPosterVerification(data);
+    setMessage(data.ok ? "海报文案已通过事实校验" : "海报文案和事实包不一致，请按建议回退");
+  }
+
+  function updatePosterSellingPoint(index: number, value: string) {
+    setPosterSellingPoints((current) => current.map((item, itemIndex) => (itemIndex === index ? value : item)));
+  }
+
+  const posterProductImage =
+    productDetail?.product.primary_image ??
+    posterBackground?.product.primary_image ??
+    posterBrief?.product.primary_image ??
+    null;
+
+  async function loadProductDetailFromInput() {
+    const value = productLookup.trim();
+    if (!value) {
+      setMessage("请输入 offer_id、product_id 或 sku");
+      return;
+    }
+    if (/^\d+$/.test(value)) {
+      await loadProductDetail({ product_id: value });
+      return;
+    }
+    await loadProductDetail({ offer_id: value });
   }
 
   async function createDryRun() {
@@ -521,6 +846,49 @@ function App() {
           </button>
         </div>
 
+        <div className="panel config-panel">
+          <div className="section-title">
+            <Sparkles />
+            <div>
+              <h2>OpenAI 出图中转</h2>
+              <p>保存海报背景生成用的 API Key 和中转地址；写入 OS keyring。</p>
+            </div>
+          </div>
+          <div className="form-grid compact">
+            <label>
+              Base URL
+              <input
+                autoComplete="off"
+                placeholder="https://api.openai.com 或中转地址"
+                value={openAiBaseUrl}
+                onChange={(event) => setOpenAiBaseUrl(event.target.value)}
+              />
+            </label>
+            <label>
+              Image model
+              <input
+                autoComplete="off"
+                placeholder="gpt-image-1"
+                value={openAiImageModel}
+                onChange={(event) => setOpenAiImageModel(event.target.value)}
+              />
+            </label>
+            <label>
+              API Key
+              <input
+                autoComplete="off"
+                placeholder="保存后只显示指纹"
+                value={openAiApiKey}
+                onChange={(event) => setOpenAiApiKey(event.target.value)}
+                type="password"
+              />
+            </label>
+          </div>
+          <button onClick={saveOpenAiConfig}>
+            <CheckCircle2 size={18} /> 保存出图配置
+          </button>
+        </div>
+
         <div className="panel diagnostics-panel">
           <div className="section-title">
             <SlidersHorizontal />
@@ -565,8 +933,28 @@ function App() {
               <span>API key fingerprint</span>
               <strong>{configStatus?.ozon.api_key_fingerprint ?? "未保存"}</strong>
             </div>
+            <div className="status-item">
+              <span>OpenAI relay</span>
+              <strong>{configStatus?.openai.configured ? configStatus.openai.base_url : "not configured"}</strong>
+              <em className={configStatus?.openai.configured ? "badge ok-badge" : "badge warn-badge"}>
+                {configStatus?.openai.source ?? "checking"}
+              </em>
+            </div>
+            <div className="status-item">
+              <span>OpenAI model</span>
+              <strong>{configStatus?.openai.image_model ?? "未保存"}</strong>
+            </div>
+            <div className="status-item">
+              <span>Lease</span>
+              <strong>{configStatus?.lease.lease_id ?? "未导入"}</strong>
+              <em className={configStatus?.lease.valid ? "badge ok-badge" : "badge warn-badge"}>
+                {configStatus?.lease.valid ? "valid" : "missing"}
+              </em>
+            </div>
           </div>
           {configStatus?.ozon.issue && <p className="notice warn-text">{configStatus.ozon.issue}</p>}
+          {configStatus?.openai.issue && <p className="notice warn-text">{configStatus.openai.issue}</p>}
+          {configStatus?.lease.issue && <p className="notice warn-text">{configStatus.lease.issue}</p>}
           {validation && (
             <p className="notice">
               {validation.checked_at} · {validation.message}
@@ -585,6 +973,21 @@ function App() {
             </div>
           </div>
           <button onClick={loadProducts}>读取 Ozon 商品</button>
+          <div className="task-command product-lookup-command">
+            <input
+              placeholder="offer_id 或数字 product_id"
+              value={productLookup}
+              onChange={(event) => setProductLookup(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  void loadProductDetailFromInput();
+                }
+              }}
+            />
+            <button onClick={loadProductDetailFromInput}>
+              <ImageIcon size={18} /> 读取详情/图片
+            </button>
+          </div>
           <div className="metric-row">
             <span>Product count</span>
             <strong>{productCount ?? "未读取"}</strong>
@@ -605,9 +1008,193 @@ function App() {
                   {product.has_fbs_stocks ? "yes" : "no"}
                   {product.archived ? " · archived" : ""}
                 </em>
+                <button className="secondary-button" onClick={() => loadProductDetail({ offer_id: product.offer_id })}>
+                  <ImageIcon size={16} /> 详情/图片
+                </button>
               </div>
             ))}
           </div>
+          {productDetail && (
+            <div className="product-detail">
+              <div className="section-title compact-title">
+                <ImageIcon />
+                <div>
+                  <h3>{productDetail.product.name ?? productDetail.product.offer_id}</h3>
+                  <p>
+                    {productDetail.product.offer_id} · product {productDetail.product.product_id} ·{" "}
+                    {productDetail.connector_mode}
+                  </p>
+                </div>
+              </div>
+              <div className="image-strip">
+                {productDetail.product.images.length === 0 && <p className="empty">Ozon 没有返回图片。</p>}
+                {productDetail.product.images.slice(0, 6).map((image) => (
+                  <a key={`${image.role}-${image.position}-${image.url}`} href={image.url} target="_blank" rel="noreferrer">
+                    <img src={image.url} alt={`${image.role} ${image.position}`} />
+                    <span>{image.role}</span>
+                  </a>
+                ))}
+              </div>
+              <div className="fact-grid">
+                <div>
+                  <span>Primary image</span>
+                  <strong>{productDetail.product.primary_image ? "available" : "missing"}</strong>
+                </div>
+                <div>
+                  <span>Attributes</span>
+                  <strong>{productDetail.product.attributes.length}</strong>
+                </div>
+                <div>
+                  <span>Barcodes</span>
+                  <strong>{productDetail.product.barcodes.length}</strong>
+                </div>
+              </div>
+              {productDetail.product.attributes.length > 0 && (
+                <div className="attribute-list">
+                  {productDetail.product.attributes.slice(0, 8).map((attribute, index) => (
+                    <p key={`${attribute.id ?? index}-${attribute.name ?? "attribute"}`}>
+                      <strong>{attribute.name ?? attribute.id ?? "attribute"}</strong>
+                      <span>{attribute.values.join(", ") || "n/a"}</span>
+                    </p>
+                  ))}
+                </div>
+              )}
+              {productDetail.product.warnings.map((warning) => (
+                <p className="notice warn-text" key={warning}>
+                  {warning}
+                </p>
+              ))}
+            </div>
+          )}
+          {(productDetail || posterBrief || posterBackground) && (
+            <div className="poster-workbench">
+              <div className="section-title compact-title">
+                <Sparkles />
+                <div>
+                  <h3>商品海报工作台</h3>
+                  <p>先用事实包生成文案，再让 AI 只做背景，把真实商品图合成进去。</p>
+                </div>
+              </div>
+              <div className="task-command poster-toolbar">
+                <select value={posterTheme} onChange={(event) => setPosterTheme(event.target.value)}>
+                  <option value="studio">clean studio</option>
+                  <option value="spotlight">spotlight</option>
+                  <option value="launch">launch stage</option>
+                  <option value="lifestyle">lifestyle</option>
+                </select>
+                <button onClick={buildPosterBrief}>
+                  <Sparkles size={18} /> 生成文案简报
+                </button>
+                <button onClick={generatePosterBackground}>
+                  <ImageIcon size={18} /> 生成背景图
+                </button>
+                <button className="secondary-button" onClick={verifyPosterCopy}>
+                  <ShieldCheck size={16} /> 校验文案
+                </button>
+              </div>
+              {posterBrief && (
+                <div className="poster-editor">
+                  <label>
+                    标题
+                    <input value={posterHeadline} onChange={(event) => setPosterHeadline(event.target.value)} />
+                  </label>
+                  <label>
+                    副标题
+                    <input value={posterSubheadline} onChange={(event) => setPosterSubheadline(event.target.value)} />
+                  </label>
+                  {posterSellingPoints.map((point, index) => (
+                    <label key={`poster-point-${index}`}>
+                      卖点 {index + 1}
+                      <input value={point} onChange={(event) => updatePosterSellingPoint(index, event.target.value)} />
+                    </label>
+                  ))}
+                  <label>
+                    收尾一句
+                    <input value={posterCtaLine} onChange={(event) => setPosterCtaLine(event.target.value)} />
+                  </label>
+                  <label className="full-span">
+                    说明
+                    <input value={posterComplianceNote} onChange={(event) => setPosterComplianceNote(event.target.value)} />
+                  </label>
+                </div>
+              )}
+              {(posterBrief || posterBackground) && (
+                <div className="poster-preview-shell">
+                  <div
+                    className="poster-preview"
+                    style={
+                      posterBackground?.background_data_url
+                        ? { backgroundImage: `linear-gradient(180deg, rgba(9, 17, 14, 0.18), rgba(9, 17, 14, 0.48)), url(${posterBackground.background_data_url})` }
+                        : undefined
+                    }
+                  >
+                    {!posterBackground?.background_data_url && <div className="poster-preview-fallback" />}
+                    <div className="poster-copy">
+                      <span className="poster-kicker">{posterBrief?.brief.theme ?? posterTheme}</span>
+                      <h3>{posterHeadline || posterBrief?.brief.headline}</h3>
+                      <p>{posterSubheadline || posterBrief?.brief.subheadline}</p>
+                      <ul>
+                        {posterSellingPoints.filter((value) => value.trim()).map((point) => (
+                          <li key={point}>{point}</li>
+                        ))}
+                      </ul>
+                      <strong>{posterCtaLine || posterBrief?.brief.cta_line}</strong>
+                      <em>{posterComplianceNote || posterBrief?.brief.compliance_note}</em>
+                    </div>
+                    {posterProductImage && (
+                      <img
+                        className="poster-product"
+                        src={posterProductImage}
+                        alt={
+                          productDetail?.product.name ??
+                          posterBackground?.product.name ??
+                          posterBrief?.product.name ??
+                          productDetail?.product.offer_id ??
+                          posterBackground?.product.offer_id ??
+                          posterBrief?.product.offer_id ??
+                          "product"
+                        }
+                      />
+                    )}
+                  </div>
+                  <div className="poster-meta">
+                    <div className="fact-grid">
+                      <div>
+                        <span>背景模型</span>
+                        <strong>{posterBackground?.image_model ?? "未生成"}</strong>
+                      </div>
+                      <div>
+                        <span>主题</span>
+                        <strong>{posterBrief?.brief.theme ?? posterTheme}</strong>
+                      </div>
+                      <div>
+                        <span>校验</span>
+                        <strong>{posterVerification ? (posterVerification.ok ? "通过" : "待修正") : "未校验"}</strong>
+                      </div>
+                    </div>
+                    {posterBackground && (
+                      <div className="poster-prompt">
+                        <span>背景提示词</span>
+                        <p>{posterBackground.revised_prompt ?? posterBackground.prompt}</p>
+                      </div>
+                    )}
+                    {posterVerification && (
+                      <div className={`poster-verify ${posterVerification.ok ? "poster-verify-ok" : "poster-verify-warn"}`}>
+                        {posterVerification.warnings.map((warning) => (
+                          <p key={warning}>{warning}</p>
+                        ))}
+                        {posterVerification.mismatches.map((mismatch) => (
+                          <p key={`${mismatch.field}-${mismatch.expected}`}>
+                            {mismatch.field}: 期望“{mismatch.expected}”，当前是“{mismatch.actual}”
+                          </p>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         <div className="panel schedule-panel">

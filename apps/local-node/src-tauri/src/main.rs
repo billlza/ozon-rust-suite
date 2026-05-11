@@ -92,7 +92,7 @@ fn start_local_node_sidecar<R: Runtime>(
 ) -> Option<CommandChild> {
     match app
         .shell()
-        .sidecar("binaries/ozon-local-node")
+        .sidecar("ozon-local-node")
         .map(|command| {
             command
                 .env("OZON_CONNECTOR_MODE", connector_mode)

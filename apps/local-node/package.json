@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 5173",
     "build": "tsc -b && vite build",
+    "stage:sidecar": "node scripts/stage-sidecar.mjs",
     "tauri:dev": "tauri dev",
+    "pretauri:build": "pnpm stage:sidecar",
     "tauri:build": "tauri build"
   },
   "dependencies": {

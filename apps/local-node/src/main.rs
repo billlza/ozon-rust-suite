@@ -16,11 +16,14 @@ use axum::{
     },
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
-use ozon_connector::{MockOzonConnector, OzonCredentials, OzonProductListPage, OzonReadConnector};
+use ozon_connector::{
+    MockOzonConnector, OzonCredentials, OzonProductListPage, OzonProductLookup, OzonReadConnector,
+};
 use ozon_domain::{
-    DryRunDiff, ExecutionReceipt, Feature, FieldChange, OperationKind, RiskLevel, Task, TaskId,
-    TaskSource, TenantId,
+    DryRunDiff, EntitlementLease, ExecutionReceipt, Feature, FieldChange, OperationKind, RiskLevel,
+    Task, TaskId, TaskSource, TenantId,
 };
 use ozon_secret_store::{SecretName, SecretStore, SystemSecretStore, fingerprint_secret, redact};
 use ozon_task_engine::{CreateTask, TaskEvent, TaskStore};
@@ -40,6 +43,11 @@ use uuid::Uuid;
 
 const DEFAULT_DEV_LOCAL_TOKEN: &str = "dev-local-token";
 const DEFAULT_DEV_OPENCLAW_TOKEN: &str = "dev-openclaw-token";
+const DEFAULT_OPENAI_IMAGE_MODEL: &str = "gpt-image-1";
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
+const SECRET_OZON_CONFIG: &str = "ozon_config";
+const SECRET_OPENAI_CONFIG: &str = "openai_config";
+const SECRET_CLOUD_LEASE: &str = "cloud_lease";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -77,12 +85,18 @@ fn skill_router(state: LocalState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/portal/status", get(portal_status))
+        .route("/portal/lease", post(save_portal_lease))
         .route("/openclaw/manifest", get(openclaw_manifest))
         .route("/config/status", get(config_status))
         .route("/config/ozon", post(save_ozon_config))
         .route("/config/ozon/validate", post(validate_ozon_config))
+        .route("/config/openai", post(save_openai_config))
         .route("/tools/ozon.products.count", post(ozon_products_count))
         .route("/tools/ozon.products.list", post(ozon_products_list))
+        .route("/tools/ozon.products.get", post(ozon_products_get))
+        .route("/poster/brief", post(poster_brief))
+        .route("/poster/generate", post(poster_generate))
+        .route("/poster/verify", post(poster_verify))
         .route("/tasks/dry-run", post(create_dry_run))
         .route("/tasks", get(list_tasks))
         .route("/tasks/{id}", get(get_task))
@@ -124,6 +138,8 @@ fn local_cors() -> CorsLayer {
                 .map(|origin| {
                     origin == "http://localhost:5173"
                         || origin == "http://127.0.0.1:5173"
+                        || origin == "http://localhost:5171"
+                        || origin == "http://127.0.0.1:5171"
                         || origin == "https://ozon66.com"
                         || origin == "https://www.ozon66.com"
                         || origin.starts_with("tauri://")
@@ -142,6 +158,8 @@ struct LocalConfig {
     operator_token: String,
     openclaw_token: String,
     use_real_ozon: bool,
+    openai_base_url: String,
+    openai_image_model: String,
     default_ecommerce_interval_secs: u64,
     default_ecommerce_limit: u16,
 }
@@ -171,6 +189,11 @@ impl LocalConfig {
             openclaw_token: env::var("OZON_OPENCLAW_TOKEN")
                 .unwrap_or_else(|_| DEFAULT_DEV_OPENCLAW_TOKEN.to_string()),
             use_real_ozon,
+            openai_base_url: env::var("OPENAI_BASE_URL")
+                .or_else(|_| env::var("OPENAI_API_BASE_URL"))
+                .unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_string()),
+            openai_image_model: env::var("OPENAI_IMAGE_MODEL")
+                .unwrap_or_else(|_| DEFAULT_OPENAI_IMAGE_MODEL.to_string()),
             default_ecommerce_interval_secs: env_u64("OZON_ECOMMERCE_READ_INTERVAL_SECS", 15 * 60),
             default_ecommerce_limit: env_u16("OZON_ECOMMERCE_READ_LIMIT", 20),
         }
@@ -194,7 +217,11 @@ struct LocalState {
     config: LocalConfig,
     tasks: TaskStore,
     secrets: Arc<dyn SecretStore>,
+    ozon_config_cache: Arc<RwLock<Option<StoredOzonConfig>>>,
+    openai_config_cache: Arc<RwLock<Option<StoredOpenAiConfig>>>,
+    cloud_lease_cache: Arc<RwLock<Option<EntitlementLease>>>,
     ozon_connector: Arc<dyn OzonReadConnector>,
+    http_client: reqwest::Client,
     schedules: ScheduleStore,
 }
 
@@ -221,7 +248,15 @@ impl LocalState {
             config,
             tasks: TaskStore::new(),
             secrets: Arc::new(SystemSecretStore::new("ozon-rust-suite-local", "default")?),
+            ozon_config_cache: Arc::new(RwLock::new(None)),
+            openai_config_cache: Arc::new(RwLock::new(None)),
+            cloud_lease_cache: Arc::new(RwLock::new(None)),
             ozon_connector,
+            http_client: reqwest::Client::builder()
+                .user_agent("ozon-rust-suite-local/0.1")
+                .timeout(Duration::from_secs(90))
+                .build()
+                .map_err(|error| anyhow::anyhow!("failed to build HTTP client: {error}"))?,
             schedules,
         })
     }
@@ -271,8 +306,12 @@ async fn health(State(state): State<LocalState>) -> Json<HealthResponse> {
     })
 }
 
-async fn portal_status(State(state): State<LocalState>) -> Json<PortalStatusResponse> {
-    Json(PortalStatusResponse {
+async fn portal_status(
+    State(state): State<LocalState>,
+) -> Result<Json<PortalStatusResponse>, ApiError> {
+    let device_fingerprint = load_or_create_device_fingerprint(&state).await?;
+    let lease = inspect_cloud_lease(&state).await;
+    Ok(Json(PortalStatusResponse {
         service: "ozon-local-node",
         status: "online",
         checked_at: Utc::now().to_rfc3339(),
@@ -284,6 +323,8 @@ async fn portal_status(State(state): State<LocalState>) -> Json<PortalStatusResp
         ),
         bridge_auth_header: "x-openclaw-token",
         real_ozon_enabled: state.config.use_real_ozon,
+        device_fingerprint,
+        lease,
         features: vec![
             Feature::OzonRead,
             Feature::OzonWriteMock,
@@ -291,7 +332,7 @@ async fn portal_status(State(state): State<LocalState>) -> Json<PortalStatusResp
             Feature::OpenClawBridge,
             Feature::LocalApproval,
         ],
-    })
+    }))
 }
 
 async fn openclaw_manifest(State(state): State<LocalState>) -> Json<OpenClawManifest> {
@@ -320,6 +361,14 @@ async fn openclaw_manifest(State(state): State<LocalState>) -> Json<OpenClawMani
                 risk: "read_only",
                 approval_required: false,
                 description: "List Ozon product summaries with a bounded limit",
+            },
+            OpenClawTool {
+                name: "ozon.products.get",
+                method: "POST",
+                path: "/tools/ozon.products.get",
+                risk: "read_only",
+                approval_required: false,
+                description: "Read one Ozon product fact pack with stable details and image URLs",
             },
             OpenClawTool {
                 name: "tasks.dry_run",
@@ -390,14 +439,85 @@ async fn save_ozon_config(
     state
         .secrets
         .put(
-            SecretName::new("ozon_config"),
+            SecretName::new(SECRET_OZON_CONFIG),
             SecretString::from(bundle_json),
         )
         .await
         .map_err(|_| ApiError::internal("failed to save Ozon config"))?;
+    *state.ozon_config_cache.write().await = Some(bundle);
     Ok(Json(OzonConfigResponse {
         client_id: redact(client_id),
         api_key: redact(api_key),
+        saved_at: Utc::now().to_rfc3339(),
+    }))
+}
+
+async fn save_openai_config(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Json(input): Json<OpenAiConfigRequest>,
+) -> Result<Json<OpenAiConfigResponse>, ApiError> {
+    require_operator_token(&state, &headers)?;
+    let api_key = input.api_key.trim();
+    if api_key.is_empty() {
+        return Err(ApiError::bad_request("OpenAI API key is required"));
+    }
+    let base_url = normalize_openai_base_url(
+        input
+            .base_url
+            .as_deref()
+            .unwrap_or(&state.config.openai_base_url),
+    )?;
+    let image_model = input
+        .image_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&state.config.openai_image_model)
+        .to_string();
+    let bundle = StoredOpenAiConfig {
+        api_key: api_key.to_string(),
+        base_url,
+        image_model,
+    };
+    let bundle_json = serde_json::to_string(&bundle)
+        .map_err(|_| ApiError::internal("failed to serialize OpenAI config"))?;
+    state
+        .secrets
+        .put(
+            SecretName::new(SECRET_OPENAI_CONFIG),
+            SecretString::from(bundle_json),
+        )
+        .await
+        .map_err(|_| ApiError::internal("failed to save OpenAI config"))?;
+    *state.openai_config_cache.write().await = Some(bundle.clone());
+    Ok(Json(OpenAiConfigResponse {
+        base_url: bundle.base_url,
+        image_model: bundle.image_model,
+        api_key_fingerprint: fingerprint_secret(&SecretString::from(api_key.to_string())),
+        saved_at: Utc::now().to_rfc3339(),
+    }))
+}
+
+async fn save_portal_lease(
+    State(state): State<LocalState>,
+    Json(input): Json<PortalLeaseRequest>,
+) -> Result<Json<PortalLeaseResponse>, ApiError> {
+    validate_cloud_lease(&input.lease)?;
+    let lease_json = serde_json::to_string(&input.lease)
+        .map_err(|_| ApiError::internal("failed to serialize lease"))?;
+    state
+        .secrets
+        .put(
+            SecretName::new(SECRET_CLOUD_LEASE),
+            SecretString::from(lease_json),
+        )
+        .await
+        .map_err(|_| ApiError::internal("failed to save cloud lease"))?;
+    *state.cloud_lease_cache.write().await = Some(input.lease.clone());
+    Ok(Json(PortalLeaseResponse {
+        accepted: true,
+        lease: lease_status(&input.lease),
         saved_at: Utc::now().to_rfc3339(),
     }))
 }
@@ -408,6 +528,7 @@ async fn config_status(
 ) -> Result<Json<ConfigStatusResponse>, ApiError> {
     require_operator_token(&state, &headers)?;
     let ozon = inspect_ozon_credentials(&state).await;
+    let openai = inspect_openai_config(&state).await;
     Ok(Json(ConfigStatusResponse {
         service: "ozon-local-node",
         checked_at: Utc::now().to_rfc3339(),
@@ -424,6 +545,8 @@ async fn config_status(
             api_key_fingerprint: ozon.api_key_fingerprint,
             issue: ozon.issue,
         },
+        openai,
+        lease: inspect_cloud_lease(&state).await,
         endpoints: LocalEndpointStatus {
             skill_api: local_http_url(&state.config.skill_bind),
             agent_api: local_http_url(&state.config.agent_bind),
@@ -491,6 +614,138 @@ async fn ozon_products_list(
         products: products.products,
         total: products.total,
         last_id: products.last_id,
+    }))
+}
+
+async fn ozon_products_get(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Json(input): Json<ProductGetRequest>,
+) -> Result<Json<ProductGetResponse>, ApiError> {
+    require_bridge_or_operator_token(&state, &headers)?;
+    let credentials = load_ozon_credentials(&state).await?;
+    let product = state
+        .ozon_connector
+        .product_get(&credentials, input.into_lookup())
+        .await
+        .map_err(|error| map_product_get_error("ozon connector failed", error))?;
+    Ok(Json(ProductGetResponse {
+        connector_mode: connector_mode(&state),
+        product,
+    }))
+}
+
+async fn poster_brief(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Json(input): Json<PosterBriefRequest>,
+) -> Result<Json<PosterBriefResponse>, ApiError> {
+    require_operator_token(&state, &headers)?;
+    let PosterBriefRequest {
+        lookup,
+        theme,
+        locale,
+    } = input;
+    let brief = build_poster_brief(
+        &state,
+        load_product_for_lookup(&state, lookup.into_lookup()).await?,
+        theme.as_deref().unwrap_or("studio"),
+        locale.as_deref().unwrap_or("zh-CN"),
+    )?;
+    Ok(Json(PosterBriefResponse {
+        connector_mode: connector_mode(&state),
+        product: brief.product.clone(),
+        brief: brief.brief,
+    }))
+}
+
+async fn poster_generate(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Json(input): Json<PosterBriefRequest>,
+) -> Result<Json<PosterGenerateResponse>, ApiError> {
+    require_operator_token(&state, &headers)?;
+    let PosterBriefRequest {
+        lookup,
+        theme,
+        locale,
+    } = input;
+    let poster = build_poster_brief(
+        &state,
+        load_product_for_lookup(&state, lookup.into_lookup()).await?,
+        theme.as_deref().unwrap_or("studio"),
+        locale.as_deref().unwrap_or("zh-CN"),
+    )?;
+    let generated = generate_poster_background(&state, &poster.brief).await?;
+    Ok(Json(PosterGenerateResponse {
+        connector_mode: connector_mode(&state),
+        product: poster.product,
+        brief: poster.brief,
+        image_model: generated.image_model,
+        prompt: generated.prompt,
+        revised_prompt: generated.revised_prompt,
+        background_data_url: generated.background_data_url,
+    }))
+}
+
+async fn poster_verify(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Json(input): Json<PosterVerifyRequest>,
+) -> Result<Json<PosterVerifyResponse>, ApiError> {
+    require_operator_token(&state, &headers)?;
+    let PosterVerifyRequest {
+        lookup,
+        theme,
+        locale,
+        headline,
+        subheadline,
+        selling_points,
+        cta_line,
+        compliance_note,
+    } = input;
+    let poster = build_poster_brief(
+        &state,
+        load_product_for_lookup(&state, lookup.into_lookup()).await?,
+        theme.as_deref().unwrap_or("studio"),
+        locale.as_deref().unwrap_or("zh-CN"),
+    )?;
+    let approved_copy = PosterCopy {
+        headline: poster.brief.headline.clone(),
+        subheadline: poster.brief.subheadline.clone(),
+        selling_points: poster.brief.selling_points.clone(),
+        cta_line: poster.brief.cta_line.clone(),
+        compliance_note: poster.brief.compliance_note.clone(),
+    };
+    let submitted_copy = PosterCopy {
+        headline: headline.trim().to_string(),
+        subheadline: subheadline.trim().to_string(),
+        selling_points: selling_points
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect(),
+        cta_line: cta_line.trim().to_string(),
+        compliance_note: compliance_note.trim().to_string(),
+    };
+    let mismatches = compare_poster_copy(&approved_copy, &submitted_copy);
+    let warnings = if mismatches.is_empty() {
+        vec![
+            "校验通过：当前文案与真实商品 fact pack 一致。".to_string(),
+            "商品主体应继续使用真实主图合成，避免让图片模型重画包装和文字。".to_string(),
+        ]
+    } else {
+        vec![
+            "当前文案和事实包不一致，建议直接回退到系统生成稿。".to_string(),
+            "这一步只做逐字段比对，不会帮你猜测哪些自由改写仍然安全。".to_string(),
+        ]
+    };
+    Ok(Json(PosterVerifyResponse {
+        ok: mismatches.is_empty(),
+        checked_at: Utc::now().to_rfc3339(),
+        approved_copy,
+        mismatches,
+        warnings,
     }))
 }
 
@@ -894,7 +1149,17 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 }
 
 async fn inspect_ozon_credentials(state: &LocalState) -> InspectedOzonCredentials {
-    match state.secrets.get(&SecretName::new("ozon_config")).await {
+    if let Some(stored) = state.ozon_config_cache.read().await.clone() {
+        return InspectedOzonCredentials {
+            configured: true,
+            source: "ozon_config_cache",
+            client_id: Some(redact(&stored.client_id)),
+            api_key_fingerprint: Some(fingerprint_secret(&SecretString::from(stored.api_key))),
+            secret_store_available: true,
+            issue: None,
+        };
+    }
+    match get_secret_for_status(state, SECRET_OZON_CONFIG).await {
         Ok(Some(bundle)) => {
             let stored: Result<StoredOzonConfig, _> = serde_json::from_str(bundle.expose_secret());
             match stored {
@@ -931,7 +1196,7 @@ async fn inspect_ozon_credentials(state: &LocalState) -> InspectedOzonCredential
 }
 
 async fn inspect_legacy_ozon_credentials(state: &LocalState) -> InspectedOzonCredentials {
-    let client_id = match state.secrets.get(&SecretName::new("ozon_client_id")).await {
+    let client_id = match get_secret_for_status(state, "ozon_client_id").await {
         Ok(value) => value,
         Err(_) => {
             return InspectedOzonCredentials {
@@ -944,7 +1209,7 @@ async fn inspect_legacy_ozon_credentials(state: &LocalState) -> InspectedOzonCre
             };
         }
     };
-    let api_key = match state.secrets.get(&SecretName::new("ozon_api_key")).await {
+    let api_key = match get_secret_for_status(state, "ozon_api_key").await {
         Ok(value) => value,
         Err(_) => {
             return InspectedOzonCredentials {
@@ -999,9 +1264,16 @@ async fn load_ozon_credentials(state: &LocalState) -> Result<OzonCredentials, Ap
         return Ok(debug_mock_ozon_credentials());
     }
 
+    if let Some(stored) = state.ozon_config_cache.read().await.clone() {
+        return Ok(OzonCredentials {
+            client_id: stored.client_id,
+            api_key: SecretString::from(stored.api_key),
+        });
+    }
+
     if let Some(bundle) = state
         .secrets
-        .get(&SecretName::new("ozon_config"))
+        .get(&SecretName::new(SECRET_OZON_CONFIG))
         .await
         .map_err(|_| ApiError::internal("secret store unavailable"))?
     {
@@ -1035,6 +1307,430 @@ async fn load_ozon_credentials(state: &LocalState) -> Result<OzonCredentials, Ap
     })
 }
 
+async fn load_or_create_device_fingerprint(_state: &LocalState) -> Result<String, ApiError> {
+    let user = env::var("USER")
+        .or_else(|_| env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown-user".to_string());
+    let home = env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "unknown-home".to_string());
+    let seed = format!("{}:{user}:{home}", env::consts::OS);
+    Ok(format!(
+        "ors-local-{}",
+        fingerprint_secret(&SecretString::from(seed))
+    ))
+}
+
+async fn inspect_openai_config(state: &LocalState) -> OpenAiCredentialStatus {
+    if let Some(stored) = state.openai_config_cache.read().await.clone() {
+        return OpenAiCredentialStatus {
+            configured: true,
+            source: "openai_config_cache",
+            base_url: stored.base_url,
+            image_model: stored.image_model,
+            api_key_fingerprint: Some(fingerprint_secret(&SecretString::from(stored.api_key))),
+            issue: None,
+        };
+    }
+    match get_secret_for_status(state, SECRET_OPENAI_CONFIG).await {
+        Ok(Some(bundle)) => {
+            match serde_json::from_str::<StoredOpenAiConfig>(bundle.expose_secret()) {
+                Ok(stored) => OpenAiCredentialStatus {
+                    configured: true,
+                    source: "openai_config",
+                    base_url: stored.base_url,
+                    image_model: stored.image_model,
+                    api_key_fingerprint: Some(fingerprint_secret(&SecretString::from(
+                        stored.api_key,
+                    ))),
+                    issue: None,
+                },
+                Err(_) => OpenAiCredentialStatus {
+                    configured: false,
+                    source: "openai_config",
+                    base_url: state.config.openai_base_url.clone(),
+                    image_model: state.config.openai_image_model.clone(),
+                    api_key_fingerprint: None,
+                    issue: Some("stored OpenAI config is invalid".to_string()),
+                },
+            }
+        }
+        Ok(None) => {
+            let api_key = env::var("OPENAI_API_KEY").ok();
+            OpenAiCredentialStatus {
+                configured: api_key.is_some(),
+                source: if api_key.is_some() { "env" } else { "missing" },
+                base_url: state.config.openai_base_url.clone(),
+                image_model: state.config.openai_image_model.clone(),
+                api_key_fingerprint: api_key
+                    .map(|value| fingerprint_secret(&SecretString::from(value))),
+                issue: if env::var("OPENAI_API_KEY").is_ok() {
+                    None
+                } else {
+                    Some("OpenAI API key is not configured".to_string())
+                },
+            }
+        }
+        Err(_) => OpenAiCredentialStatus {
+            configured: false,
+            source: "unavailable",
+            base_url: state.config.openai_base_url.clone(),
+            image_model: state.config.openai_image_model.clone(),
+            api_key_fingerprint: None,
+            issue: Some("secret store unavailable".to_string()),
+        },
+    }
+}
+
+async fn load_openai_config(state: &LocalState) -> Result<StoredOpenAiConfig, ApiError> {
+    if let Some(stored) = state.openai_config_cache.read().await.clone() {
+        return Ok(stored);
+    }
+
+    if let Some(bundle) = state
+        .secrets
+        .get(&SecretName::new(SECRET_OPENAI_CONFIG))
+        .await
+        .map_err(|_| ApiError::internal("secret store unavailable"))?
+    {
+        let stored: StoredOpenAiConfig = serde_json::from_str(bundle.expose_secret())
+            .map_err(|_| ApiError::internal("stored OpenAI config is invalid"))?;
+        return Ok(stored);
+    }
+
+    let api_key = env::var("OPENAI_API_KEY").map_err(|_| {
+        ApiError::bad_request("OpenAI API key is not configured for poster generation")
+    })?;
+    Ok(StoredOpenAiConfig {
+        api_key,
+        base_url: normalize_openai_base_url(&state.config.openai_base_url)?,
+        image_model: state.config.openai_image_model.clone(),
+    })
+}
+
+async fn inspect_cloud_lease(state: &LocalState) -> LeaseStatus {
+    if let Some(lease) = state.cloud_lease_cache.read().await.clone() {
+        return lease_status(&lease);
+    }
+    match get_secret_for_status(state, SECRET_CLOUD_LEASE).await {
+        Ok(Some(bundle)) => {
+            match serde_json::from_str::<EntitlementLease>(bundle.expose_secret()) {
+                Ok(lease) => lease_status(&lease),
+                Err(_) => LeaseStatus {
+                    configured: false,
+                    valid: false,
+                    lease_id: None,
+                    device_id: None,
+                    features: Vec::new(),
+                    expires_at: None,
+                    issue: Some("stored cloud lease is invalid".to_string()),
+                },
+            }
+        }
+        Ok(None) => LeaseStatus {
+            configured: false,
+            valid: false,
+            lease_id: None,
+            device_id: None,
+            features: Vec::new(),
+            expires_at: None,
+            issue: Some("cloud lease is not installed".to_string()),
+        },
+        Err(_) => LeaseStatus {
+            configured: false,
+            valid: false,
+            lease_id: None,
+            device_id: None,
+            features: Vec::new(),
+            expires_at: None,
+            issue: Some("secret store unavailable".to_string()),
+        },
+    }
+}
+
+async fn get_secret_for_status(
+    state: &LocalState,
+    name: &'static str,
+) -> Result<Option<SecretString>, ()> {
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        state.secrets.get(&SecretName::new(name)),
+    )
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())
+}
+
+fn validate_cloud_lease(lease: &EntitlementLease) -> Result<(), ApiError> {
+    if lease.expires_at <= Utc::now() {
+        return Err(ApiError::bad_request("lease is expired"));
+    }
+    if !lease.features.contains(&Feature::OzonRead) {
+        return Err(ApiError::bad_request(
+            "lease does not include Ozon read access",
+        ));
+    }
+    Ok(())
+}
+
+fn lease_status(lease: &EntitlementLease) -> LeaseStatus {
+    let valid = lease.expires_at > Utc::now() && lease.features.contains(&Feature::OzonRead);
+    LeaseStatus {
+        configured: true,
+        valid,
+        lease_id: Some(lease.lease_id.to_string()),
+        device_id: Some(lease.device_id.0.to_string()),
+        features: lease.features.clone(),
+        expires_at: Some(lease.expires_at.to_rfc3339()),
+        issue: if valid {
+            None
+        } else {
+            Some("lease is expired or missing Ozon read access".to_string())
+        },
+    }
+}
+
+fn normalize_openai_base_url(value: &str) -> Result<String, ApiError> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_OPENAI_BASE_URL.to_string());
+    }
+    let url = reqwest::Url::parse(trimmed)
+        .map_err(|_| ApiError::bad_request("OpenAI base URL must be a valid URL"))?;
+    if !matches!(url.scheme(), "https" | "http") {
+        return Err(ApiError::bad_request(
+            "OpenAI base URL must use http or https",
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn openai_images_endpoint(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/images/generations")
+    } else {
+        format!("{base}/v1/images/generations")
+    }
+}
+
+async fn load_product_for_lookup(
+    state: &LocalState,
+    lookup: OzonProductLookup,
+) -> Result<ozon_connector::OzonProductDetail, ApiError> {
+    let credentials = load_ozon_credentials(state).await?;
+    state
+        .ozon_connector
+        .product_get(&credentials, lookup)
+        .await
+        .map_err(|error| map_product_get_error("ozon connector failed", error))
+}
+
+fn build_poster_brief(
+    state: &LocalState,
+    product: ozon_connector::OzonProductDetail,
+    theme: &str,
+    locale: &str,
+) -> Result<PosterContext, ApiError> {
+    let headline = preferred_headline(&product);
+    let attribute_points = product
+        .attributes
+        .iter()
+        .filter_map(|attribute| {
+            let name = attribute.name.as_deref()?.trim();
+            let value = attribute.values.first()?.trim();
+            if name.is_empty() || value.is_empty() {
+                return None;
+            }
+            Some(format!("{name}: {}", truncate_text(value, 22)))
+        })
+        .take(3)
+        .collect::<Vec<_>>();
+    let selling_points = if attribute_points.is_empty() {
+        vec![
+            format!("Ozon 实时商品：{}", product.offer_id),
+            format!("已读取 {} 张商品图", product.images.len()),
+            format!("已整理 {} 条属性", product.attributes.len()),
+        ]
+    } else {
+        attribute_points
+    };
+    let image_count = product.images.len();
+    let subheadline = if image_count > 0 {
+        format!("先用真实商品图站住画面，再把 Ozon 已有属性整理成能直接上图的卖点。")
+    } else {
+        "这件商品还没带主图，先补图再出海报会更稳。".to_string()
+    };
+    let compliance_note = if state.config.use_real_ozon {
+        "商品主体与文案来自 Ozon 实时数据；AI 只负责背景氛围，不重画商品包装。".to_string()
+    } else {
+        "当前是本地 mock 模式，正式出图前请切到真实 Ozon API 再校验一次。".to_string()
+    };
+    let cta_line = match locale {
+        "zh-CN" => "主图、卖点和活动视觉可以先在这一版里敲定".to_string(),
+        _ => "Lock the hero image, then tune the selling points in one pass.".to_string(),
+    };
+    let image_stage = if product.primary_image.is_some() {
+        "Reserve a clean stage in the lower-right area for compositing the real product cutout."
+    } else {
+        "Leave the center clean for a product to be placed later."
+    };
+    let background_prompt = format!(
+        "Create a premium e-commerce poster background only, with no product, no packaging, no text, no logo, and no watermark. Theme: {}. Mood: confident, commercial, polished. Use light, shadow, reflections, and spatial depth to support a seller campaign poster. {} Palette should feel modern and readable behind Chinese text overlays. Keep the composition suitable for a 4:5 portrait poster.",
+        normalize_theme(theme),
+        image_stage
+    );
+    Ok(PosterContext {
+        product,
+        brief: PosterBrief {
+            theme: normalize_theme(theme).to_string(),
+            headline,
+            subheadline,
+            selling_points,
+            cta_line,
+            compliance_note,
+            background_prompt,
+        },
+    })
+}
+
+async fn generate_poster_background(
+    state: &LocalState,
+    brief: &PosterBrief,
+) -> Result<PosterGeneratedBackground, ApiError> {
+    let openai = load_openai_config(state).await?;
+    let request = OpenAiImageGenerationRequest {
+        model: openai.image_model.clone(),
+        prompt: brief.background_prompt.clone(),
+        size: "1536x1024".to_string(),
+    };
+    let response = state
+        .http_client
+        .post(openai_images_endpoint(&openai.base_url))
+        .bearer_auth(openai.api_key)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| {
+            ApiError::bad_gateway(format!("OpenAI image generation failed: {error}"))
+        })?;
+    if !response.status().is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "unknown error".to_string());
+        return Err(ApiError::bad_gateway(format!(
+            "OpenAI image generation failed: {}",
+            body.trim()
+        )));
+    }
+    let payload: OpenAiImageGenerationResponse = response.json().await.map_err(|error| {
+        ApiError::bad_gateway(format!("invalid OpenAI image response: {error}"))
+    })?;
+    let image = payload
+        .data
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::bad_gateway("OpenAI image response returned no images"))?;
+    let b64 = image.b64_json.ok_or_else(|| {
+        ApiError::bad_gateway("OpenAI image response did not include base64 image data")
+    })?;
+    let bytes = BASE64_STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|_| ApiError::bad_gateway("OpenAI image response returned invalid base64 data"))?;
+    Ok(PosterGeneratedBackground {
+        image_model: openai.image_model,
+        prompt: request.prompt,
+        revised_prompt: image.revised_prompt,
+        background_data_url: format!("data:image/png;base64,{}", BASE64_STANDARD.encode(bytes)),
+    })
+}
+
+fn preferred_headline(product: &ozon_connector::OzonProductDetail) -> String {
+    let raw = product
+        .name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&product.offer_id);
+    truncate_text(raw.trim(), 28)
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn normalize_theme(theme: &str) -> &str {
+    let normalized = theme.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "spotlight" => "spotlight studio",
+        "launch" => "product launch stage",
+        "lifestyle" => "editorial lifestyle display",
+        _ => "clean studio",
+    }
+}
+
+fn compare_poster_copy(expected: &PosterCopy, actual: &PosterCopy) -> Vec<PosterCopyMismatch> {
+    let mut mismatches = Vec::new();
+    push_copy_mismatch(
+        &mut mismatches,
+        "headline",
+        &expected.headline,
+        &actual.headline,
+    );
+    push_copy_mismatch(
+        &mut mismatches,
+        "subheadline",
+        &expected.subheadline,
+        &actual.subheadline,
+    );
+    push_copy_mismatch(
+        &mut mismatches,
+        "cta_line",
+        &expected.cta_line,
+        &actual.cta_line,
+    );
+    push_copy_mismatch(
+        &mut mismatches,
+        "compliance_note",
+        &expected.compliance_note,
+        &actual.compliance_note,
+    );
+    let expected_points = expected.selling_points.join(" | ");
+    let actual_points = actual.selling_points.join(" | ");
+    push_copy_mismatch(
+        &mut mismatches,
+        "selling_points",
+        &expected_points,
+        &actual_points,
+    );
+    mismatches
+}
+
+fn push_copy_mismatch(
+    mismatches: &mut Vec<PosterCopyMismatch>,
+    field: &'static str,
+    expected: &str,
+    actual: &str,
+) {
+    if normalize_copy(expected) != normalize_copy(actual) {
+        mismatches.push(PosterCopyMismatch {
+            field,
+            expected: expected.to_string(),
+            actual: actual.to_string(),
+        });
+    }
+}
+
+fn normalize_copy(value: &str) -> String {
+    value.split_whitespace().collect::<String>().to_lowercase()
+}
+
 fn debug_mock_ozon_credentials() -> OzonCredentials {
     OzonCredentials {
         client_id: "debug-local-client-id".to_string(),
@@ -1047,6 +1743,18 @@ fn connector_mode(state: &LocalState) -> &'static str {
         "real"
     } else {
         "mock"
+    }
+}
+
+fn map_product_get_error(context: &str, error: ozon_connector::OzonConnectorError) -> ApiError {
+    match error {
+        ozon_connector::OzonConnectorError::InvalidProductLookup(message) => {
+            ApiError::bad_request(format!("{context}: {message}"))
+        }
+        ozon_connector::OzonConnectorError::ProductNotFound(label) => {
+            ApiError::not_found(format!("{context}: product not found for {label}"))
+        }
+        error => ApiError::bad_gateway(format!("{context}: {error}")),
     }
 }
 
@@ -1130,6 +1838,8 @@ struct PortalStatusResponse {
     manifest_url: String,
     bridge_auth_header: &'static str,
     real_ozon_enabled: bool,
+    device_fingerprint: String,
+    lease: LeaseStatus,
     features: Vec<Feature>,
 }
 
@@ -1166,16 +1876,50 @@ struct OzonConfigRequest {
     api_key: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
+struct OpenAiConfigRequest {
+    api_key: String,
+    base_url: Option<String>,
+    image_model: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct StoredOzonConfig {
     client_id: String,
     api_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct StoredOpenAiConfig {
+    api_key: String,
+    base_url: String,
+    image_model: String,
 }
 
 #[derive(Debug, Serialize)]
 struct OzonConfigResponse {
     client_id: String,
     api_key: String,
+    saved_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiConfigResponse {
+    base_url: String,
+    image_model: String,
+    api_key_fingerprint: String,
+    saved_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PortalLeaseRequest {
+    lease: EntitlementLease,
+}
+
+#[derive(Debug, Serialize)]
+struct PortalLeaseResponse {
+    accepted: bool,
+    lease: LeaseStatus,
     saved_at: String,
 }
 
@@ -1197,6 +1941,8 @@ struct ConfigStatusResponse {
     connector_mode: &'static str,
     secret_store: SecretStoreStatus,
     ozon: OzonCredentialStatus,
+    openai: OpenAiCredentialStatus,
+    lease: LeaseStatus,
     endpoints: LocalEndpointStatus,
 }
 
@@ -1212,6 +1958,27 @@ struct OzonCredentialStatus {
     source: &'static str,
     client_id: Option<String>,
     api_key_fingerprint: Option<String>,
+    issue: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiCredentialStatus {
+    configured: bool,
+    source: &'static str,
+    base_url: String,
+    image_model: String,
+    api_key_fingerprint: Option<String>,
+    issue: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LeaseStatus {
+    configured: bool,
+    valid: bool,
+    lease_id: Option<String>,
+    device_id: Option<String>,
+    features: Vec<Feature>,
+    expires_at: Option<String>,
     issue: Option<String>,
 }
 
@@ -1246,6 +2013,136 @@ struct ProductListResponse {
     products: Vec<ozon_connector::OzonProductSummary>,
     total: u32,
     last_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProductGetRequest {
+    product_id: Option<String>,
+    offer_id: Option<String>,
+    sku: Option<String>,
+}
+
+impl ProductGetRequest {
+    fn into_lookup(self) -> OzonProductLookup {
+        OzonProductLookup {
+            product_id: self.product_id,
+            offer_id: self.offer_id,
+            sku: self.sku,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ProductGetResponse {
+    connector_mode: &'static str,
+    product: ozon_connector::OzonProductDetail,
+}
+
+#[derive(Debug, Deserialize)]
+struct PosterBriefRequest {
+    #[serde(flatten)]
+    lookup: ProductGetRequest,
+    theme: Option<String>,
+    locale: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PosterBrief {
+    theme: String,
+    headline: String,
+    subheadline: String,
+    selling_points: Vec<String>,
+    cta_line: String,
+    compliance_note: String,
+    background_prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PosterContext {
+    product: ozon_connector::OzonProductDetail,
+    brief: PosterBrief,
+}
+
+#[derive(Debug, Serialize)]
+struct PosterBriefResponse {
+    connector_mode: &'static str,
+    product: ozon_connector::OzonProductDetail,
+    brief: PosterBrief,
+}
+
+#[derive(Debug, Serialize)]
+struct PosterGenerateResponse {
+    connector_mode: &'static str,
+    product: ozon_connector::OzonProductDetail,
+    brief: PosterBrief,
+    image_model: String,
+    prompt: String,
+    revised_prompt: Option<String>,
+    background_data_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PosterVerifyRequest {
+    #[serde(flatten)]
+    lookup: ProductGetRequest,
+    theme: Option<String>,
+    locale: Option<String>,
+    headline: String,
+    subheadline: String,
+    selling_points: Vec<String>,
+    cta_line: String,
+    compliance_note: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PosterCopy {
+    headline: String,
+    subheadline: String,
+    selling_points: Vec<String>,
+    cta_line: String,
+    compliance_note: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PosterCopyMismatch {
+    field: &'static str,
+    expected: String,
+    actual: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PosterVerifyResponse {
+    ok: bool,
+    checked_at: String,
+    approved_copy: PosterCopy,
+    mismatches: Vec<PosterCopyMismatch>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug)]
+struct PosterGeneratedBackground {
+    image_model: String,
+    prompt: String,
+    revised_prompt: Option<String>,
+    background_data_url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiImageGenerationRequest {
+    model: String,
+    prompt: String,
+    size: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiImageGenerationResponse {
+    data: Vec<OpenAiImageData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiImageData {
+    b64_json: Option<String>,
+    revised_prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1397,6 +2294,8 @@ mod tests {
             operator_token: "operator-token".to_string(),
             openclaw_token: "bridge-token".to_string(),
             use_real_ozon: false,
+            openai_base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
+            openai_image_model: DEFAULT_OPENAI_IMAGE_MODEL.to_string(),
             default_ecommerce_interval_secs: 900,
             default_ecommerce_limit: 20,
         }
@@ -1476,6 +2375,50 @@ mod tests {
         .expect_err("bridge token must not enable schedule");
 
         assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn bridge_token_can_read_product_detail() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-openclaw-token", "bridge-token".parse().unwrap());
+
+        let response = ozon_products_get(
+            State(state),
+            headers,
+            Json(ProductGetRequest {
+                product_id: Some("mock-product-1".to_string()),
+                offer_id: None,
+                sku: None,
+            }),
+        )
+        .await
+        .expect("product detail");
+
+        assert_eq!(response.connector_mode, "mock");
+        assert_eq!(response.product.product_id, "mock-product-1");
+        assert_eq!(response.product.images.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn product_get_rejects_ambiguous_lookup() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-openclaw-token", "bridge-token".parse().unwrap());
+
+        let error = ozon_products_get(
+            State(state),
+            headers,
+            Json(ProductGetRequest {
+                product_id: Some("mock-product-1".to_string()),
+                offer_id: Some("SKU-MOCK-1".to_string()),
+                sku: None,
+            }),
+        )
+        .await
+        .expect_err("ambiguous lookup");
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

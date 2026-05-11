@@ -25,8 +25,11 @@ import {
 } from "lucide-react";
 import "./styles.css";
 
-const API_BASE = import.meta.env.VITE_CLOUD_API ?? "http://127.0.0.1:8080";
+const API_BASE = normalizeBaseUrl(import.meta.env.VITE_CLOUD_API ?? defaultCloudApiBase());
 const LOCAL_NODE_API = normalizeBaseUrl(import.meta.env.VITE_LOCAL_NODE_API ?? "http://127.0.0.1:8790");
+const LOCAL_CONSOLE_URL = normalizeOptionalUrl(
+  import.meta.env.VITE_LOCAL_CONSOLE_URL ?? (import.meta.env.DEV ? "http://127.0.0.1:5173" : "")
+);
 const SESSION_KEY = "ozon-rust-suite.portal.session";
 const NEBULA_OAUTH_STORAGE_KEY = "ozon-rust-suite.nebula.oauth";
 const DEFAULT_NEBULA_SCOPE = "openid profile email offline_access";
@@ -83,9 +86,30 @@ type Order = {
   id: string;
   status: string;
   plan_code: string;
+  payment_provider: string;
   payment_reference: string;
+  amount_minor: number;
+  currency: string;
+  checkout_session_id?: string | null;
+  payment_intent_id?: string | null;
+  paid_at?: string | null;
   created_at: string;
   confirmed_at?: string | null;
+};
+
+type PaymentSession = {
+  provider: string;
+  checkout_url?: string | null;
+  checkout_session_id?: string | null;
+  payment_reference: string;
+  amount_minor: number;
+  currency: string;
+  message: string;
+};
+
+type OrderApiResponse = {
+  order: Order;
+  payment?: PaymentSession | null;
 };
 
 type Device = {
@@ -157,6 +181,16 @@ type LocalPortalStatus = {
   manifest_url: string;
   bridge_auth_header: string;
   real_ozon_enabled: boolean;
+  device_fingerprint: string;
+  lease: {
+    configured: boolean;
+    valid: boolean;
+    lease_id: string | null;
+    device_id: string | null;
+    features: string[];
+    expires_at: string | null;
+    issue: string | null;
+  };
   features: string[];
 };
 
@@ -274,8 +308,10 @@ function App() {
   });
   const [operationStatus, setOperationStatus] = useState<string | null>(null);
   const authRequestId = useRef(0);
+  const checkoutNoticeHandled = useRef(false);
 
   const [order, setOrder] = useState<Order | null>(null);
+  const [paymentSession, setPaymentSession] = useState<PaymentSession | null>(null);
   const [cardKey, setCardKey] = useState("");
   const [entitlements, setEntitlements] = useState<Entitlement[]>([]);
   const [deviceName, setDeviceName] = useState("MacBook Local Node");
@@ -289,7 +325,10 @@ function App() {
   });
 
   const activeEntitlement = useMemo(
-    () => entitlements.find((entitlement) => !entitlement.revoked_at) ?? null,
+    () =>
+      entitlements.find(
+        (entitlement) => !entitlement.revoked_at && new Date(entitlement.expires_at).getTime() > Date.now()
+      ) ?? null,
     [entitlements]
   );
   const authBusy = isAuthBusy(authState.phase);
@@ -301,9 +340,12 @@ function App() {
   const localPairingStatus = localNodePairingStatus(localNode, activeEntitlement, device, lease);
   const localNodeMsiUrl = downloads?.local_node_msi ?? downloads?.local_node ?? "";
   const localNodeExeUrl = downloads?.local_node_exe ?? "";
-  const openclawPluginUrl = downloads?.openclaw_plugin ?? "/downloads/openclaw-plugin.zip";
-  const openclawManifestUrl = downloads?.openclaw_manifest ?? "/openclaw/manifest.json";
-  const localManifestUrl = downloads?.local_manifest_url ?? `${LOCAL_NODE_API}/openclaw/manifest`;
+  const openclawPluginUrl = absolutePortalUrl(downloads?.openclaw_plugin ?? "/downloads/openclaw-plugin.zip");
+  const openclawManifestUrl = absolutePortalUrl(downloads?.openclaw_manifest ?? "/openclaw/manifest.json");
+  const localManifestUrl = localNode.portal?.manifest_url ?? `${LOCAL_NODE_API}/openclaw/manifest`;
+  const canOpenLocalConsole = Boolean(LOCAL_CONSOLE_URL);
+  const canCopyLocalManifest = localNode.phase === "online";
+  const canBindLocalDevice = canUseProtectedActions && localNode.phase === "online" && Boolean(localNode.portal?.device_fingerprint);
   const directAuthUnavailableMessage =
     "当前部署未配置门户内账号登录环境，请检查 VITE_SKYBRIDGE_SUPABASE_URL 和 VITE_SKYBRIDGE_SUPABASE_ANON_KEY。";
   const authSubmitText =
@@ -316,9 +358,9 @@ function App() {
       : authMode === "register"
         ? "邮箱注册"
         : "邮箱登录";
-  const authDialogTitle = authMode === "register" ? "创建卖家账号" : "登录卖家工作台";
+  const authDialogTitle = authMode === "register" ? "创建账号" : "登录工作台";
   const authDialogDescription =
-    authMode === "register" ? "用邮箱或手机号创建账号，稍后补充店铺和设备信息。" : "继续管理店铺授权、订单和本地节点。";
+    authMode === "register" ? "先把账号建起来，后面的安装包、设备绑定和本机节点都在同一条路上。" : "回来继续看授权、安装包和本机节点状态。";
   const shouldShowAuthDialogStatus =
     authBusy || authState.phase === "failed" || authState.phase === "authenticated" || Boolean(operationStatus);
 
@@ -719,6 +761,7 @@ function App() {
     setSession(null);
     setEntitlements([]);
     setOrder(null);
+    setPaymentSession(null);
     setDevice(null);
     setLease(null);
     setOperationStatus(null);
@@ -732,12 +775,18 @@ function App() {
       return;
     }
     try {
-      const data = await api<{ order: Order }>("/orders", {
+      const data = await api<OrderApiResponse>("/orders", {
         method: "POST",
         body: JSON.stringify({ plan_code: "standard_30d" })
       });
       setOrder(data.order);
-      setOperationStatus("订单已创建，将订单 UUID 或支付备注交给管理员确认");
+      setPaymentSession(data.payment ?? null);
+      if (data.payment?.checkout_url) {
+        setOperationStatus("订单已创建，正在打开支付页");
+        window.location.assign(data.payment.checkout_url);
+        return;
+      }
+      setOperationStatus(data.payment?.message ?? "订单已创建，请按支付备注完成确认");
     } catch (error) {
       setOperationStatus(`创建订单失败：${errorMessage(error)}`);
     }
@@ -748,8 +797,29 @@ function App() {
       setOperationStatus("还没有可复制的订单");
       return;
     }
-    await navigator.clipboard.writeText(`订单 UUID: ${order.id}\n支付备注: ${order.payment_reference}`);
+    await navigator.clipboard.writeText(
+      `订单 UUID: ${order.id}\n支付方式: ${order.payment_provider}\n支付备注: ${order.payment_reference}`
+    );
     setOperationStatus("订单信息已复制");
+  }
+
+  async function refreshOrder() {
+    if (!order) {
+      setOperationStatus("还没有可刷新的订单");
+      return;
+    }
+    try {
+      const data = await api<OrderApiResponse>(`/orders/${order.id}`);
+      setOrder(data.order);
+      setPaymentSession(data.payment ?? null);
+      setOperationStatus(
+        data.order.status === "confirmed"
+          ? "订单已确认，授权状态会在账户刷新后生效"
+          : `订单状态已刷新：${data.order.status}`
+      );
+    } catch (error) {
+      setOperationStatus(`刷新订单失败：${errorMessage(error)}`);
+    }
   }
 
   async function redeem() {
@@ -800,7 +870,13 @@ function App() {
         body: JSON.stringify({ device_id: device.id })
       });
       setLease(data.lease);
-      setOperationStatus("授权租约已签发，本地节点可用这个租约启动受控功能");
+      try {
+        await localNodePost("/portal/lease", { lease: data.lease });
+        setOperationStatus("授权租约已签发，并已写入本机节点");
+        await probeLocalNode();
+      } catch (localError) {
+        setOperationStatus(`云端租约已签发，但写入本机节点失败：${errorMessage(localError)}`);
+      }
     } catch (error) {
       setOperationStatus(`签发租约失败：${errorMessage(error)}`);
     }
@@ -817,6 +893,9 @@ function App() {
         localNodeJson<LocalNodeManifest>("/openclaw/manifest"),
         localNodeJson<LocalPortalStatus>("/portal/status").catch(() => null)
       ]);
+      if (portal?.device_fingerprint) {
+        setDeviceFingerprint(portal.device_fingerprint);
+      }
       setLocalNode({
         phase: "online",
         message: health.real_ozon_enabled ? "本机节点在线，当前是真实 Ozon API 模式" : "本机节点在线，当前是开发 mock 模式",
@@ -835,13 +914,16 @@ function App() {
   }
 
   async function copyLocalManifestUrl() {
-    await navigator.clipboard.writeText(localManifestUrl);
+    if (!canCopyLocalManifest) {
+      setOperationStatus("先把本机节点检测到 online，再复制本机 manifest");
+      return;
+    }
+    await copyText(localManifestUrl);
     setOperationStatus("本机 OpenClaw manifest URL 已复制");
   }
 
   async function copyStaticManifestUrl() {
-    const url = absolutePortalUrl(openclawManifestUrl);
-    await navigator.clipboard.writeText(url);
+    await copyText(openclawManifestUrl);
     setOperationStatus("门户 OpenClaw manifest URL 已复制");
   }
 
@@ -871,6 +953,21 @@ function App() {
         phase: "idle",
         message: "登录后会检测 127.0.0.1:8790 本机节点"
       });
+    }
+  }, [session?.token]);
+
+  useEffect(() => {
+    if (checkoutNoticeHandled.current) return;
+    const checkout = new URL(window.location.href).searchParams.get("checkout");
+    if (!checkout) return;
+    checkoutNoticeHandled.current = true;
+    if (checkout === "success") {
+      setOperationStatus("支付完成，正在刷新授权状态");
+      if (session?.token) {
+        refreshAccount();
+      }
+    } else if (checkout === "cancelled") {
+      setOperationStatus("支付已取消，订单还没有扣款");
     }
   }, [session?.token]);
 
@@ -1002,16 +1099,21 @@ function App() {
       <section className="hero-section" id="top">
         <div className="hero-copy">
           <p className="eyebrow">Ozon 自动化运营工作台</p>
-          <h1>一套后台，管住 1688、跟卖和 Ozon 本地节点</h1>
+          <h1>先把账号、安装包和本机节点接起来，再谈自动化。</h1>
           <p>
-            面向跨境卖家的 Rust 自动化套件：OpenClaw 提议任务，本地节点执行校验，Ozon 写操作必须先预览差异并人工批准。
+            这套门户不跟你兜圈子。登录后先拿到安装包，确认本机节点在线，再去本地控制台验证 Ozon 凭据、读取真实商品，把第一张海报跑出来。
           </p>
           <div className="hero-actions">
             {session ? (
               <>
                 <a className="download" href="#console">
-                  <ArrowRight size={18} /> 进入账户授权
+                  <ArrowRight size={18} /> 继续接入流程
                 </a>
+                {canOpenLocalConsole && (
+                  <a className="download secondary" href={LOCAL_CONSOLE_URL} target="_blank" rel="noreferrer">
+                    <MonitorCheck size={18} /> 打开本地控制台
+                  </a>
+                )}
                 <button className="secondary" disabled={authBusy} onClick={() => refreshAccount()}>
                   <RefreshCcw size={18} /> 刷新状态
                 </button>
@@ -1021,16 +1123,16 @@ function App() {
                 <button onClick={() => openAuthDialog("register")}>
                   <UserPlus size={18} /> 立即注册
                 </button>
-                <button className="secondary" onClick={() => openAuthDialog("login")}>
-                  <LogIn size={18} /> 登录控制台
-                </button>
+                <a className="download secondary" href="#workflow">
+                  <ArrowRight size={18} /> 看看接入步骤
+                </a>
               </>
             )}
           </div>
           <div className="hero-meta">
-            <span>邮箱/手机号注册自动分配 Nebula ID</span>
-            <span>Ozon 写操作默认 dry-run</span>
-            <span>本地服务仅绑定 127.0.0.1</span>
+            <span>邮箱或手机号注册后自动分配 Nebula ID</span>
+            <span>安装包、设备和授权都在同一套账号下</span>
+            <span>真实写操作继续留在本地审批</span>
           </div>
         </div>
         <div className="hero-visual" aria-label="Ozon Rust Suite workflow preview">
@@ -1038,78 +1140,82 @@ function App() {
             <span />
             <span />
             <span />
-            <strong>approval queue</strong>
+            <strong>happy path</strong>
           </div>
           <div className="visual-grid">
             <div>
-              <span>1688 import</span>
-              <strong>128 drafts</strong>
+              <span>Step 1</span>
+              <strong>登录账号</strong>
             </div>
             <div>
-              <span>Ozon read</span>
-              <strong>2 shops</strong>
+              <span>Step 2</span>
+              <strong>下载并启动本地节点</strong>
             </div>
             <div>
-              <span>risk</span>
-              <strong>medium</strong>
+              <span>Step 3</span>
+              <strong>检测 127.0.0.1:8790</strong>
             </div>
           </div>
           <div className="diff-preview">
-            <span>price update</span>
-            <strong>dry-run diff ready</strong>
-            <em>waiting for operator approval</em>
+            <span>Step 4</span>
+            <strong>去本地控制台验证 Ozon，再读取真实商品</strong>
+            <em>第一条顺路的链跑通以后，再接出图和审批。</em>
           </div>
         </div>
       </section>
 
       <section className="capability-band" id="capabilities">
         <div className="band-title">
-          <p className="eyebrow">功能覆盖</p>
-          <h2>对标 OzonClaw，但按合规产品重做执行边界</h2>
+          <p className="eyebrow">我们现在真能做的</p>
+          <h2>先把关键链路做扎实，再慢慢把自动化铺开。</h2>
         </div>
         <div className="capability-grid">
           <article>
             <PackageCheck />
-            <h3>1688 铺货到 Ozon</h3>
-            <p>先支持导入和模拟数据，生成商品草稿、校验字段和预览上传差异，后续再接授权数据源。</p>
+            <h3>账号、下载和授权走在一条线上</h3>
+            <p>登录、安装包、设备绑定和租约状态都在同一个工作台里看，不用来回找页面。</p>
           </article>
           <article>
             <Boxes />
-            <h3>Ozon 跟卖与商品操作</h3>
-            <p>读取商品、库存和价格状态；写操作进入审批队列，带租户、店铺、风险等级和幂等记录。</p>
+            <h3>真实 Ozon 商品已经能读</h3>
+            <p>本地节点直接读官方 Seller API。凭据没配好就报错，不会悄悄回退成假数据。</p>
           </article>
           <article>
             <Bot />
-            <h3>OpenClaw 一体化使用</h3>
-            <p>OpenClaw 只能创建提议任务，不能越过本地审批。任务进度、日志、回执都可审计。</p>
+            <h3>AI 先帮你出底图，不替你瞎改商品</h3>
+            <p>海报流程会把真实商品图锁住，AI 只负责背景氛围，文案继续按事实包逐项校验。</p>
           </article>
         </div>
       </section>
 
       <section className="workflow-band" id="workflow">
         <div className="workflow-copy">
-          <p className="eyebrow">账户体系</p>
-          <h2>邮箱、手机号和 Nebula ID 共用同一身份</h2>
+          <p className="eyebrow">上手路径</p>
+          <h2>这条路先走顺：登录、下载、检测、验证、读商品。</h2>
           <p>
-            登录可选择邮箱、手机号或 Nebula ID；注册请使用邮箱或手机号。邮箱和手机号注册成功后会自动分配 Nebula ID，Ozon
-            只保存当前服务需要的身份投影。
+            门户负责把账号、下载和本机节点连接起来。本地控制台负责保存凭据、验证 Ozon、读取商品和生成海报。两边各做自己该做的事，用户就不会卡在半路。
           </p>
         </div>
         <div className="workflow-steps">
           <div>
             <span>01</span>
-            <strong>选择登录或注册</strong>
-            <p>入口只出现两个清晰动作，账号方式在登录面板里选择。</p>
+            <strong>登录账号</strong>
+            <p>邮箱、手机号和 Nebula ID 都归同一个身份，登录后自动恢复下载和授权状态。</p>
           </div>
           <div>
             <span>02</span>
-            <strong>分配 Nebula ID</strong>
-            <p>邮箱/手机号注册后自动得到 Nebula ID；老用户可直接用 Nebula ID 登录。</p>
+            <strong>下载安装包</strong>
+            <p>先把本地节点装起来，之后门户才能知道你这台机器有没有在线。</p>
           </div>
           <div>
             <span>03</span>
-            <strong>进入授权工作台</strong>
-            <p>创建订单、兑换卡密、绑定设备和签发本地节点租约。</p>
+            <strong>检测本机节点</strong>
+            <p>门户只探测 `127.0.0.1:8790` 有没有响应，不去越权读取你的本地密钥。</p>
+          </div>
+          <div>
+            <span>04</span>
+            <strong>打开本地控制台</strong>
+            <p>在本地控制台验证 Ozon 凭据、读取真实商品，再开始海报和后续自动化。</p>
           </div>
         </div>
       </section>
@@ -1244,12 +1350,12 @@ function App() {
           <section className="operations">
             <div className="op-section">
               <div className="section-title">
-                <Clipboard />
-                <div>
-                  <h2>订单</h2>
-                  <p>手工付款 MVP：创建订单后，把 UUID 或支付备注交给管理员确认。</p>
+                  <Clipboard />
+                  <div>
+                    <h2>订单</h2>
+                  <p>创建标准版订单。配置 Stripe 时会跳转收银台，支付成功后自动开通授权。</p>
+                  </div>
                 </div>
-              </div>
               <div className="form-grid">
                 <label>
                   订单 UUID
@@ -1263,13 +1369,35 @@ function App() {
                   订单状态
                   <input value={order?.status ?? "none"} readOnly />
                 </label>
+                <label>
+                  支付方式
+                  <input value={order?.payment_provider ?? "未创建"} readOnly />
+                </label>
+                <label>
+                  金额
+                  <input value={order ? formatMoney(order.amount_minor, order.currency) : "未创建"} readOnly />
+                </label>
               </div>
+              {paymentSession && (
+                <div className="payment-note">
+                  <CheckCircle2 size={18} />
+                  <span>{paymentSession.message}</span>
+                  {paymentSession.checkout_url && (
+                    <a href={paymentSession.checkout_url}>
+                      <ExternalLink size={16} /> 打开支付页
+                    </a>
+                  )}
+                </div>
+              )}
               <div className="command-row">
                 <button disabled={!canUseProtectedActions} onClick={createOrder}>
                   <ArrowRight size={18} /> 创建订单
                 </button>
                 <button className="secondary" onClick={copyOrderInfo} disabled={!order}>
                   复制订单信息
+                </button>
+                <button className="secondary" onClick={refreshOrder} disabled={!order || authBusy}>
+                  <RefreshCcw size={18} /> 刷新订单
                 </button>
               </div>
             </div>
@@ -1313,7 +1441,7 @@ function App() {
                 <MonitorCheck />
                 <div>
                   <h2>本机节点与 OpenClaw</h2>
-                  <p>登录后检测本机 127.0.0.1:8790；安装包启动本地服务，OpenClaw 通过 manifest 接入。</p>
+                  <p>门户先确认本机节点是否在线；真正的凭据校验、商品读取和出图留在本地控制台里做。</p>
                 </div>
               </div>
               <div className="local-node-grid">
@@ -1334,7 +1462,7 @@ function App() {
                 </div>
               </div>
               <div className="command-row">
-                <button disabled={!session || localNode.phase === "checking"} onClick={probeLocalNode}>
+                <button disabled={localNode.phase === "checking"} onClick={probeLocalNode}>
                   <RefreshCcw size={18} /> 检测本机节点
                 </button>
                 {localNodeMsiUrl && (
@@ -1347,16 +1475,24 @@ function App() {
                     <Download size={18} /> EXE 安装包
                   </a>
                 )}
-                <a className="download" href={openclawPluginUrl}>
+                {canOpenLocalConsole && (
+                  <a className="download secondary" href={LOCAL_CONSOLE_URL} target="_blank" rel="noreferrer">
+                    <MonitorCheck size={18} /> 打开本地控制台
+                  </a>
+                )}
+                <a className="download" href={openclawPluginUrl} target="_blank" rel="noreferrer">
                   <Download size={18} /> OpenClaw 插件
                 </a>
-                <button className="secondary" onClick={copyLocalManifestUrl}>
+                <button className="secondary" disabled={!canCopyLocalManifest} onClick={copyLocalManifestUrl}>
                   <Clipboard size={18} /> 复制本机 manifest
                 </button>
                 <button className="secondary" onClick={copyStaticManifestUrl}>
-                  <ExternalLink size={18} /> 复制安装 manifest
+                  <ExternalLink size={18} /> 复制门户 manifest
                 </button>
               </div>
+              <p className="section-hint">
+                先下载安装包并启动本机节点；检测到 online 后，再复制本机 manifest 给 OpenClaw。门户 manifest 只负责安装入口，不代替本机授权。
+              </p>
               {localNode.manifest && (
                 <div className="manifest-tools">
                   {localNode.manifest.tools.map((tool) => (
@@ -1375,7 +1511,7 @@ function App() {
                 <MonitorCheck />
                 <div>
                   <h2>设备绑定</h2>
-                  <p>绑定会消耗卡密的设备额度，超出 `max_devices` 会被云端拒绝。</p>
+                  <p>先检测本机节点，再用本机节点生成的指纹绑定设备；超出 `max_devices` 会被云端拒绝。</p>
                 </div>
               </div>
               <div className="form-grid">
@@ -1385,7 +1521,12 @@ function App() {
                 </label>
                 <label>
                   设备指纹
-                  <input value={deviceFingerprint} onChange={(event) => setDeviceFingerprint(event.target.value)} />
+                  <input
+                    value={deviceFingerprint}
+                    readOnly
+                    placeholder="先检测本机节点"
+                    title="设备指纹由本机节点生成，门户不再允许手写伪造"
+                  />
                 </label>
                 <label>
                   绑定状态
@@ -1393,7 +1534,7 @@ function App() {
                 </label>
               </div>
               <div className="command-row">
-                <button disabled={!canUseProtectedActions} onClick={activateDevice}>
+                <button disabled={!canBindLocalDevice} onClick={activateDevice}>
                   <MonitorCheck size={18} /> 绑定设备
                 </button>
                 <button className="secondary" onClick={issueLease} disabled={!device || authBusy}>
@@ -1416,8 +1557,8 @@ function App() {
       <section className="pricing-band" id="pricing">
         <div>
           <p className="eyebrow">MVP 商业流</p>
-          <h2>先用人工确认收款，卡密兑换授权</h2>
-          <p>适合现在快速验证产品：注册账号、创建订单、管理员确认、兑换卡密、绑定设备、下载本地节点。</p>
+          <h2>先把用户从登录带到真实商品读取，后面的自动化再一段段补上。</h2>
+          <p>当前最重要的是把账号、安装包、本机节点、Ozon 凭据和商品读取这条线跑顺。付费、授权和设备绑定已经接上，下一段就是海报和审批。</p>
         </div>
         {session ? (
           <a className="download" href="#console">
@@ -1679,8 +1820,40 @@ async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}
   }
 }
 
+async function copyText(value: string) {
+  try {
+    await navigator.clipboard.writeText(value);
+    return;
+  } catch {
+    const element = document.createElement("textarea");
+    element.value = value;
+    element.setAttribute("readonly", "true");
+    element.style.position = "fixed";
+    element.style.opacity = "0";
+    document.body.appendChild(element);
+    element.select();
+    document.execCommand("copy");
+    document.body.removeChild(element);
+  }
+}
+
 async function localNodeJson<T>(path: string): Promise<T> {
   const response = await fetchWithTimeout(`${LOCAL_NODE_API}${path}`, {}, 4_000);
+  return parseResponse<T>(response);
+}
+
+async function localNodePost<T>(path: string, body: unknown): Promise<T> {
+  const response = await fetchWithTimeout(
+    `${LOCAL_NODE_API}${path}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    },
+    4_000
+  );
   return parseResponse<T>(response);
 }
 
@@ -1748,6 +1921,29 @@ function localNodePairingStatus(
 
 function absolutePortalUrl(pathOrUrl: string) {
   return new URL(pathOrUrl, window.location.origin).toString();
+}
+
+function defaultCloudApiBase() {
+  if (typeof window === "undefined") {
+    return "http://127.0.0.1:8080";
+  }
+  const hostname = window.location.hostname.replace(/^www\./, "");
+  if (hostname === "ozon66.com") {
+    return "https://api.ozon66.com";
+  }
+  if (hostname === "localhost" || hostname === "127.0.0.1") {
+    return "http://127.0.0.1:8080";
+  }
+  if (import.meta.env.DEV) {
+    return "http://127.0.0.1:8080";
+  }
+  throw new Error("VITE_CLOUD_API must be configured for this production portal host");
+}
+
+function normalizeOptionalUrl(value: string | undefined) {
+  const trimmed = value?.trim();
+  if (!trimmed) return "";
+  return normalizeBaseUrl(trimmed);
 }
 
 async function skybridgePasswordAuth(input: {
@@ -2229,6 +2425,18 @@ function identifierAutocomplete(loginMethod: LoginMethod) {
   if (loginMethod === "email") return "email";
   if (loginMethod === "phone") return "tel";
   return "username";
+}
+
+function formatMoney(amountMinor: number, currency: string) {
+  const normalizedCurrency = currency.toUpperCase();
+  try {
+    return new Intl.NumberFormat("zh-CN", {
+      style: "currency",
+      currency: normalizedCurrency
+    }).format(amountMinor / 100);
+  } catch {
+    return `${normalizedCurrency} ${(amountMinor / 100).toFixed(2)}`;
+  }
 }
 
 function normalizeBaseUrl(value: string) {

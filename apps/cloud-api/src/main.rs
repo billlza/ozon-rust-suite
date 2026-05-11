@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr};
+use std::{collections::HashMap, env, net::SocketAddr};
 
 use argon2::{
     Argon2,
@@ -6,6 +6,7 @@ use argon2::{
 };
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Path, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
@@ -15,11 +16,12 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Duration, Utc};
+use hmac::{Hmac, Mac};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use ozon_domain::{
     AuditEvent, AuditEventId, CardKey, CardKeyId, CardKeyStatus, Device, DeviceId, DeviceStatus,
     Email, Entitlement, EntitlementId, EntitlementLease, Feature, NebulaId, NebulaSource, Order,
-    OrderId, OrderStatus, PhoneNumber, PlanCode, TenantId, User, UserId, UserRole,
+    OrderId, OrderStatus, PaymentProvider, PhoneNumber, PlanCode, TenantId, User, UserId, UserRole,
 };
 use rand::{Rng, distr::Alphanumeric};
 use rand_core::OsRng;
@@ -85,6 +87,7 @@ fn app_router(state: AppState) -> Router {
         .route("/me", get(me))
         .route("/orders", post(create_order))
         .route("/orders/{id}", get(get_order))
+        .route("/webhooks/stripe", post(stripe_webhook))
         .route("/admin/orders/{id}/confirm", post(confirm_order))
         .route(
             "/admin/orders/by-reference/{payment_reference}/confirm",
@@ -117,10 +120,51 @@ struct AppConfig {
     local_node_version: String,
     openclaw_plugin_url: String,
     openclaw_manifest_url: String,
+    payment_provider: ConfiguredPaymentProvider,
+    stripe_secret_key: Option<SecretString>,
+    stripe_webhook_secret: Option<SecretString>,
+    stripe_success_url: String,
+    stripe_cancel_url: String,
+    stripe_currency: String,
+    stripe_standard_amount_minor: i64,
     skybridge_api_base_urls: Vec<String>,
     allow_local_nebula_registration: bool,
     cors_allowed_origins: Vec<String>,
     cors_allowed_origins_configured: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ConfiguredPaymentProvider {
+    Manual,
+    Stripe,
+    Alipay,
+    WechatPay,
+    Unknown(String),
+}
+
+impl ConfiguredPaymentProvider {
+    fn from_env() -> Self {
+        let raw = env::var("OZON_SUITE_PAYMENT_PROVIDER")
+            .or_else(|_| env::var("OZON_PAYMENT_PROVIDER"))
+            .unwrap_or_else(|_| "manual".to_string());
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "manual" => Self::Manual,
+            "stripe" => Self::Stripe,
+            "alipay" | "ali_pay" => Self::Alipay,
+            "wechat" | "wechat_pay" | "weixin" | "weixin_pay" => Self::WechatPay,
+            _ => Self::Unknown(raw),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Manual => "manual",
+            Self::Stripe => "stripe",
+            Self::Alipay => "alipay",
+            Self::WechatPay => "wechat_pay",
+            Self::Unknown(value) => value.as_str(),
+        }
+    }
 }
 
 impl AppConfig {
@@ -162,6 +206,25 @@ impl AppConfig {
             }),
             openclaw_manifest_url: env::var("OZON_SUITE_OPENCLAW_MANIFEST_URL")
                 .unwrap_or_else(|_| "https://ozon66.com/openclaw/manifest.json".to_string()),
+            payment_provider: ConfiguredPaymentProvider::from_env(),
+            stripe_secret_key: env::var("OZON_SUITE_STRIPE_SECRET_KEY")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(SecretString::from),
+            stripe_webhook_secret: env::var("OZON_SUITE_STRIPE_WEBHOOK_SECRET")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(SecretString::from),
+            stripe_success_url: env::var("OZON_SUITE_STRIPE_SUCCESS_URL")
+                .unwrap_or_else(|_| "https://ozon66.com/?checkout=success#console".to_string()),
+            stripe_cancel_url: env::var("OZON_SUITE_STRIPE_CANCEL_URL")
+                .unwrap_or_else(|_| "https://ozon66.com/?checkout=cancelled#console".to_string()),
+            stripe_currency: env::var("OZON_SUITE_STRIPE_CURRENCY")
+                .unwrap_or_else(|_| "cny".to_string()),
+            stripe_standard_amount_minor: env::var("OZON_SUITE_STRIPE_STANDARD_30D_AMOUNT_MINOR")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(4000),
             skybridge_api_base_urls: skybridge_api_base_urls_from_env(),
             allow_local_nebula_registration: env::var("OZON_SUITE_ALLOW_LOCAL_NEBULA_REGISTRATION")
                 .ok()
@@ -203,6 +266,9 @@ impl AppConfig {
                 "OZON_SUITE_CORS_ALLOWED_ORIGINS must be set before running cloud-api in production or on a non-loopback bind"
             );
         }
+        if production_like && !dev_override {
+            validate_production_download_config(self)?;
+        }
         if self.cors_allowed_origins.is_empty() {
             anyhow::bail!("at least one CORS origin must be configured");
         }
@@ -211,8 +277,119 @@ impl AppConfig {
                 .parse::<HeaderValue>()
                 .map_err(|_| anyhow::anyhow!("invalid CORS origin: {origin}"))?;
         }
+        self.validate_payment_provider(production_like)?;
         Ok(())
     }
+
+    fn validate_payment_provider(&self, production_like: bool) -> anyhow::Result<()> {
+        match &self.payment_provider {
+            ConfiguredPaymentProvider::Manual => {}
+            ConfiguredPaymentProvider::Stripe => {
+                if self.stripe_secret_key.is_none() {
+                    anyhow::bail!(
+                        "OZON_SUITE_STRIPE_SECRET_KEY must be set when OZON_SUITE_PAYMENT_PROVIDER=stripe"
+                    );
+                }
+                if self.stripe_webhook_secret.is_none() {
+                    anyhow::bail!(
+                        "OZON_SUITE_STRIPE_WEBHOOK_SECRET must be set when OZON_SUITE_PAYMENT_PROVIDER=stripe"
+                    );
+                }
+                if self.stripe_standard_amount_minor <= 0 {
+                    anyhow::bail!("OZON_SUITE_STRIPE_STANDARD_30D_AMOUNT_MINOR must be positive");
+                }
+                validate_checkout_return_url(
+                    "OZON_SUITE_STRIPE_SUCCESS_URL",
+                    &self.stripe_success_url,
+                    production_like,
+                )?;
+                validate_checkout_return_url(
+                    "OZON_SUITE_STRIPE_CANCEL_URL",
+                    &self.stripe_cancel_url,
+                    production_like,
+                )?;
+                validate_currency("OZON_SUITE_STRIPE_CURRENCY", &self.stripe_currency)?;
+            }
+            ConfiguredPaymentProvider::Alipay | ConfiguredPaymentProvider::WechatPay => {
+                anyhow::bail!(
+                    "payment provider '{}' is fail-closed until merchant credentials and signing are implemented; use manual or stripe",
+                    self.payment_provider.as_str()
+                );
+            }
+            ConfiguredPaymentProvider::Unknown(value) => {
+                anyhow::bail!(
+                    "unknown payment provider '{value}'; expected manual, stripe, alipay, or wechat_pay"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_checkout_return_url(
+    name: &str,
+    value: &str,
+    production_like: bool,
+) -> anyhow::Result<()> {
+    let parsed =
+        url::Url::parse(value).map_err(|_| anyhow::anyhow!("{name} must be an absolute URL"))?;
+    if production_like && parsed.scheme() != "https" {
+        anyhow::bail!("{name} must use https in production");
+    }
+    if !matches!(parsed.scheme(), "https" | "http") {
+        anyhow::bail!("{name} must use http or https");
+    }
+    Ok(())
+}
+
+fn validate_currency(name: &str, value: &str) -> anyhow::Result<()> {
+    let normalized = value.trim();
+    if normalized.len() != 3 || !normalized.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        anyhow::bail!("{name} must be a three-letter currency code");
+    }
+    Ok(())
+}
+
+fn validate_production_download_config(config: &AppConfig) -> anyhow::Result<()> {
+    for (name, value) in [
+        (
+            "OZON_SUITE_PORTAL_DOWNLOAD_URL",
+            config.download_url.as_str(),
+        ),
+        (
+            "OZON_SUITE_PORTAL_DOWNLOAD_MSI_URL",
+            config.download_msi_url.as_str(),
+        ),
+        (
+            "OZON_SUITE_PORTAL_DOWNLOAD_EXE_URL",
+            config.download_exe_url.as_str(),
+        ),
+        (
+            "OZON_SUITE_OPENCLAW_PLUGIN_URL",
+            config.openclaw_plugin_url.as_str(),
+        ),
+        (
+            "OZON_SUITE_OPENCLAW_MANIFEST_URL",
+            config.openclaw_manifest_url.as_str(),
+        ),
+    ] {
+        let parsed = url::Url::parse(value)
+            .map_err(|_| anyhow::anyhow!("{name} must be an absolute URL in production"))?;
+        if parsed.scheme() != "https" {
+            anyhow::bail!("{name} must use https in production");
+        }
+    }
+    if config.download_sha256 == "pending-release-sha256" {
+        anyhow::bail!("OZON_SUITE_PORTAL_DOWNLOAD_SHA256 must be set to a real SHA256");
+    }
+    if !is_sha256_hex(&config.download_sha256) {
+        anyhow::bail!("OZON_SUITE_PORTAL_DOWNLOAD_SHA256 must be a 64-character hex digest");
+    }
+    Ok(())
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn cors_allowed_origins_from_env() -> Option<Vec<String>> {
@@ -257,6 +434,7 @@ fn cloud_cors(config: &AppConfig) -> CorsLayer {
             AUTHORIZATION,
             CONTENT_TYPE,
             HeaderName::from_static("x-admin-token"),
+            HeaderName::from_static("stripe-signature"),
         ])
 }
 
@@ -264,11 +442,16 @@ fn cloud_cors(config: &AppConfig) -> CorsLayer {
 struct AppState {
     config: AppConfig,
     db: PgPool,
+    http_client: reqwest::Client,
 }
 
 impl AppState {
     fn new(config: AppConfig, db: PgPool) -> Self {
-        Self { config, db }
+        Self {
+            config,
+            db,
+            http_client: reqwest::Client::new(),
+        }
     }
 }
 
@@ -412,17 +595,33 @@ async fn create_order(
     Json(input): Json<CreateOrderRequest>,
 ) -> Result<Json<OrderResponse>, ApiError> {
     let claims = require_user(&state, &headers)?;
-    let order = Order {
+    let plan = plan_definition(&state.config, input.plan_code.as_deref())?;
+    let provider = order_payment_provider(&state.config.payment_provider)?;
+    let mut order = Order {
         id: OrderId::new(),
         tenant_id: claims.tenant_id,
         user_id: claims.sub,
-        plan_code: PlanCode(
-            input
-                .plan_code
-                .unwrap_or_else(|| "standard_30d".to_string()),
-        ),
-        status: OrderStatus::PendingManualPayment,
-        payment_reference: format!("OZON-{}", Uuid::new_v4().simple()),
+        plan_code: plan.code.clone(),
+        status: match provider {
+            PaymentProvider::Manual => OrderStatus::PendingManualPayment,
+            PaymentProvider::Stripe => OrderStatus::PendingProviderPayment,
+            PaymentProvider::Alipay | PaymentProvider::WechatPay => {
+                return Err(ApiError::service_unavailable(
+                    "selected payment provider is not wired yet",
+                ));
+            }
+        },
+        payment_provider: provider,
+        payment_reference: match provider {
+            PaymentProvider::Manual => format!("OZON-{}", Uuid::new_v4().simple()),
+            PaymentProvider::Stripe => format!("stripe:{}", Uuid::new_v4().simple()),
+            PaymentProvider::Alipay | PaymentProvider::WechatPay => unreachable!(),
+        },
+        amount_minor: plan.amount_minor,
+        currency: plan.currency.clone(),
+        checkout_session_id: None,
+        payment_intent_id: None,
+        paid_at: None,
         created_at: Utc::now(),
         confirmed_at: None,
     };
@@ -435,12 +634,39 @@ async fn create_order(
             &format!("{:?}", order.user_id),
             "order.created",
             &format!("{:?}", order.id),
-            "manual payment order created",
+            &format!("{} order created", payment_provider_to_db(provider)),
         ),
     )
     .await?;
     tx.commit().await.map_err(db_internal)?;
-    Ok(Json(OrderResponse { order }))
+
+    let payment = match provider {
+        PaymentProvider::Manual => Some(PaymentSessionResponse {
+            provider: payment_provider_to_db(provider).to_string(),
+            checkout_url: None,
+            checkout_session_id: None,
+            payment_reference: order.payment_reference.clone(),
+            amount_minor: order.amount_minor,
+            currency: order.currency.clone(),
+            message: "创建成功。线下付款确认后，客服会返回卡密用于兑换授权。".to_string(),
+        }),
+        PaymentProvider::Stripe => {
+            let session = create_stripe_checkout_session(&state, &order, &plan).await?;
+            order = attach_checkout_session(&state.db, order.id, &session.id).await?;
+            Some(PaymentSessionResponse {
+                provider: payment_provider_to_db(provider).to_string(),
+                checkout_url: Some(session.url),
+                checkout_session_id: Some(session.id),
+                payment_reference: order.payment_reference.clone(),
+                amount_minor: order.amount_minor,
+                currency: order.currency.clone(),
+                message: "正在打开 Stripe Checkout。支付成功后会自动开通授权。".to_string(),
+            })
+        }
+        PaymentProvider::Alipay | PaymentProvider::WechatPay => unreachable!(),
+    };
+
+    Ok(Json(OrderResponse { order, payment }))
 }
 
 async fn get_order(
@@ -453,7 +679,326 @@ async fn get_order(
         .await?
         .filter(|order| order.user_id == claims.sub || claims.role == UserRole::Admin)
         .ok_or_else(|| ApiError::not_found("order not found"))?;
-    Ok(Json(OrderResponse { order }))
+    Ok(Json(OrderResponse {
+        order,
+        payment: None,
+    }))
+}
+
+#[derive(Clone, Debug)]
+struct PlanDefinition {
+    code: PlanCode,
+    display_name: &'static str,
+    amount_minor: i64,
+    currency: String,
+}
+
+fn plan_definition(
+    config: &AppConfig,
+    requested_code: Option<&str>,
+) -> Result<PlanDefinition, ApiError> {
+    let code = requested_code
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("standard_30d");
+    match code {
+        "standard_30d" => Ok(PlanDefinition {
+            code: PlanCode::standard_30d(),
+            display_name: "Ozon Rust Suite Standard 30 days",
+            amount_minor: config.stripe_standard_amount_minor,
+            currency: config.stripe_currency.trim().to_ascii_lowercase(),
+        }),
+        _ => Err(ApiError::bad_request("unsupported plan code")),
+    }
+}
+
+fn order_payment_provider(
+    configured: &ConfiguredPaymentProvider,
+) -> Result<PaymentProvider, ApiError> {
+    match configured {
+        ConfiguredPaymentProvider::Manual => Ok(PaymentProvider::Manual),
+        ConfiguredPaymentProvider::Stripe => Ok(PaymentProvider::Stripe),
+        ConfiguredPaymentProvider::Alipay => Err(ApiError::service_unavailable(
+            "Alipay is not wired yet; configure Stripe or manual payments",
+        )),
+        ConfiguredPaymentProvider::WechatPay => Err(ApiError::service_unavailable(
+            "WeChat Pay is not wired yet; configure Stripe or manual payments",
+        )),
+        ConfiguredPaymentProvider::Unknown(provider) => Err(ApiError::service_unavailable(
+            format!("unknown payment provider: {provider}"),
+        )),
+    }
+}
+
+async fn create_stripe_checkout_session(
+    state: &AppState,
+    order: &Order,
+    plan: &PlanDefinition,
+) -> Result<StripeCheckoutSessionCreateResponse, ApiError> {
+    let secret_key = state
+        .config
+        .stripe_secret_key
+        .as_ref()
+        .ok_or_else(|| ApiError::service_unavailable("Stripe is not configured"))?;
+    let order_id = order.id.0.to_string();
+    let tenant_id = order.tenant_id.0.to_string();
+    let user_id = order.user_id.0.to_string();
+    let amount = plan.amount_minor.to_string();
+    let form = vec![
+        ("mode", "payment".to_string()),
+        ("success_url", state.config.stripe_success_url.clone()),
+        ("cancel_url", state.config.stripe_cancel_url.clone()),
+        ("client_reference_id", order_id.clone()),
+        ("metadata[order_id]", order_id),
+        ("metadata[tenant_id]", tenant_id),
+        ("metadata[user_id]", user_id),
+        ("metadata[plan_code]", plan.code.0.clone()),
+        ("line_items[0][quantity]", "1".to_string()),
+        ("line_items[0][price_data][currency]", plan.currency.clone()),
+        ("line_items[0][price_data][unit_amount]", amount),
+        (
+            "line_items[0][price_data][product_data][name]",
+            plan.display_name.to_string(),
+        ),
+    ];
+
+    let response = state
+        .http_client
+        .post("https://api.stripe.com/v1/checkout/sessions")
+        .bearer_auth(secret_key.expose_secret())
+        .form(&form)
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "stripe checkout session request failed");
+            ApiError::bad_gateway("Stripe checkout is temporarily unavailable")
+        })?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| {
+        tracing::warn!(error = %error, "failed to read stripe checkout response");
+        ApiError::bad_gateway("Stripe checkout response could not be read")
+    })?;
+    if !status.is_success() {
+        let stripe_error = serde_json::from_str::<StripeErrorEnvelope>(&body)
+            .ok()
+            .map(|value| value.error.message)
+            .unwrap_or_else(|| "Stripe rejected checkout session creation".to_string());
+        tracing::warn!(status = %status, stripe_error = %stripe_error, "stripe checkout session creation failed");
+        return Err(ApiError::bad_gateway(
+            "Stripe checkout session creation failed",
+        ));
+    }
+    let session =
+        serde_json::from_str::<StripeCheckoutSessionCreateResponse>(&body).map_err(|error| {
+            tracing::warn!(error = %error, "failed to decode stripe checkout response");
+            ApiError::bad_gateway("Stripe checkout response was invalid")
+        })?;
+    if session.url.trim().is_empty() {
+        return Err(ApiError::bad_gateway(
+            "Stripe checkout response did not include a checkout URL",
+        ));
+    }
+    Ok(session)
+}
+
+async fn stripe_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<StripeWebhookResponse>, ApiError> {
+    let signing_secret = state
+        .config
+        .stripe_webhook_secret
+        .as_ref()
+        .ok_or_else(|| ApiError::service_unavailable("Stripe webhook is not configured"))?;
+    let signature = headers
+        .get("stripe-signature")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::bad_request("missing Stripe-Signature header"))?;
+    verify_stripe_signature(signature, &body, signing_secret.expose_secret())?;
+
+    let payload_hash = sha256_hex(&body);
+    let event: StripeWebhookEvent = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::bad_request("invalid Stripe webhook payload"))?;
+    let processed = match event.kind.as_str() {
+        "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
+            let session =
+                serde_json::from_value::<StripeCheckoutSessionObject>(event.data.object.clone())
+                    .map_err(|_| ApiError::bad_request("invalid Stripe checkout session event"))?;
+            fulfill_stripe_checkout_session(&state, &event, &session, &payload_hash).await?
+        }
+        _ => record_ignored_stripe_event(&state, &event, &payload_hash).await?,
+    };
+
+    Ok(Json(StripeWebhookResponse {
+        received: true,
+        processed,
+    }))
+}
+
+async fn fulfill_stripe_checkout_session(
+    state: &AppState,
+    event: &StripeWebhookEvent,
+    session: &StripeCheckoutSessionObject,
+    payload_hash: &str,
+) -> Result<bool, ApiError> {
+    if session.payment_status.as_deref() != Some("paid") {
+        return record_ignored_stripe_event(state, event, payload_hash).await;
+    }
+
+    let order_id = stripe_session_order_id(session)?;
+    let payment_intent_id = stripe_string_value(session.payment_intent.as_ref());
+    let mut tx = state.db.begin().await.map_err(db_internal)?;
+    let inserted = insert_payment_event(
+        &mut tx,
+        PaymentProvider::Stripe,
+        &event.id,
+        &event.kind,
+        Some(order_id),
+        payload_hash,
+    )
+    .await?;
+    if !inserted {
+        tx.commit().await.map_err(db_internal)?;
+        return Ok(false);
+    }
+
+    let current_order = find_order_by_id_for_update(&mut tx, order_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("order not found"))?;
+    validate_stripe_session_matches_order(session, &current_order)?;
+    if current_order.status == OrderStatus::Confirmed {
+        tx.commit().await.map_err(db_internal)?;
+        return Ok(false);
+    }
+    if current_order.status != OrderStatus::PendingProviderPayment {
+        return Err(ApiError::conflict("order is not awaiting provider payment"));
+    }
+
+    let paid_order =
+        confirm_provider_order(&mut tx, order_id, payment_intent_id.as_deref(), Utc::now()).await?;
+    provision_paid_order_entitlement(
+        &mut tx,
+        &paid_order,
+        "stripe",
+        "Stripe checkout paid and entitlement activated",
+    )
+    .await?;
+    tx.commit().await.map_err(db_internal)?;
+    Ok(true)
+}
+
+async fn record_ignored_stripe_event(
+    state: &AppState,
+    event: &StripeWebhookEvent,
+    payload_hash: &str,
+) -> Result<bool, ApiError> {
+    let mut tx = state.db.begin().await.map_err(db_internal)?;
+    insert_payment_event(
+        &mut tx,
+        PaymentProvider::Stripe,
+        &event.id,
+        &event.kind,
+        None,
+        payload_hash,
+    )
+    .await?;
+    tx.commit().await.map_err(db_internal)?;
+    Ok(false)
+}
+
+fn verify_stripe_signature(header: &str, body: &[u8], secret: &str) -> Result<(), ApiError> {
+    let (timestamp, signatures) = parse_stripe_signature_header(header)?;
+    let now = Utc::now().timestamp();
+    if (now - timestamp).abs() > 300 {
+        return Err(ApiError::bad_request("stale Stripe webhook signature"));
+    }
+    let mut payload = timestamp.to_string().into_bytes();
+    payload.push(b'.');
+    payload.extend_from_slice(body);
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .map_err(|_| ApiError::internal("invalid Stripe webhook secret"))?;
+    mac.update(&payload);
+    let expected = hex_lower(&mac.finalize().into_bytes());
+    if signatures
+        .iter()
+        .any(|signature| constant_time_eq(signature, &expected))
+    {
+        return Ok(());
+    }
+    Err(ApiError::bad_request("invalid Stripe webhook signature"))
+}
+
+fn parse_stripe_signature_header(header: &str) -> Result<(i64, Vec<String>), ApiError> {
+    let mut timestamp = None;
+    let mut signatures = Vec::new();
+    for part in header.split(',') {
+        let Some((key, value)) = part.trim().split_once('=') else {
+            continue;
+        };
+        match key {
+            "t" => {
+                timestamp = value.parse::<i64>().ok();
+            }
+            "v1" if !value.trim().is_empty() => signatures.push(value.trim().to_string()),
+            _ => {}
+        }
+    }
+    let timestamp = timestamp.ok_or_else(|| ApiError::bad_request("missing Stripe timestamp"))?;
+    if signatures.is_empty() {
+        return Err(ApiError::bad_request("missing Stripe v1 signature"));
+    }
+    Ok((timestamp, signatures))
+}
+
+fn stripe_session_order_id(session: &StripeCheckoutSessionObject) -> Result<OrderId, ApiError> {
+    let raw = session
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("order_id"))
+        .or(session.client_reference_id.as_ref())
+        .ok_or_else(|| ApiError::bad_request("Stripe session missing order id"))?;
+    let order_id = Uuid::parse_str(raw)
+        .map_err(|_| ApiError::bad_request("Stripe session order id is invalid"))?;
+    Ok(OrderId(order_id))
+}
+
+fn validate_stripe_session_matches_order(
+    session: &StripeCheckoutSessionObject,
+    order: &Order,
+) -> Result<(), ApiError> {
+    if order.payment_provider != PaymentProvider::Stripe {
+        return Err(ApiError::bad_request("order is not a Stripe order"));
+    }
+    if order.checkout_session_id.as_deref() != Some(session.id.as_str()) {
+        return Err(ApiError::bad_request("Stripe session does not match order"));
+    }
+    if session.amount_total != Some(order.amount_minor) {
+        return Err(ApiError::bad_request("Stripe amount does not match order"));
+    }
+    if session.currency.as_deref().map(str::to_ascii_lowercase) != Some(order.currency.clone()) {
+        return Err(ApiError::bad_request(
+            "Stripe currency does not match order",
+        ));
+    }
+    Ok(())
+}
+
+fn stripe_string_value(value: Option<&serde_json::Value>) -> Option<String> {
+    value.and_then(|value| value.as_str().map(str::to_string))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex_lower(&Sha256::digest(bytes))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push_str(&format!("{byte:02x}"));
+    }
+    encoded
 }
 
 async fn confirm_order(
@@ -519,6 +1064,71 @@ async fn confirm_order_card_key(
         order,
         card_key: generated.plain_code,
     })
+}
+
+async fn provision_paid_order_entitlement(
+    tx: &mut Transaction<'_, Postgres>,
+    order: &Order,
+    actor: &str,
+    summary: &str,
+) -> Result<Entitlement, ApiError> {
+    let (duration_days, max_devices) = fulfillment_terms_for_plan(&order.plan_code)?;
+    validate_card_key_limits(duration_days, max_devices)?;
+    let generated = generate_card_key(
+        &order.plan_code,
+        order.tenant_id,
+        duration_days,
+        max_devices,
+    )?;
+    insert_card_key(tx, &generated.card_key, Some(order.id))
+        .await
+        .map_err(|error| {
+            map_unique_conflict(
+                error,
+                "uq_card_keys_order_id",
+                "order already has a card key",
+            )
+        })?;
+    let redeemed_at = Utc::now();
+    mark_card_key_redeemed(tx, generated.card_key.id, order.user_id, redeemed_at).await?;
+    let entitlement = Entitlement {
+        id: EntitlementId::new(),
+        tenant_id: order.tenant_id,
+        user_id: order.user_id,
+        plan_code: order.plan_code.clone(),
+        source_card_key_id: generated.card_key.id,
+        features: default_features(),
+        expires_at: redeemed_at + Duration::days(i64::from(duration_days)),
+        revoked_at: None,
+    };
+    insert_entitlement(tx, &entitlement)
+        .await
+        .map_err(|error| {
+            map_unique_conflict(
+                error,
+                "uq_entitlements_source_card_key",
+                "order entitlement is already active",
+            )
+        })?;
+    insert_audit(
+        tx,
+        &audit(
+            Some(order.tenant_id),
+            actor,
+            "order.entitlement_activated",
+            &format!("{:?}", order.id),
+            summary,
+        ),
+    )
+    .await?;
+    Ok(entitlement)
+}
+
+fn fulfillment_terms_for_plan(plan_code: &PlanCode) -> Result<(u16, u8), ApiError> {
+    match plan_code.0.as_str() {
+        "standard_30d" => Ok((30, 1)),
+        _ => Err(ApiError::bad_request("unsupported plan code")),
+    }
 }
 
 async fn create_card_keys(
@@ -941,8 +1551,12 @@ async fn find_user_by_id(db: &PgPool, user_id: UserId) -> Result<Option<User>, A
 async fn insert_order(tx: &mut Transaction<'_, Postgres>, order: &Order) -> Result<(), ApiError> {
     sqlx::query(
         r#"
-        INSERT INTO orders (id, tenant_id, user_id, plan_code, status, payment_reference, created_at, confirmed_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        INSERT INTO orders (
+            id, tenant_id, user_id, plan_code, status, payment_provider,
+            payment_reference, amount_minor, currency, checkout_session_id,
+            payment_intent_id, paid_at, created_at, confirmed_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         "#,
     )
     .bind(order.id.0)
@@ -950,7 +1564,13 @@ async fn insert_order(tx: &mut Transaction<'_, Postgres>, order: &Order) -> Resu
     .bind(order.user_id.0)
     .bind(&order.plan_code.0)
     .bind(order_status_to_db(order.status))
+    .bind(payment_provider_to_db(order.payment_provider))
     .bind(&order.payment_reference)
+    .bind(order.amount_minor)
+    .bind(&order.currency)
+    .bind(&order.checkout_session_id)
+    .bind(&order.payment_intent_id)
+    .bind(order.paid_at)
     .bind(order.created_at)
     .bind(order.confirmed_at)
     .execute(&mut **tx)
@@ -962,7 +1582,9 @@ async fn insert_order(tx: &mut Transaction<'_, Postgres>, order: &Order) -> Resu
 async fn find_order_by_id(db: &PgPool, order_id: OrderId) -> Result<Option<Order>, ApiError> {
     sqlx::query(
         r#"
-        SELECT id, tenant_id, user_id, plan_code, status, payment_reference, created_at, confirmed_at
+        SELECT id, tenant_id, user_id, plan_code, status, payment_provider, payment_reference,
+               amount_minor, currency, checkout_session_id, payment_intent_id, paid_at,
+               created_at, confirmed_at
         FROM orders
         WHERE id = $1
         "#,
@@ -982,9 +1604,11 @@ async fn confirm_pending_order(
     let row = sqlx::query(
         r#"
         UPDATE orders
-        SET status = 'confirmed', confirmed_at = $2
+        SET status = 'confirmed', paid_at = $2, confirmed_at = $2
         WHERE id = $1 AND status = 'pending_manual_payment'
-        RETURNING id, tenant_id, user_id, plan_code, status, payment_reference, created_at, confirmed_at
+        RETURNING id, tenant_id, user_id, plan_code, status, payment_provider, payment_reference,
+                  amount_minor, currency, checkout_session_id, payment_intent_id, paid_at,
+                  created_at, confirmed_at
         "#,
     )
     .bind(order_id.0)
@@ -998,7 +1622,9 @@ async fn confirm_pending_order(
 
     let existing = sqlx::query(
         r#"
-        SELECT id, tenant_id, user_id, plan_code, status, payment_reference, created_at, confirmed_at
+        SELECT id, tenant_id, user_id, plan_code, status, payment_provider, payment_reference,
+               amount_minor, currency, checkout_session_id, payment_intent_id, paid_at,
+               created_at, confirmed_at
         FROM orders
         WHERE id = $1
         "#,
@@ -1020,9 +1646,11 @@ async fn confirm_pending_order_by_reference(
     let row = sqlx::query(
         r#"
         UPDATE orders
-        SET status = 'confirmed', confirmed_at = $2
+        SET status = 'confirmed', paid_at = $2, confirmed_at = $2
         WHERE payment_reference = $1 AND status = 'pending_manual_payment'
-        RETURNING id, tenant_id, user_id, plan_code, status, payment_reference, created_at, confirmed_at
+        RETURNING id, tenant_id, user_id, plan_code, status, payment_provider, payment_reference,
+                  amount_minor, currency, checkout_session_id, payment_intent_id, paid_at,
+                  created_at, confirmed_at
         "#,
     )
     .bind(payment_reference)
@@ -1036,7 +1664,9 @@ async fn confirm_pending_order_by_reference(
 
     let existing = sqlx::query(
         r#"
-        SELECT id, tenant_id, user_id, plan_code, status, payment_reference, created_at, confirmed_at
+        SELECT id, tenant_id, user_id, plan_code, status, payment_provider, payment_reference,
+               amount_minor, currency, checkout_session_id, payment_intent_id, paid_at,
+               created_at, confirmed_at
         FROM orders
         WHERE payment_reference = $1
         "#,
@@ -1049,6 +1679,112 @@ async fn confirm_pending_order_by_reference(
         Some(_) => Err(ApiError::conflict("order is not pending manual payment")),
         None => Err(ApiError::not_found("order not found")),
     }
+}
+
+async fn attach_checkout_session(
+    db: &PgPool,
+    order_id: OrderId,
+    checkout_session_id: &str,
+) -> Result<Order, ApiError> {
+    sqlx::query(
+        r#"
+        UPDATE orders
+        SET checkout_session_id = $2, payment_reference = $2
+        WHERE id = $1 AND status = 'pending_provider_payment'
+        RETURNING id, tenant_id, user_id, plan_code, status, payment_provider, payment_reference,
+                  amount_minor, currency, checkout_session_id, payment_intent_id, paid_at,
+                  created_at, confirmed_at
+        "#,
+    )
+    .bind(order_id.0)
+    .bind(checkout_session_id)
+    .fetch_optional(db)
+    .await
+    .map_err(db_internal)?
+    .map(row_to_order)
+    .transpose()?
+    .ok_or_else(|| ApiError::conflict("order cannot attach checkout session"))
+}
+
+async fn find_order_by_id_for_update(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: OrderId,
+) -> Result<Option<Order>, ApiError> {
+    sqlx::query(
+        r#"
+        SELECT id, tenant_id, user_id, plan_code, status, payment_provider, payment_reference,
+               amount_minor, currency, checkout_session_id, payment_intent_id, paid_at,
+               created_at, confirmed_at
+        FROM orders
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(order_id.0)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_internal)?
+    .map(row_to_order)
+    .transpose()
+}
+
+async fn confirm_provider_order(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: OrderId,
+    payment_intent_id: Option<&str>,
+    paid_at: DateTime<Utc>,
+) -> Result<Order, ApiError> {
+    sqlx::query(
+        r#"
+        UPDATE orders
+        SET status = 'confirmed',
+            payment_intent_id = $2,
+            paid_at = $3,
+            confirmed_at = $3
+        WHERE id = $1 AND status = 'pending_provider_payment'
+        RETURNING id, tenant_id, user_id, plan_code, status, payment_provider, payment_reference,
+                  amount_minor, currency, checkout_session_id, payment_intent_id, paid_at,
+                  created_at, confirmed_at
+        "#,
+    )
+    .bind(order_id.0)
+    .bind(payment_intent_id)
+    .bind(paid_at)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_internal)?
+    .map(row_to_order)
+    .transpose()?
+    .ok_or_else(|| ApiError::conflict("order is not pending provider payment"))
+}
+
+async fn insert_payment_event(
+    tx: &mut Transaction<'_, Postgres>,
+    provider: PaymentProvider,
+    event_id: &str,
+    event_type: &str,
+    order_id: Option<OrderId>,
+    payload_hash: &str,
+) -> Result<bool, ApiError> {
+    let inserted = sqlx::query(
+        r#"
+        INSERT INTO payment_events (provider, event_id, event_type, order_id, payload_hash, received_at)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (provider, event_id) DO NOTHING
+        "#,
+    )
+    .bind(payment_provider_to_db(provider))
+    .bind(event_id)
+    .bind(event_type)
+    .bind(order_id.map(|id| id.0))
+    .bind(payload_hash)
+    .bind(Utc::now())
+    .execute(&mut **tx)
+    .await
+    .map_err(db_internal)?
+    .rows_affected()
+        > 0;
+    Ok(inserted)
 }
 
 async fn insert_card_key(
@@ -1479,7 +2215,13 @@ fn row_to_order(row: PgRow) -> Result<Order, ApiError> {
         user_id: UserId(row.get("user_id")),
         plan_code: PlanCode(row.get("plan_code")),
         status: order_status_from_db(row.get("status"))?,
+        payment_provider: payment_provider_from_db(row.get("payment_provider"))?,
         payment_reference: row.get("payment_reference"),
+        amount_minor: row.get("amount_minor"),
+        currency: row.get("currency"),
+        checkout_session_id: row.get("checkout_session_id"),
+        payment_intent_id: row.get("payment_intent_id"),
+        paid_at: row.get("paid_at"),
         created_at: row.get("created_at"),
         confirmed_at: row.get("confirmed_at"),
     })
@@ -1895,6 +2637,7 @@ fn nebula_source_from_db(value: &str) -> Result<NebulaSource, ApiError> {
 fn order_status_to_db(status: OrderStatus) -> &'static str {
     match status {
         OrderStatus::PendingManualPayment => "pending_manual_payment",
+        OrderStatus::PendingProviderPayment => "pending_provider_payment",
         OrderStatus::Confirmed => "confirmed",
         OrderStatus::Cancelled => "cancelled",
     }
@@ -1903,9 +2646,29 @@ fn order_status_to_db(status: OrderStatus) -> &'static str {
 fn order_status_from_db(value: &str) -> Result<OrderStatus, ApiError> {
     match value {
         "pending_manual_payment" => Ok(OrderStatus::PendingManualPayment),
+        "pending_provider_payment" => Ok(OrderStatus::PendingProviderPayment),
         "confirmed" => Ok(OrderStatus::Confirmed),
         "cancelled" => Ok(OrderStatus::Cancelled),
         _ => Err(ApiError::internal("invalid order status in database")),
+    }
+}
+
+fn payment_provider_to_db(provider: PaymentProvider) -> &'static str {
+    match provider {
+        PaymentProvider::Manual => "manual",
+        PaymentProvider::Stripe => "stripe",
+        PaymentProvider::Alipay => "alipay",
+        PaymentProvider::WechatPay => "wechat_pay",
+    }
+}
+
+fn payment_provider_from_db(value: &str) -> Result<PaymentProvider, ApiError> {
+    match value {
+        "manual" => Ok(PaymentProvider::Manual),
+        "stripe" => Ok(PaymentProvider::Stripe),
+        "alipay" => Ok(PaymentProvider::Alipay),
+        "wechat_pay" => Ok(PaymentProvider::WechatPay),
+        _ => Err(ApiError::internal("invalid payment provider in database")),
     }
 }
 
@@ -2262,12 +3025,70 @@ struct CreateOrderRequest {
 #[derive(Debug, Serialize)]
 struct OrderResponse {
     order: Order,
+    payment: Option<PaymentSessionResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct PaymentSessionResponse {
+    provider: String,
+    checkout_url: Option<String>,
+    checkout_session_id: Option<String>,
+    payment_reference: String,
+    amount_minor: i64,
+    currency: String,
+    message: String,
 }
 
 #[derive(Debug, Serialize)]
 struct ConfirmOrderResponse {
     order: Order,
     card_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StripeCheckoutSessionCreateResponse {
+    id: String,
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StripeErrorEnvelope {
+    error: StripeErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct StripeErrorBody {
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StripeWebhookEvent {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    data: StripeWebhookEventData,
+}
+
+#[derive(Debug, Deserialize)]
+struct StripeWebhookEventData {
+    object: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct StripeCheckoutSessionObject {
+    id: String,
+    client_reference_id: Option<String>,
+    metadata: Option<HashMap<String, String>>,
+    payment_status: Option<String>,
+    amount_total: Option<i64>,
+    currency: Option<String>,
+    payment_intent: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct StripeWebhookResponse {
+    received: bool,
+    processed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2507,6 +3328,11 @@ mod tests {
             order_status_to_db(OrderStatus::PendingManualPayment),
             "pending_manual_payment"
         );
+        assert_eq!(
+            order_status_to_db(OrderStatus::PendingProviderPayment),
+            "pending_provider_payment"
+        );
+        assert_eq!(payment_provider_to_db(PaymentProvider::Stripe), "stripe");
         assert_eq!(feature_to_db(Feature::OpenClawBridge), "open_claw_bridge");
     }
 
@@ -2592,6 +3418,13 @@ mod tests {
             openclaw_plugin_url: "https://downloads.example.com/openclaw-plugin.zip".to_string(),
             openclaw_manifest_url: "https://downloads.example.com/openclaw/manifest.json"
                 .to_string(),
+            payment_provider: ConfiguredPaymentProvider::Manual,
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            stripe_success_url: "https://ozon66.com/?checkout=success#console".to_string(),
+            stripe_cancel_url: "https://ozon66.com/?checkout=cancelled#console".to_string(),
+            stripe_currency: "cny".to_string(),
+            stripe_standard_amount_minor: 4000,
             skybridge_api_base_urls: vec![],
             allow_local_nebula_registration: false,
             cors_allowed_origins: DEV_CORS_ORIGINS
@@ -2626,5 +3459,31 @@ mod tests {
         assert!(constant_time_eq("same-secret", "same-secret"));
         assert!(!constant_time_eq("same-secret", "same-secret-extra"));
         assert!(!constant_time_eq("same-secret", "same-secreu"));
+    }
+
+    #[test]
+    fn stripe_webhook_signature_requires_matching_hmac() {
+        let body = br#"{"id":"evt_test"}"#;
+        let timestamp = Utc::now().timestamp();
+        let mut payload = timestamp.to_string().into_bytes();
+        payload.push(b'.');
+        payload.extend_from_slice(body);
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"whsec_test").unwrap();
+        mac.update(&payload);
+        let signature = hex_lower(&mac.finalize().into_bytes());
+        let header = format!("t={timestamp},v1={signature}");
+
+        assert!(verify_stripe_signature(&header, body, "whsec_test").is_ok());
+        assert!(verify_stripe_signature(&header, body, "whsec_other").is_err());
+    }
+
+    #[test]
+    fn stripe_config_requires_webhook_secret() {
+        let mut config = config_for_security_tests();
+        config.payment_provider = ConfiguredPaymentProvider::Stripe;
+        config.stripe_secret_key = Some(SecretString::from("sk_test_123"));
+        let bind: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+
+        assert!(config.validate(bind).is_err());
     }
 }

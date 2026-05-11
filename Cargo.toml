@@ -26,6 +26,7 @@ axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 futures-core = "0.3"
+hmac = "0.12"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 keyring = "4.0.0"
 keyring-core = "1.0.0"
