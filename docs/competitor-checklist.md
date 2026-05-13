@@ -8,11 +8,11 @@ safer defaults, and explicit approval boundaries.
 | Account registration | Website register/login with captcha | Implemented SkyBridge/Nebula-backed account sync: email/phone/Nebula login belongs to SkyBridge, Ozon maps `/auth/skybridge` into service accounts and keeps `local_dev` fallback explicit; captcha/email/SMS policy stays on SkyBridge |
 | Manual payment | Manual confirmation after user payment | Implemented manual order + admin confirmation by order UUID or payment reference |
 | Card key | Product card key / device activation | Implemented card key generation/redeem + device activation with `max_devices` enforcement |
-| Downloads | Windows package download | Implemented release-manifest-backed MSI/EXE downloads with SHA-256 checksums from the published release |
+| Downloads | Windows package download | Implemented release-manifest-backed Windows MSI/EXE and Apple Silicon DMG downloads with SHA-256 checksums from the published release |
 | Local config center | Browser/Tauri-like setup wizard | Implemented Tauri shell, React config center, OS keyring save, config status, and Ozon credential validation |
 | Skill service | `127.0.0.1:8790` | Implemented health, read tools, dry-run, task status, and operator-only approval/execution |
 | Agent service | `127.0.0.1:17870` | Implemented operator-only health + SSE task events |
-| OpenClaw bridge | OpenClaw sends tasks | Implemented separate bridge token for read/proposal calls; plugin packaging still pending |
+| OpenClaw bridge | OpenClaw sends tasks | Implemented separate bridge token for read/proposal calls plus packaged OpenClaw manifest/plugin release artifact |
 | QQ bot | Natural language commands through OpenClaw | Deferred to OpenClaw bridge; direct QQ protocol excluded |
 | Ozon read | Product/query capability | Implemented official Ozon Seller API read connector with fail-closed credential handling; mock products are explicit debug/demo mode only |
 | Ozon write | Price/inventory/promotion/upload | Mock write tasks implemented; real write deferred behind feature flag |

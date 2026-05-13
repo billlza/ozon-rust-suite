@@ -1978,11 +1978,17 @@ async fn downloads(State(state): State<AppState>) -> Result<Json<DownloadsRespon
         local_node: release_manifest.msi.url.clone(),
         local_node_msi: release_manifest.msi.url.clone(),
         local_node_exe: release_manifest.exe.url.clone(),
+        local_node_macos_dmg: release_manifest
+            .macos_artifact()
+            .map(|artifact| artifact.url.clone()),
         version: release_manifest.version.clone(),
         checksum: release_manifest.msi.sha256.clone(),
         checksum_sha256: release_manifest.msi.sha256.clone(),
         local_node_msi_sha256: release_manifest.msi.sha256.clone(),
         local_node_exe_sha256: release_manifest.exe.sha256.clone(),
+        local_node_macos_dmg_sha256: release_manifest
+            .macos_artifact()
+            .map(|artifact| artifact.sha256.clone()),
         release_manifest_url: state.config.download_manifest_url,
         release_manifest,
         openclaw_plugin: state.config.openclaw_plugin_url,
@@ -2061,6 +2067,12 @@ fn validate_local_node_release_manifest(
     }
     validate_release_artifact("msi", &manifest.msi)?;
     validate_release_artifact("exe", &manifest.exe)?;
+    if let Some(artifact) = &manifest.macos_aarch64_dmg {
+        validate_release_artifact("macos_aarch64_dmg", artifact)?;
+    }
+    if let Some(artifact) = &manifest.dmg {
+        validate_release_artifact("dmg", artifact)?;
+    }
     Ok(())
 }
 
@@ -4109,11 +4121,13 @@ struct DownloadsResponse {
     local_node: String,
     local_node_msi: String,
     local_node_exe: String,
+    local_node_macos_dmg: Option<String>,
     version: String,
     checksum: String,
     checksum_sha256: String,
     local_node_msi_sha256: String,
     local_node_exe_sha256: String,
+    local_node_macos_dmg_sha256: Option<String>,
     release_manifest_url: String,
     release_manifest: LocalNodeReleaseManifest,
     openclaw_plugin: String,
@@ -4127,6 +4141,16 @@ struct LocalNodeReleaseManifest {
     commit: String,
     msi: ReleaseArtifact,
     exe: ReleaseArtifact,
+    #[serde(default)]
+    macos_aarch64_dmg: Option<ReleaseArtifact>,
+    #[serde(default)]
+    dmg: Option<ReleaseArtifact>,
+}
+
+impl LocalNodeReleaseManifest {
+    fn macos_artifact(&self) -> Option<&ReleaseArtifact> {
+        self.macos_aarch64_dmg.as_ref().or(self.dmg.as_ref())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -4248,6 +4272,11 @@ mod tests {
                 url: "https://downloads.example.com/OzonRustLocalSetup-x64.exe".to_string(),
                 sha256: "b".repeat(64),
             },
+            macos_aarch64_dmg: Some(ReleaseArtifact {
+                url: "https://downloads.example.com/OzonRustLocal-aarch64.dmg".to_string(),
+                sha256: "c".repeat(64),
+            }),
+            dmg: None,
         };
         validate_local_node_release_manifest(&manifest).unwrap();
 
@@ -4256,6 +4285,11 @@ mod tests {
 
         manifest.commit = "0123456789abcdef0123456789abcdef01234567".to_string();
         manifest.exe.sha256 = "pending-release-sha256".to_string();
+        assert!(validate_local_node_release_manifest(&manifest).is_err());
+
+        manifest.exe.sha256 = "b".repeat(64);
+        manifest.macos_aarch64_dmg.as_mut().unwrap().url =
+            "http://downloads.example.com/OzonRustLocal-aarch64.dmg".to_string();
         assert!(validate_local_node_release_manifest(&manifest).is_err());
     }
 

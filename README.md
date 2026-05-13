@@ -198,7 +198,7 @@ merchant parameters above into the deployment environment.
 
 ## Local node release manifest
 
-The Windows installer workflow publishes MSI/EXE assets plus
+The local-node release workflow publishes Windows MSI/EXE and Apple Silicon DMG assets plus
 `release-manifest.json` to `billlza/ozon-rust-suite-downloads` by default. Set
 the repository variable `OZON_DOWNLOADS_REPOSITORY` to publish to another
 downloads repository, and set `OZON_DOWNLOADS_REPO_TOKEN` when the workflow needs
@@ -218,6 +218,10 @@ cross-repository release permissions.
   },
   "exe": {
     "url": "https://github.com/billlza/ozon-rust-suite-downloads/releases/download/local-node-v0.1.0/OzonRustLocalSetup-x64.exe",
+    "sha256": "64-character-lowercase-hex"
+  },
+  "macos_aarch64_dmg": {
+    "url": "https://github.com/billlza/ozon-rust-suite-downloads/releases/download/local-node-v0.1.0/OzonRustLocal-aarch64.dmg",
     "sha256": "64-character-lowercase-hex"
   }
 }

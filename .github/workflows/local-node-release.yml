@@ -28,6 +28,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Resolve release version
+        shell: bash
+        run: |
+          version="${{ github.event.inputs.version }}"
+          if [ -z "$version" ]; then
+            version="${GITHUB_REF_NAME#local-node-v}"
+          fi
+          echo "LOCAL_NODE_RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "OZON_LOCAL_NODE_RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "LOCAL_NODE_RELEASE_TAG=local-node-v$version" >> "$GITHUB_ENV"
+
       - name: Enable pnpm
         run: corepack enable
 
@@ -83,7 +94,17 @@ jobs:
               try {
                 $health = Invoke-RestMethod -Uri "http://127.0.0.1:8790/health" -TimeoutSec 2
                 $manifest = Invoke-RestMethod -Uri "http://127.0.0.1:8790/openclaw/manifest" -TimeoutSec 2
-                if ($health.status -eq "ok" -and $manifest.version) {
+                $preflight = Invoke-WebRequest -Method Options -Uri "http://127.0.0.1:8790/health" -Headers @{
+                  Origin = "https://ozon66.com"
+                  "Access-Control-Request-Method" = "GET"
+                  "Access-Control-Request-Private-Network" = "true"
+                } -TimeoutSec 2
+                if (
+                  $health.status -eq "ok" -and
+                  $manifest.version -and
+                  $preflight.Headers["Access-Control-Allow-Origin"] -eq "https://ozon66.com" -and
+                  $preflight.Headers["Access-Control-Allow-Private-Network"] -eq "true"
+                ) {
                   $ready = $true
                   break
                 }
@@ -107,10 +128,7 @@ jobs:
         id: collect
         shell: pwsh
         run: |
-          $version = "${{ github.event.inputs.version }}"
-          if (-not $version) {
-            $version = "${{ github.ref_name }}".Replace("local-node-v", "")
-          }
+          $version = $env:LOCAL_NODE_RELEASE_VERSION
           $tagName = "local-node-v$version"
           $releaseBaseUrl = "https://github.com/${{ env.DOWNLOADS_REPOSITORY }}/releases/download/$tagName"
           New-Item -ItemType Directory -Force dist/release | Out-Null
@@ -157,12 +175,175 @@ jobs:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && format('local-node-v{0}', github.event.inputs.version) || github.ref_name }}
           name: Ozon Rust Local ${{ github.event.inputs.version || github.ref_name }}
           make_latest: true
+          overwrite_files: true
+          files: dist/release/*
+
+  macos-dmg:
+    name: Build macOS DMG
+    runs-on: macos-14
+    needs: windows-installers
+    env:
+      CARGO_TERM_COLOR: always
+      OZON_SUITE_LEASE_PUBLIC_KEY_PEM: ${{ vars.OZON_SUITE_LEASE_PUBLIC_KEY_PEM || secrets.OZON_SUITE_LEASE_PUBLIC_KEY_PEM }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release version
+        shell: bash
+        run: |
+          version="${{ github.event.inputs.version }}"
+          if [ -z "$version" ]; then
+            version="${GITHUB_REF_NAME#local-node-v}"
+          fi
+          echo "LOCAL_NODE_RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "OZON_LOCAL_NODE_RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "LOCAL_NODE_RELEASE_TAG=local-node-v$version" >> "$GITHUB_ENV"
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            apps/local-node/src-tauri -> apps/local-node/src-tauri/target
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build local-node sidecar
+        if: ${{ env.OZON_SUITE_LEASE_PUBLIC_KEY_PEM != '' }}
+        run: cargo build -p ozon-local-node --release --target aarch64-apple-darwin
+
+      - name: Require lease public key
+        if: ${{ env.OZON_SUITE_LEASE_PUBLIC_KEY_PEM == '' }}
+        run: |
+          echo "Set repository variable or secret OZON_SUITE_LEASE_PUBLIC_KEY_PEM before releasing local-node. The installer must embed the public key used to verify cloud leases." >&2
+          exit 1
+
+      - name: Stage sidecar for Tauri
+        run: pnpm --dir apps/local-node stage:sidecar
+
+      - name: Smoke test sidecar
+        shell: bash
+        run: |
+          set -euo pipefail
+          export OZON_CONNECTOR_MODE=real
+          export OZON_LOCAL_TOKEN="$(uuidgen | tr -d '-')"
+          export OZON_OPENCLAW_TOKEN="$(uuidgen | tr -d '-')"
+          export OZON_LOCAL_SKILL_BIND=127.0.0.1:8790
+          export OZON_LOCAL_AGENT_BIND=127.0.0.1:17870
+          sidecar="apps/local-node/src-tauri/binaries/ozon-local-node-aarch64-apple-darwin"
+          "$sidecar" > local-node-smoke.log 2>&1 &
+          pid="$!"
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          ready=0
+          for _ in $(seq 1 30); do
+            if health="$(curl -fsS --max-time 2 http://127.0.0.1:8790/health)" &&
+              manifest="$(curl -fsS --max-time 2 http://127.0.0.1:8790/openclaw/manifest)" &&
+              preflight="$(curl -fsS --max-time 2 -D - -o /dev/null -X OPTIONS http://127.0.0.1:8790/health \
+                -H 'Origin: https://ozon66.com' \
+                -H 'Access-Control-Request-Method: GET' \
+                -H 'Access-Control-Request-Private-Network: true')" &&
+              echo "$health" | grep -q '"status":"ok"' &&
+              echo "$manifest" | grep -q '"version"' &&
+              echo "$preflight" | tr -d '\r' | grep -qi '^access-control-allow-origin: https://ozon66.com$' &&
+              echo "$preflight" | tr -d '\r' | grep -qi '^access-control-allow-private-network: true$'; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != "1" ]; then
+            cat local-node-smoke.log >&2 || true
+            echo "local-node sidecar did not pass /health + manifest + PNA preflight smoke test" >&2
+            exit 1
+          fi
+
+      - name: Build Tauri app bundle
+        run: pnpm --dir apps/local-node tauri:build --target aarch64-apple-darwin --bundles app
+
+      - name: Collect DMG and update release manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$LOCAL_NODE_RELEASE_VERSION"
+          tag_name="local-node-v$version"
+          release_base_url="https://github.com/${DOWNLOADS_REPOSITORY}/releases/download/$tag_name"
+          mkdir -p dist/release
+          app_path="$(find target apps/local-node/src-tauri/target -type d -name 'Ozon Rust Local.app' | head -n 1)"
+          if [ -z "$app_path" ]; then
+            echo "macOS app bundle was not produced" >&2
+            exit 1
+          fi
+          rm -rf dist/macos-dmg-src
+          mkdir -p dist/macos-dmg-src
+          cp -R "$app_path" dist/macos-dmg-src/
+          ln -s /Applications dist/macos-dmg-src/Applications
+          hdiutil create -volname "Ozon Rust Local" -srcfolder dist/macos-dmg-src -ov -format UDZO dist/release/OzonRustLocal-aarch64.dmg
+          cp dist/release/OzonRustLocal-aarch64.dmg "dist/release/OzonRustLocal-$version-aarch64.dmg"
+          dmg_hash="$(shasum -a 256 dist/release/OzonRustLocal-aarch64.dmg | awk '{print $1}')"
+          curl -fsSL "$release_base_url/release-manifest.json" -o dist/release/release-manifest.json
+          export MAC_DMG_URL="$release_base_url/OzonRustLocal-aarch64.dmg"
+          export MAC_DMG_SHA256="$dmg_hash"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          manifest_path = Path("dist/release/release-manifest.json")
+          manifest = json.loads(manifest_path.read_text())
+          manifest["macos_aarch64_dmg"] = {
+              "url": os.environ["MAC_DMG_URL"],
+              "sha256": os.environ["MAC_DMG_SHA256"],
+          }
+          manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+
+          sums = [
+              (manifest["msi"]["sha256"], "OzonRustLocal-x64.msi"),
+              (manifest["exe"]["sha256"], "OzonRustLocalSetup-x64.exe"),
+              (manifest["macos_aarch64_dmg"]["sha256"], "OzonRustLocal-aarch64.dmg"),
+          ]
+          Path("dist/release/SHA256SUMS.txt").write_text(
+              "".join(f"{sha}  {name}\n" for sha, name in sums)
+          )
+          PY
+
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-node-macos-aarch64
+          path: dist/release/*
+          if-no-files-found: error
+
+      - name: Publish macOS DMG and combined manifest
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ env.DOWNLOADS_REPOSITORY }}
+          token: ${{ secrets.OZON_DOWNLOADS_REPO_TOKEN || github.token }}
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && format('local-node-v{0}', github.event.inputs.version) || github.ref_name }}
+          name: Ozon Rust Local ${{ github.event.inputs.version || github.ref_name }}
+          make_latest: true
+          overwrite_files: true
           files: dist/release/*
 
   openclaw-plugin:
     name: Package OpenClaw plugin
     runs-on: ubuntu-latest
-    needs: windows-installers
+    needs: macos-dmg
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -201,4 +382,5 @@ jobs:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && format('local-node-v{0}', github.event.inputs.version) || github.ref_name }}
           name: Ozon Rust Local ${{ github.event.inputs.version || github.ref_name }}
           make_latest: true
+          overwrite_files: true
           files: dist/openclaw-plugin.zip

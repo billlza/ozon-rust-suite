@@ -139,6 +139,8 @@ type LocalNodeReleaseManifest = {
   commit: string;
   msi: ReleaseArtifact;
   exe: ReleaseArtifact;
+  macos_aarch64_dmg?: ReleaseArtifact;
+  dmg?: ReleaseArtifact;
 };
 
 type Downloads = {
@@ -147,8 +149,10 @@ type Downloads = {
   local_node?: string;
   local_node_msi?: string;
   local_node_exe?: string;
+  local_node_macos_dmg?: string;
   local_node_msi_sha256?: string;
   local_node_exe_sha256?: string;
+  local_node_macos_dmg_sha256?: string;
   version?: string;
   checksum?: string;
   checksum_sha256?: string;
@@ -366,11 +370,16 @@ function App() {
   const releaseManifest = downloads?.release_manifest;
   const localNodeMsiUrl = releaseManifest?.msi.url ?? "";
   const localNodeExeUrl = releaseManifest?.exe.url ?? "";
+  const localNodeMacDmgUrl =
+    releaseManifest?.macos_aarch64_dmg?.url ?? releaseManifest?.dmg?.url ?? downloads?.local_node_macos_dmg ?? "";
+  const localPlatform = useMemo(() => detectLocalPlatform(), []);
+  const localNodeDownloadOptions = useMemo(
+    () => localNodeDownloads(localPlatform, localNodeMacDmgUrl, localNodeMsiUrl, localNodeExeUrl),
+    [localPlatform, localNodeMacDmgUrl, localNodeMsiUrl, localNodeExeUrl]
+  );
   const releaseVersion = releaseManifest?.version ?? "待同步";
   const releaseCommit = releaseManifest?.commit ? shortCommit(releaseManifest.commit) : "待同步";
-  const releaseChecksum = releaseManifest
-    ? `MSI ${shortSha256(releaseManifest.msi.sha256)} / EXE ${shortSha256(releaseManifest.exe.sha256)}`
-    : "等待 release-manifest.json";
+  const releaseChecksum = releaseManifest ? releaseChecksumLabel(releaseManifest) : "等待 release-manifest.json";
   const openclawPluginUrl = downloads?.openclaw_plugin ? absolutePortalUrl(downloads.openclaw_plugin) : "";
   const localManifestUrl = localNode.portal?.manifest_url ?? `${LOCAL_NODE_API}/openclaw/manifest`;
   const canOpenLocalConsole = Boolean(LOCAL_CONSOLE_URL);
@@ -1432,19 +1441,16 @@ function App() {
                 )}
                 {localNode.phase !== "online" && (
                   <>
-                    {localNodeMsiUrl ? (
-                      <a className="download" href={localNodeMsiUrl}>
-                        <Download size={18} /> 下载 MSI
-                      </a>
+                    {localNodeDownloadOptions.length > 0 ? (
+                      localNodeDownloadOptions.map((option, index) => (
+                        <a className={`download ${index > 0 ? "secondary" : ""}`} href={option.url} key={option.key}>
+                          <Download size={18} /> {option.shortLabel}
+                        </a>
+                      ))
                     ) : (
                       <button className="secondary" disabled>
                         <Download size={18} /> 安装包待同步
                       </button>
-                    )}
-                    {localNodeExeUrl && (
-                      <a className="download secondary" href={localNodeExeUrl}>
-                        <Download size={18} /> 下载 EXE
-                      </a>
                     )}
                     <button className="secondary" disabled={localNode.phase === "checking"} onClick={probeLocalNode}>
                       <RefreshCcw size={18} /> 检测本机节点
@@ -1606,21 +1612,16 @@ function App() {
                 <button disabled={localNode.phase === "checking"} onClick={probeLocalNode}>
                   <RefreshCcw size={18} /> 检测本机节点
                 </button>
-                {!localNodeMsiUrl && !localNodeExeUrl && (
+                {localNodeDownloadOptions.length === 0 && (
                   <button className="secondary" disabled>
                     <Download size={18} /> 安装包待同步
                   </button>
                 )}
-                {localNodeMsiUrl && (
-                  <a className="download" href={localNodeMsiUrl}>
-                    <Download size={18} /> MSI 安装包
+                {localNodeDownloadOptions.map((option, index) => (
+                  <a className={`download ${index > 0 ? "secondary" : ""}`} href={option.url} key={option.key}>
+                    <Download size={18} /> {option.label}
                   </a>
-                )}
-                {localNodeExeUrl && (
-                  <a className="download" href={localNodeExeUrl}>
-                    <Download size={18} /> EXE 安装包
-                  </a>
-                )}
+                ))}
                 {canOpenLocalConsole && (
                   <a className="download secondary" href={LOCAL_CONSOLE_URL} target="_blank" rel="noreferrer">
                     <MonitorCheck size={18} /> 打开本地控制台
@@ -2165,6 +2166,52 @@ function setupStatusModel(input: {
 
 function absolutePortalUrl(pathOrUrl: string) {
   return new URL(pathOrUrl, window.location.origin).toString();
+}
+
+type LocalPlatform = "mac" | "windows" | "other";
+
+type LocalNodeDownloadOption = {
+  key: string;
+  label: string;
+  shortLabel: string;
+  url: string;
+};
+
+function detectLocalPlatform(): LocalPlatform {
+  const nav = navigator as Navigator & { userAgentData?: { platform?: string } };
+  const value = `${nav.userAgentData?.platform ?? ""} ${navigator.platform ?? ""} ${navigator.userAgent ?? ""}`.toLowerCase();
+  if (value.includes("mac")) return "mac";
+  if (value.includes("win")) return "windows";
+  return "other";
+}
+
+function localNodeDownloads(
+  platform: LocalPlatform,
+  macDmgUrl: string,
+  msiUrl: string,
+  exeUrl: string
+): LocalNodeDownloadOption[] {
+  const mac = macDmgUrl
+    ? [{ key: "mac-dmg", label: "Mac 安装包", shortLabel: "下载 Mac 版", url: macDmgUrl }]
+    : [];
+  const windows = [
+    ...(msiUrl ? [{ key: "windows-msi", label: "Windows MSI", shortLabel: "下载 MSI", url: msiUrl }] : []),
+    ...(exeUrl ? [{ key: "windows-exe", label: "Windows EXE", shortLabel: "下载 EXE", url: exeUrl }] : [])
+  ];
+
+  if (platform === "mac") return [...mac, ...windows];
+  if (platform === "windows") return [...windows, ...mac];
+  return [...mac, ...windows];
+}
+
+function releaseChecksumLabel(manifest: LocalNodeReleaseManifest) {
+  return [
+    manifest.macos_aarch64_dmg ? `Mac ${shortSha256(manifest.macos_aarch64_dmg.sha256)}` : null,
+    manifest.msi ? `MSI ${shortSha256(manifest.msi.sha256)}` : null,
+    manifest.exe ? `EXE ${shortSha256(manifest.exe.sha256)}` : null
+  ]
+    .filter(Boolean)
+    .join(" / ");
 }
 
 function shortCommit(commit: string) {

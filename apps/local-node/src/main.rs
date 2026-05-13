@@ -62,6 +62,10 @@ const BUILD_COMMIT: &str = match option_env!("GITHUB_SHA") {
     None => "local-build",
 };
 
+fn package_version() -> &'static str {
+    option_env!("OZON_LOCAL_NODE_RELEASE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
@@ -336,7 +340,7 @@ async fn health(State(state): State<LocalState>) -> Json<HealthResponse> {
         agent_port: local_port(&state.config.agent_bind),
         protocol_version: PROTOCOL_VERSION,
         build_commit: BUILD_COMMIT,
-        package_version: env!("CARGO_PKG_VERSION"),
+        package_version: package_version(),
         supervisor: "tauri-sidecar",
         features: vec![
             Feature::OzonRead,
@@ -359,7 +363,7 @@ async fn diagnostics(State(state): State<LocalState>) -> Json<DiagnosticsRespons
         checked_at: Utc::now().to_rfc3339(),
         protocol_version: PROTOCOL_VERSION,
         build_commit: BUILD_COMMIT,
-        package_version: env!("CARGO_PKG_VERSION"),
+        package_version: package_version(),
         skill_api: local_http_url(&state.config.skill_bind),
         agent_api: local_http_url(&state.config.agent_bind),
         connector_mode: connector_mode(&state),
@@ -398,7 +402,7 @@ async fn portal_status(
         bridge_auth_header: "x-openclaw-token",
         protocol_version: PROTOCOL_VERSION,
         build_commit: BUILD_COMMIT,
-        package_version: env!("CARGO_PKG_VERSION"),
+        package_version: package_version(),
         real_ozon_enabled: state.config.use_real_ozon,
         device_fingerprint,
         lease,
@@ -415,7 +419,7 @@ async fn portal_status(
 async fn openclaw_manifest(State(state): State<LocalState>) -> Json<OpenClawManifest> {
     Json(OpenClawManifest {
         name: "ozon-rust-suite-local",
-        version: env!("CARGO_PKG_VERSION"),
+        version: package_version(),
         description: "Local Ozon seller automation bridge with dry-run and approval enforcement",
         base_url: local_http_url(&state.config.skill_bind),
         auth: OpenClawAuth {
@@ -2752,6 +2756,7 @@ impl IntoResponse for ApiError {
 mod tests {
     use axum::http::HeaderMap;
     use ozon_secret_store::MemorySecretStore;
+    use reqwest::header::HeaderValue as ReqwestHeaderValue;
 
     use super::*;
 
@@ -2900,6 +2905,42 @@ mod tests {
         .expect_err("real reads require a cloud lease");
 
         assert_eq!(error.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn local_cors_allows_ozon66_private_network_preflight() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test local node");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, skill_router(test_state()))
+                .await
+                .expect("serve test local node");
+        });
+
+        let response = reqwest::Client::new()
+            .request(reqwest::Method::OPTIONS, format!("http://{addr}/health"))
+            .header("Origin", "https://ozon66.com")
+            .header("Access-Control-Request-Method", "GET")
+            .header("Access-Control-Request-Private-Network", "true")
+            .send()
+            .await
+            .expect("preflight response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("access-control-allow-origin"),
+            Some(&ReqwestHeaderValue::from_static("https://ozon66.com"))
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-private-network"),
+            Some(&ReqwestHeaderValue::from_static("true"))
+        );
+
+        server.abort();
     }
 
     #[tokio::test]
