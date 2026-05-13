@@ -8,7 +8,7 @@ safer defaults, and explicit approval boundaries.
 | Account registration | Website register/login with captcha | Implemented SkyBridge/Nebula-backed account sync: email/phone/Nebula login belongs to SkyBridge, Ozon maps `/auth/skybridge` into service accounts and keeps `local_dev` fallback explicit; captcha/email/SMS policy stays on SkyBridge |
 | Manual payment | Manual confirmation after user payment | Implemented manual order + admin confirmation by order UUID or payment reference |
 | Card key | Product card key / device activation | Implemented card key generation/redeem + device activation with `max_devices` enforcement |
-| Downloads | Windows package download | Portal shows download access after account flow; endpoint still uses placeholder checksum |
+| Downloads | Windows package download | Implemented release-manifest-backed MSI/EXE downloads with SHA-256 checksums from the published release |
 | Local config center | Browser/Tauri-like setup wizard | Implemented Tauri shell, React config center, OS keyring save, config status, and Ozon credential validation |
 | Skill service | `127.0.0.1:8790` | Implemented health, read tools, dry-run, task status, and operator-only approval/execution |
 | Agent service | `127.0.0.1:17870` | Implemented operator-only health + SSE task events |
@@ -26,4 +26,4 @@ safer defaults, and explicit approval boundaries.
 - Identity is now aligned semantically: SkyBridge is the authority, Ozon is a relying service with cached `nebula_id`.
 - Portal still needs production-grade OAuth/PKCE redirect wiring; current browser form can call SkyBridge Supabase Auth when env vars are set, and token sync remains the safest local demo path.
 - Local `local_dev` auth is intentionally not a production account system and is disabled by default in the cloud API.
-- Remaining commercial gaps versus a polished competitor site: payment automation, production downloads/checksums, card-key admin UX polish, and end-to-end browser smoke tests.
+- Remaining commercial gaps versus a polished competitor site: payment automation, card-key admin UX polish, and end-to-end browser smoke tests.

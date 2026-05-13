@@ -302,6 +302,13 @@ function App() {
   const [schedule, setSchedule] = useState<ScheduleStatus | null>(null);
   const [scheduleInterval, setScheduleInterval] = useState(900);
   const [scheduleLimit, setScheduleLimit] = useState(20);
+  const realModeRequiresLease = configStatus?.real_ozon_enabled ?? true;
+  const canUseOzonReadTools = Boolean(configStatus && (!realModeRequiresLease || configStatus.lease.valid));
+  const ozonReadGateMessage = !configStatus
+    ? "先连接本机节点并刷新状态"
+    : realModeRequiresLease && !configStatus.lease.valid
+      ? "真实 Ozon 读取需要从 ozon66.com 写入有效授权租约"
+      : "";
 
   const queueStats = useMemo(() => {
     const pending = tasks.filter((task) => task.state === "pending_approval").length;
@@ -319,6 +326,14 @@ function App() {
         ...(init.headers ?? {})
       }
     });
+  }
+
+  function ensureOzonReadAccess(action: string) {
+    if (canUseOzonReadTools) {
+      return true;
+    }
+    setMessage(`${action}被拦截：${ozonReadGateMessage}`);
+    return false;
   }
 
   async function refresh() {
@@ -417,6 +432,7 @@ function App() {
   }
 
   async function loadProducts() {
+    if (!ensureOzonReadAccess("读取 Ozon 商品")) return;
     const [countResponse, listResponse] = await Promise.all([
       api("/tools/ozon.products.count", { method: "POST" }),
       api("/tools/ozon.products.list", {
@@ -441,6 +457,7 @@ function App() {
   }
 
   async function loadProductDetail(lookup: { offer_id?: string; product_id?: string; sku?: string }) {
+    if (!ensureOzonReadAccess("读取商品详情")) return;
     const cleanLookup = Object.fromEntries(
       Object.entries(lookup).filter(([, value]) => value && value.trim())
     );
@@ -507,10 +524,11 @@ function App() {
     if (!value) {
       return null;
     }
-    return /^\d+$/.test(value) ? { product_id: value } : { offer_id: value };
+    return parseProductLookupInput(value);
   }
 
   async function buildPosterBrief() {
+    if (!ensureOzonReadAccess("生成海报简报")) return;
     const lookup = currentLookupPayload();
     if (!lookup) {
       setMessage("先读取一个真实商品，再生成海报简报");
@@ -535,6 +553,7 @@ function App() {
   }
 
   async function generatePosterBackground() {
+    if (!ensureOzonReadAccess("生成海报背景")) return;
     const lookup = currentLookupPayload();
     if (!lookup) {
       setMessage("先读取一个真实商品，再生成海报背景");
@@ -559,6 +578,7 @@ function App() {
   }
 
   async function verifyPosterCopy() {
+    if (!ensureOzonReadAccess("校验海报文案")) return;
     const lookup = currentLookupPayload();
     if (!lookup) {
       setMessage("先读取商品，再校验海报文案");
@@ -584,7 +604,7 @@ function App() {
       return;
     }
     setPosterVerification(data);
-    setMessage(data.ok ? "海报文案已通过事实校验" : "海报文案和事实包不一致，请按建议回退");
+    setMessage(data.ok ? "海报文案已通过系统稿一致性校验" : "海报文案和系统稿不一致，请回到商品属性再确认");
   }
 
   function updatePosterSellingPoint(index: number, value: string) {
@@ -603,11 +623,12 @@ function App() {
       setMessage("请输入 offer_id、product_id 或 sku");
       return;
     }
-    if (/^\d+$/.test(value)) {
-      await loadProductDetail({ product_id: value });
+    const lookup = parseProductLookupInput(value);
+    if (!lookup) {
+      setMessage("查询格式不对：可用 sku:、offer:、product: 前缀，或直接输入 offer_id / 数字 product_id");
       return;
     }
-    await loadProductDetail({ offer_id: value });
+    await loadProductDetail(lookup);
   }
 
   async function createDryRun() {
@@ -644,6 +665,7 @@ function App() {
   }
 
   async function configureSchedule(enabled: boolean) {
+    if (enabled && !ensureOzonReadAccess("启用只读定时采集")) return;
     const response = await api("/schedules/ecommerce-read", {
       method: "POST",
       body: JSON.stringify({
@@ -662,6 +684,7 @@ function App() {
   }
 
   async function runScheduleNow() {
+    if (!ensureOzonReadAccess("立即采集")) return;
     const response = await api("/schedules/ecommerce-read/run-now", { method: "POST" });
     const data = await response.json();
     if (!response.ok) {
@@ -1030,13 +1053,14 @@ function App() {
             <DatabaseZap />
             <div>
               <h2>真实商品读取</h2>
-              <p>真实模式直接调用 Ozon Seller API；未配置凭据时失败关闭。</p>
+              <p>真实模式直接调用 Ozon Seller API；未配置凭据或授权租约时失败关闭。</p>
             </div>
           </div>
-          <button onClick={loadProducts}>读取 Ozon 商品</button>
+          <button disabled={!canUseOzonReadTools} onClick={loadProducts}>读取 Ozon 商品</button>
+          {!canUseOzonReadTools && <p className="notice warn-text">{ozonReadGateMessage}</p>}
           <div className="task-command product-lookup-command">
             <input
-              placeholder="offer_id 或数字 product_id"
+              placeholder="offer_id、数字 product_id，或 sku:123"
               value={productLookup}
               onChange={(event) => setProductLookup(event.target.value)}
               onKeyDown={(event) => {
@@ -1045,7 +1069,7 @@ function App() {
                 }
               }}
             />
-            <button onClick={loadProductDetailFromInput}>
+            <button disabled={!canUseOzonReadTools} onClick={loadProductDetailFromInput}>
               <ImageIcon size={18} /> 读取详情/图片
             </button>
           </div>
@@ -1069,7 +1093,11 @@ function App() {
                   {product.has_fbs_stocks ? "yes" : "no"}
                   {product.archived ? " · archived" : ""}
                 </em>
-                <button className="secondary-button" onClick={() => loadProductDetail({ offer_id: product.offer_id })}>
+                <button
+                  className="secondary-button"
+                  disabled={!canUseOzonReadTools}
+                  onClick={() => loadProductDetail({ offer_id: product.offer_id })}
+                >
                   <ImageIcon size={16} /> 详情/图片
                 </button>
               </div>
@@ -1143,14 +1171,14 @@ function App() {
                   <option value="launch">launch stage</option>
                   <option value="lifestyle">lifestyle</option>
                 </select>
-                <button onClick={buildPosterBrief}>
+                <button disabled={!canUseOzonReadTools} onClick={buildPosterBrief}>
                   <Sparkles size={18} /> 生成文案简报
                 </button>
-                <button onClick={generatePosterBackground}>
+                <button disabled={!canUseOzonReadTools} onClick={generatePosterBackground}>
                   <ImageIcon size={18} /> 生成背景图
                 </button>
-                <button className="secondary-button" onClick={verifyPosterCopy}>
-                  <ShieldCheck size={16} /> 校验文案
+                <button className="secondary-button" disabled={!canUseOzonReadTools} onClick={verifyPosterCopy}>
+                  <ShieldCheck size={16} /> 校验文案一致性
                 </button>
               </div>
               {posterBrief && (
@@ -1286,16 +1314,17 @@ function App() {
             />
           </div>
           <div className="inline-actions">
-            <button onClick={() => configureSchedule(true)}>
+            <button disabled={!canUseOzonReadTools} onClick={() => configureSchedule(true)}>
               <Play size={18} /> 启用
             </button>
             <button onClick={() => configureSchedule(false)}>
               <PauseCircle size={18} /> 停止
             </button>
-            <button onClick={runScheduleNow}>
+            <button disabled={!canUseOzonReadTools} onClick={runScheduleNow}>
               <RefreshCcw size={18} /> 立即采集
             </button>
           </div>
+          {!canUseOzonReadTools && <p className="notice warn-text">{ozonReadGateMessage}</p>}
           <div className="status-list schedule-status">
             <div className="status-item">
               <span>Status</span>
@@ -1451,6 +1480,29 @@ function maskSecret(value: string) {
     return "configured";
   }
   return `${value.slice(0, 4)}...${value.slice(-4)}`;
+}
+
+function parseProductLookupInput(value: string): { offer_id?: string; product_id?: string; sku?: string } | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const prefixed = trimmed.match(/^(offer|offer_id|product|product_id|sku)\s*:\s*(.+)$/i);
+  if (prefixed) {
+    const key = prefixed[1].toLowerCase();
+    const content = prefixed[2].trim();
+    if (!content) {
+      return null;
+    }
+    if (key === "sku") {
+      return { sku: content };
+    }
+    if (key === "product" || key === "product_id") {
+      return { product_id: content };
+    }
+    return { offer_id: content };
+  }
+  return /^\d+$/.test(trimmed) ? { product_id: trimmed } : { offer_id: trimmed };
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

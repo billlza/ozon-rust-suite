@@ -256,6 +256,16 @@ struct LocalState {
 
 impl LocalState {
     fn new(config: LocalConfig) -> anyhow::Result<Self> {
+        Self::new_with_secret_store(
+            config,
+            Arc::new(SystemSecretStore::new("ozon-rust-suite-local", "default")?),
+        )
+    }
+
+    fn new_with_secret_store(
+        config: LocalConfig,
+        secrets: Arc<dyn SecretStore>,
+    ) -> anyhow::Result<Self> {
         let ozon_connector: Arc<dyn OzonReadConnector> = if config.use_real_ozon {
             Arc::new(ozon_connector::OzonHttpClient::new())
         } else {
@@ -276,7 +286,7 @@ impl LocalState {
         Ok(Self {
             config,
             tasks: TaskStore::new(),
-            secrets: Arc::new(SystemSecretStore::new("ozon-rust-suite-local", "default")?),
+            secrets,
             ozon_config_cache: Arc::new(RwLock::new(None)),
             openai_config_cache: Arc::new(RwLock::new(None)),
             cloud_lease_cache: Arc::new(RwLock::new(None)),
@@ -570,7 +580,7 @@ async fn save_portal_lease(
     State(state): State<LocalState>,
     Json(input): Json<PortalLeaseRequest>,
 ) -> Result<Json<PortalLeaseResponse>, ApiError> {
-    validate_cloud_lease(&state, &input.lease)?;
+    validate_cloud_lease_with_feature(&state, &input.lease, Feature::OzonRead)?;
     let lease_json = serde_json::to_string(&input.lease)
         .map_err(|_| ApiError::internal("failed to serialize lease"))?;
     state
@@ -655,6 +665,7 @@ async fn ozon_products_count(
     headers: HeaderMap,
 ) -> Result<Json<ProductCountResponse>, ApiError> {
     require_bridge_or_operator_token(&state, &headers)?;
+    require_valid_lease_with_feature(&state, Feature::OzonRead).await?;
     let credentials = load_ozon_credentials(&state).await?;
     let mut count = state
         .ozon_connector
@@ -690,6 +701,7 @@ async fn ozon_products_list(
     Json(input): Json<ProductListRequest>,
 ) -> Result<Json<ProductListResponse>, ApiError> {
     require_bridge_or_operator_token(&state, &headers)?;
+    require_valid_lease_with_feature(&state, Feature::OzonRead).await?;
     let credentials = load_ozon_credentials(&state).await?;
     let limit = input.limit.unwrap_or(20);
     let requested_visibility = normalize_product_list_visibility(input.visibility)?;
@@ -740,6 +752,7 @@ async fn ozon_products_get(
     Json(input): Json<ProductGetRequest>,
 ) -> Result<Json<ProductGetResponse>, ApiError> {
     require_bridge_or_operator_token(&state, &headers)?;
+    require_valid_lease_with_feature(&state, Feature::OzonRead).await?;
     let credentials = load_ozon_credentials(&state).await?;
     let product = state
         .ozon_connector
@@ -848,12 +861,12 @@ async fn poster_verify(
     let mismatches = compare_poster_copy(&approved_copy, &submitted_copy);
     let warnings = if mismatches.is_empty() {
         vec![
-            "校验通过：当前文案与真实商品 fact pack 一致。".to_string(),
+            "校验通过：当前文案与系统生成稿一致。".to_string(),
             "商品主体应继续使用真实主图合成，避免让图片模型重画包装和文字。".to_string(),
         ]
     } else {
         vec![
-            "当前文案和事实包不一致，建议直接回退到系统生成稿。".to_string(),
+            "当前文案和系统生成稿不一致，建议回到商品属性再确认改写是否安全。".to_string(),
             "这一步只做逐字段比对，不会帮你猜测哪些自由改写仍然安全。".to_string(),
         ]
     };
@@ -1027,6 +1040,7 @@ async fn propose_ecommerce_schedule(
     Json(input): Json<ProposeEcommerceScheduleRequest>,
 ) -> Result<Json<TaskResponse>, ApiError> {
     require_bridge_or_operator_token(&state, &headers)?;
+    require_valid_lease_with_feature(&state, Feature::OzonRead).await?;
     let interval_secs = input
         .interval_secs
         .unwrap_or(state.config.default_ecommerce_interval_secs)
@@ -1154,6 +1168,7 @@ async fn execute_ecommerce_read_once(
     state: &LocalState,
     limit: u16,
 ) -> Result<EcommerceReadRun, ApiError> {
+    require_valid_lease_with_feature(state, Feature::OzonRead).await?;
     let started_at = Utc::now();
     let start = Instant::now();
     let credentials = load_ozon_credentials(state).await?;
@@ -1267,6 +1282,37 @@ fn require_bridge_or_operator_token(
     Err(ApiError::unauthorized(
         "missing or invalid x-openclaw-token / x-local-token",
     ))
+}
+
+async fn require_valid_lease_with_feature(
+    state: &LocalState,
+    feature: Feature,
+) -> Result<(), ApiError> {
+    if !state.config.use_real_ozon && state.config.allow_unsigned_lease {
+        return Ok(());
+    }
+    let lease = load_cloud_lease(state).await?;
+    validate_cloud_lease_with_feature(state, &lease, feature)
+}
+
+async fn load_cloud_lease(state: &LocalState) -> Result<EntitlementLease, ApiError> {
+    if let Some(lease) = state.cloud_lease_cache.read().await.clone() {
+        return Ok(lease);
+    }
+    let bundle = state
+        .secrets
+        .get(&SecretName::new(SECRET_CLOUD_LEASE))
+        .await
+        .map_err(|_| ApiError::internal("secret store unavailable"))?
+        .ok_or_else(|| {
+            ApiError::forbidden(
+                "cloud lease is not installed; sign in on ozon66.com, bind this device, then issue a lease",
+            )
+        })?;
+    let lease: EntitlementLease = serde_json::from_str(bundle.expose_secret())
+        .map_err(|_| ApiError::bad_request("stored cloud lease is invalid"))?;
+    *state.cloud_lease_cache.write().await = Some(lease.clone());
+    Ok(lease)
 }
 
 fn constant_time_eq(left: &str, right: &str) -> bool {
@@ -1695,17 +1741,37 @@ fn validate_cloud_lease(state: &LocalState, lease: &EntitlementLease) -> Result<
     if lease.expires_at <= Utc::now() {
         return Err(ApiError::bad_request("lease is expired"));
     }
-    if !lease.features.contains(&Feature::OzonRead) {
-        return Err(ApiError::bad_request(
-            "lease does not include Ozon read access",
-        ));
-    }
     verify_cloud_lease_signature(state, lease)?;
     Ok(())
 }
 
+fn validate_cloud_lease_with_feature(
+    state: &LocalState,
+    lease: &EntitlementLease,
+    feature: Feature,
+) -> Result<(), ApiError> {
+    validate_cloud_lease(state, lease)?;
+    if !lease.features.contains(&feature) {
+        return Err(ApiError::forbidden(format!(
+            "cloud lease does not include {}",
+            feature_name(feature)
+        )));
+    }
+    Ok(())
+}
+
+fn feature_name(feature: Feature) -> &'static str {
+    match feature {
+        Feature::OzonRead => "Ozon read access",
+        Feature::OzonWriteMock => "Ozon dry-run write access",
+        Feature::DraftImport1688Mock => "1688 draft import dry-run access",
+        Feature::OpenClawBridge => "OpenClaw bridge access",
+        Feature::LocalApproval => "local approval access",
+    }
+}
+
 fn lease_status(state: &LocalState, lease: &EntitlementLease) -> LeaseStatus {
-    let validation = validate_cloud_lease(state, lease);
+    let validation = validate_cloud_lease_with_feature(state, lease, Feature::OzonRead);
     let valid = validation.is_ok();
     LeaseStatus {
         configured: true,
@@ -1816,6 +1882,7 @@ async fn load_product_for_lookup(
     state: &LocalState,
     lookup: OzonProductLookup,
 ) -> Result<ozon_connector::OzonProductDetail, ApiError> {
+    require_valid_lease_with_feature(state, Feature::OzonRead).await?;
     let credentials = load_ozon_credentials(state).await?;
     state
         .ozon_connector
@@ -1900,7 +1967,7 @@ async fn generate_poster_background(
     let request = OpenAiImageGenerationRequest {
         model: openai.image_model.clone(),
         prompt: brief.background_prompt.clone(),
-        size: "1536x1024".to_string(),
+        size: "1024x1536".to_string(),
     };
     let response = state
         .http_client
@@ -2640,6 +2707,13 @@ impl ApiError {
         }
     }
 
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -2677,11 +2751,13 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use axum::http::HeaderMap;
+    use ozon_secret_store::MemorySecretStore;
 
     use super::*;
 
     fn test_state() -> LocalState {
-        LocalState::new(test_config()).expect("local state")
+        LocalState::new_with_secret_store(test_config(), Arc::new(MemorySecretStore::default()))
+            .expect("local state")
     }
 
     fn test_config() -> LocalConfig {
@@ -2799,6 +2875,31 @@ mod tests {
         assert_eq!(response.connector_mode, "mock");
         assert_eq!(response.product.product_id, "mock-product-1");
         assert_eq!(response.product.images.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn real_mode_requires_cloud_lease_before_product_read() {
+        let mut config = test_config();
+        config.use_real_ozon = true;
+        let state =
+            LocalState::new_with_secret_store(config, Arc::new(MemorySecretStore::default()))
+                .expect("local state");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-openclaw-token", "bridge-token".parse().unwrap());
+
+        let error = ozon_products_get(
+            State(state),
+            headers,
+            Json(ProductGetRequest {
+                product_id: Some("mock-product-1".to_string()),
+                offer_id: None,
+                sku: None,
+            }),
+        )
+        .await
+        .expect_err("real reads require a cloud lease");
+
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
