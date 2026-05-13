@@ -1974,21 +1974,20 @@ async fn revoke_entitlement(
 
 async fn downloads(State(state): State<AppState>) -> Result<Json<DownloadsResponse>, ApiError> {
     let release_manifest = fetch_local_node_release_manifest(&state).await?;
+    let macos_artifact = release_manifest.macos_artifact();
     Ok(Json(DownloadsResponse {
         local_node: release_manifest.msi.url.clone(),
         local_node_msi: release_manifest.msi.url.clone(),
         local_node_exe: release_manifest.exe.url.clone(),
-        local_node_macos_dmg: release_manifest
-            .macos_artifact()
-            .map(|artifact| artifact.url.clone()),
+        local_node_macos_dmg: macos_artifact.map(|artifact| artifact.url.clone()),
+        macos_aarch64_dmg: macos_artifact.map(|artifact| artifact.url.clone()),
         version: release_manifest.version.clone(),
         checksum: release_manifest.msi.sha256.clone(),
         checksum_sha256: release_manifest.msi.sha256.clone(),
         local_node_msi_sha256: release_manifest.msi.sha256.clone(),
         local_node_exe_sha256: release_manifest.exe.sha256.clone(),
-        local_node_macos_dmg_sha256: release_manifest
-            .macos_artifact()
-            .map(|artifact| artifact.sha256.clone()),
+        local_node_macos_dmg_sha256: macos_artifact.map(|artifact| artifact.sha256.clone()),
+        macos_aarch64_dmg_sha256: macos_artifact.map(|artifact| artifact.sha256.clone()),
         release_manifest_url: state.config.download_manifest_url,
         release_manifest,
         openclaw_plugin: state.config.openclaw_plugin_url,
@@ -4122,12 +4121,14 @@ struct DownloadsResponse {
     local_node_msi: String,
     local_node_exe: String,
     local_node_macos_dmg: Option<String>,
+    macos_aarch64_dmg: Option<String>,
     version: String,
     checksum: String,
     checksum_sha256: String,
     local_node_msi_sha256: String,
     local_node_exe_sha256: String,
     local_node_macos_dmg_sha256: Option<String>,
+    macos_aarch64_dmg_sha256: Option<String>,
     release_manifest_url: String,
     release_manifest: LocalNodeReleaseManifest,
     openclaw_plugin: String,

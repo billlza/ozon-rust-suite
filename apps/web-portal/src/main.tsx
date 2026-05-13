@@ -2056,17 +2056,17 @@ function isLocalNodeBrowserBlock(error: unknown) {
 function localNodeStatusLabel(phase: LocalNodePhase) {
   switch (phase) {
     case "checking":
-      return "checking";
+      return "检测中";
     case "online":
-      return "online";
+      return "已在线";
     case "degraded":
-      return "degraded";
+      return "部分可用";
     case "blocked":
-      return "blocked";
+      return "未连上";
     case "offline":
-      return "offline";
+      return "未启动";
     default:
-      return "waiting";
+      return "待检测";
   }
 }
 
@@ -2091,6 +2091,13 @@ function localNodePairingStatus(
     };
   }
   if (!device) {
+    if (localNode.phase !== "online") {
+      return {
+        kind: "warn",
+        title: "先连上本机节点",
+        message: "授权已存在；检测到本机节点在线后，会读取设备指纹并开放绑定。"
+      };
+    }
     return {
       kind: "warn",
       title: "待绑定设备",
