@@ -56,6 +56,12 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
+      - name: Stage Linux sidecar for Tauri tests
+        run: |
+          cargo build -p ozon-local-node
+          mkdir -p apps/local-node/src-tauri/binaries
+          cp target/debug/ozon-local-node apps/local-node/src-tauri/binaries/ozon-local-node-x86_64-unknown-linux-gnu
+
       - name: Test workspace
         run: cargo test --workspace
 
