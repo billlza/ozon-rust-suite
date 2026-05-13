@@ -16,6 +16,7 @@ permissions:
 
 env:
   DOWNLOADS_REPOSITORY: ${{ vars.OZON_DOWNLOADS_REPOSITORY || 'billlza/ozon-rust-suite-downloads' }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   windows-installers:
@@ -284,7 +285,11 @@ jobs:
           tag_name="local-node-v$version"
           release_base_url="https://github.com/${DOWNLOADS_REPOSITORY}/releases/download/$tag_name"
           mkdir -p dist/release
-          app_path="$(find target apps/local-node/src-tauri/target -type d -name 'Ozon Rust Local.app' | head -n 1)"
+          search_roots=(target)
+          if [ -d apps/local-node/src-tauri/target ]; then
+            search_roots+=(apps/local-node/src-tauri/target)
+          fi
+          app_path="$(find "${search_roots[@]}" -type d -name 'Ozon Rust Local.app' | head -n 1)"
           if [ -z "$app_path" ]; then
             echo "macOS app bundle was not produced" >&2
             exit 1
