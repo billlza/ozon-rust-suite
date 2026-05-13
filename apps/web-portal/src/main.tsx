@@ -332,7 +332,7 @@ function App() {
   const [session, setSession] = useState<Session | null>(() => loadSession());
   const [authState, dispatchAuth] = useReducer(authReducer, {
     phase: loadSession() ? "authenticated" : "idle",
-    message: loadSession() ? "已恢复本地会话，正在等待刷新" : "请选择邮箱、手机号或 Nebula ID 登录",
+    message: loadSession() ? "已恢复本地会话，正在等待刷新" : "请选择邮箱或手机号登录",
     requestId: 0
   });
   const [operationStatus, setOperationStatus] = useState<string | null>(null);
@@ -343,14 +343,14 @@ function App() {
   const [paymentSession, setPaymentSession] = useState<PaymentSession | null>(null);
   const [cardKey, setCardKey] = useState("");
   const [entitlements, setEntitlements] = useState<Entitlement[]>([]);
-  const [deviceName, setDeviceName] = useState("MacBook Local Node");
+  const [deviceName, setDeviceName] = useState("我的电脑");
   const [deviceFingerprint, setDeviceFingerprint] = useState(() => defaultFingerprint());
   const [device, setDevice] = useState<Device | null>(null);
   const [lease, setLease] = useState<Lease | null>(null);
   const [downloads, setDownloads] = useState<Downloads | null>(null);
   const [localNode, setLocalNode] = useState<LocalNodeProbe>({
     phase: "idle",
-    message: "登录后会检测 127.0.0.1:8790 本机节点"
+    message: "登录后会检测电脑助手是否打开"
   });
 
   const activeEntitlement = useMemo(
@@ -377,6 +377,7 @@ function App() {
     () => localNodeDownloads(localPlatform, localNodeMacDmgUrl, localNodeMsiUrl, localNodeExeUrl),
     [localPlatform, localNodeMacDmgUrl, localNodeMsiUrl, localNodeExeUrl]
   );
+  const primaryDownloadOption = localNodeDownloadOptions[0] ?? null;
   const releaseVersion = releaseManifest?.version ?? "待同步";
   const releaseCommit = releaseManifest?.commit ? shortCommit(releaseManifest.commit) : "待同步";
   const releaseChecksum = releaseManifest ? releaseChecksumLabel(releaseManifest) : "等待 release-manifest.json";
@@ -393,15 +394,15 @@ function App() {
         ? "手机号注册"
         : "手机号登录"
       : authMethod === "nebula"
-        ? "Nebula ID 登录"
+        ? "账号编号登录"
       : authMode === "register"
         ? "邮箱注册"
         : "邮箱登录";
   const authDialogTitle = authMode === "register" ? "创建账号" : "登录工作台";
   const authDialogDescription =
     authMode === "register"
-      ? "账号创建后会进入同一套安装包、设备绑定和本机节点流程。"
-      : "登录后继续查看授权、安装包和本机节点状态。";
+      ? "账号创建后，按页面提示开通服务、安装电脑助手并连接店铺。"
+      : "登录后继续完成开通、安装和电脑授权。";
   const shouldShowAuthDialogStatus =
     authBusy || authState.phase === "failed" || authState.phase === "authenticated" || Boolean(operationStatus);
   const setupStatus = setupStatusModel({
@@ -411,6 +412,9 @@ function App() {
     localNode,
     order
   });
+  const computerHelperOnline = localNode.phase === "online";
+  const computerAuthorized = Boolean(device && lease);
+  const canStartWorkspace = computerHelperOnline && computerAuthorized && canOpenLocalConsole;
 
   async function api<T>(path: string, init: RequestInit = {}, token = session?.token): Promise<T> {
     const response = await fetchWithTimeout(`${API_BASE}${path}`, {
@@ -752,7 +756,7 @@ function App() {
     commitSession(nextSession);
     dispatchAuth({
       type: "success",
-      message: `账号已登录，Nebula ID：${data.user.nebula_id}`,
+      message: `账号已登录：${displayLoginAlias(data.user)}`,
       requestId
     });
     await refreshAccount(nextSession.token, requestId);
@@ -789,8 +793,8 @@ function App() {
 
   async function refreshAccount(token = session?.token, requestId?: number) {
     if (!token) {
-      const nextRequestId = beginAuth("failed", "请先使用 Nebula 登录");
-      dispatchAuth({ type: "failure", message: "请先使用 Nebula 登录", requestId: nextRequestId });
+      const nextRequestId = beginAuth("failed", "请先登录账号");
+      dispatchAuth({ type: "failure", message: "请先登录账号", requestId: nextRequestId });
       return;
     }
     const currentRequestId = requestId ?? beginAuth("refreshing", "正在刷新账户状态");
@@ -841,7 +845,7 @@ function App() {
 
   async function createOrder() {
     if (!session) {
-      setOperationStatus("请先使用 Nebula 登录");
+      setOperationStatus("请先登录账号");
       openAuthDialog("login");
       return;
     }
@@ -869,9 +873,9 @@ function App() {
       return;
     }
     await navigator.clipboard.writeText(
-      `订单 UUID: ${order.id}\n支付方式: ${order.payment_provider}\n支付备注: ${order.payment_reference}`
+      `申请编号: ${order.id}\n付款方式: ${paymentProviderLabel(order.payment_provider)}\n付款备注: ${order.payment_reference}`
     );
-    setOperationStatus("订单信息已复制");
+    setOperationStatus("申请信息已复制");
   }
 
   async function refreshOrder() {
@@ -886,7 +890,7 @@ function App() {
       setOperationStatus(
         data.order.status === "confirmed"
           ? confirmedOrderMessage(data.order)
-          : `订单状态已刷新：${data.order.status}`
+          : `开通状态已刷新：${orderStatusLabel(data.order.status)}`
       );
     } catch (error) {
       setOperationStatus(`刷新订单失败：${errorMessage(error)}`);
@@ -895,7 +899,7 @@ function App() {
 
   async function redeem() {
     if (!session || !cardKey.trim()) {
-      setOperationStatus("需要登录并填写卡密");
+      setOperationStatus("需要登录并填写开通码");
       return;
     }
     try {
@@ -904,16 +908,16 @@ function App() {
         body: JSON.stringify({ card_key: cardKey.trim() })
       });
       setCardKey("");
-      setOperationStatus("卡密已兑换，授权已生效");
+      setOperationStatus("开通码已使用，服务已开通");
       await refreshAccount();
     } catch (error) {
-      setOperationStatus(`兑换失败：${errorMessage(error)}`);
+      setOperationStatus(`开通失败：${errorMessage(error)}`);
     }
   }
 
   async function activateDevice() {
     if (!session) {
-      setOperationStatus("请先使用 Nebula 登录");
+      setOperationStatus("请先登录账号");
       openAuthDialog("login");
       return;
     }
@@ -924,9 +928,9 @@ function App() {
       });
       setDevice(data.device);
       setLease(null);
-      setOperationStatus("设备已绑定到当前账户");
+      setOperationStatus("这台电脑已加入你的账号");
     } catch (error) {
-      setOperationStatus(`设备绑定失败：${errorMessage(error)}`);
+      setOperationStatus(`授权这台电脑失败：${errorMessage(error)}`);
     }
   }
 
@@ -943,20 +947,20 @@ function App() {
       setLease(data.lease);
       try {
         await localNodePost("/portal/lease", { lease: data.lease });
-        setOperationStatus("授权租约已签发，并已写入本机节点");
+        setOperationStatus("这台电脑已完成授权");
         await probeLocalNode();
       } catch (localError) {
-        setOperationStatus(`云端租约已签发，但写入本机节点失败：${errorMessage(localError)}`);
+        setOperationStatus(`云端已授权，但电脑助手写入失败：${errorMessage(localError)}`);
       }
     } catch (error) {
-      setOperationStatus(`签发租约失败：${errorMessage(error)}`);
+      setOperationStatus(`电脑授权失败：${errorMessage(error)}`);
     }
   }
 
   async function probeLocalNode() {
     setLocalNode({
       phase: "checking",
-      message: "正在检测本机 127.0.0.1:8790 节点"
+      message: "正在检测电脑助手是否已打开"
     });
     try {
       const health = await localNodeJson<LocalNodeHealth>("/health").catch((error) => {
@@ -992,11 +996,11 @@ function App() {
 
   async function copyLocalManifestUrl() {
     if (!canCopyLocalManifest) {
-      setOperationStatus("检测到本机节点 online 后即可复制本机 manifest");
+      setOperationStatus("电脑助手连接成功后，才能复制 OpenClaw 连接地址");
       return;
     }
     await copyText(localManifestUrl);
-    setOperationStatus("本机 OpenClaw manifest URL 已复制");
+    setOperationStatus("OpenClaw 连接地址已复制");
   }
 
   useEffect(() => {
@@ -1030,7 +1034,7 @@ function App() {
     } else {
       setLocalNode({
         phase: "idle",
-        message: "登录后会检测 127.0.0.1:8790 本机节点"
+        message: "登录后会检测电脑助手是否打开"
       });
     }
   }, [session?.token]);
@@ -1097,7 +1101,7 @@ function App() {
         setTurnstileStatus("安全验证组件已加载；完成验证后可提交");
         window.setTimeout(() => {
           if (!cancelled && !turnstileTokenRef.current) {
-            setTurnstileStatus("若验证控件不可见，请确认 Turnstile site key 允许当前域名，或使用 Nebula 授权入口");
+            setTurnstileStatus("如果没有看到安全验证，请刷新页面或改用网页登录入口");
           }
         }, 4_000);
       })
@@ -1148,9 +1152,18 @@ function App() {
           <span>Ozon Rust Suite</span>
         </a>
         <nav aria-label="primary navigation">
-          <a href="#capabilities">功能</a>
-          <a href="#workflow">流程</a>
-          <a href="#pricing">方案</a>
+          {session ? (
+            <>
+              <a href="#console">接入向导</a>
+              <a href="#advanced">排查</a>
+            </>
+          ) : (
+            <>
+              <a href="#capabilities">功能</a>
+              <a href="#workflow">流程</a>
+              <a href="#pricing">方案</a>
+            </>
+          )}
         </nav>
         <div className="nav-actions">
           {session ? (
@@ -1175,12 +1188,14 @@ function App() {
         </div>
       </header>
 
+      {!session && (
+        <>
       <section className="hero-section" id="top">
         <div className="hero-copy">
           <p className="eyebrow">Ozon Rust Suite</p>
-          <h1>从登录到真实商品读取，卖家工作台一条线接好。</h1>
+          <h1>登录后，按步骤把店铺商品读出来。</h1>
           <p>
-            门户管理账号、授权、安装包和本机节点；本地控制台保存 Ozon 凭据、读取商品详情、生成海报，并把写操作留在本机审批。
+            先开通服务，安装电脑助手，连接这台电脑，然后读取 Ozon 商品并生成海报。每一步都有按钮提示，不需要懂技术名词。
           </p>
           <div className="hero-actions">
             {session ? (
@@ -1190,7 +1205,7 @@ function App() {
                 </a>
                 {canOpenLocalConsole && (
                   <a className="download secondary" href={LOCAL_CONSOLE_URL} target="_blank" rel="noreferrer">
-                    <MonitorCheck size={18} /> 打开本地控制台
+                    <MonitorCheck size={18} /> 打开工作台
                   </a>
                 )}
                 <button className="secondary" disabled={authBusy} onClick={() => refreshAccount()}>
@@ -1209,9 +1224,9 @@ function App() {
             )}
           </div>
           <div className="hero-meta">
-            <span>Nebula 统一身份</span>
-            <span>真实 Seller API 读取</span>
-            <span>本机密钥与审批</span>
+            <span>邮箱/手机号登录</span>
+            <span>真实商品读取</span>
+            <span>海报生成</span>
           </div>
         </div>
         <div className="hero-visual" aria-label="Ozon Rust Suite workflow preview">
@@ -1219,7 +1234,7 @@ function App() {
             <span />
             <span />
             <span />
-            <strong>operator path</strong>
+            <strong>接入步骤</strong>
           </div>
           <div className="visual-grid">
             <div>
@@ -1228,41 +1243,41 @@ function App() {
             </div>
             <div>
               <span>Step 2</span>
-              <strong>下载并启动本地节点</strong>
+              <strong>安装电脑助手</strong>
             </div>
             <div>
               <span>Step 3</span>
-              <strong>检测 127.0.0.1:8790</strong>
+              <strong>连接这台电脑</strong>
             </div>
           </div>
           <div className="diff-preview">
             <span>Step 4</span>
-            <strong>验证 Ozon 商品，再生成可校验海报</strong>
-            <em>商品事实、图片顺序和文案校验都留在本机控制台。</em>
+            <strong>读取商品，再生成海报</strong>
+            <em>商品图片和文案都来自真实商品信息。</em>
           </div>
         </div>
       </section>
 
       <section className="capability-band" id="capabilities">
         <div className="band-title">
-          <p className="eyebrow">已接通的核心链路</p>
-          <h2>账户、授权、本机节点、商品读取和海报生成已经串起来。</h2>
+          <p className="eyebrow">能做什么</p>
+          <h2>把复杂的接入过程，变成一步一步的操作。</h2>
         </div>
         <div className="capability-grid">
           <article>
             <PackageCheck />
-            <h3>账号、下载和授权走在一条线上</h3>
-            <p>登录、安装包、设备绑定和租约状态都在同一个工作台里看，不用来回找页面。</p>
+            <h3>不用到处找入口</h3>
+            <p>登录、开通、下载、连接电脑都在同一个页面完成。</p>
           </article>
           <article>
             <Boxes />
-            <h3>真实 Ozon 商品已经能读</h3>
-            <p>本地节点直接读官方 Seller API。凭据没配好就报错，不会悄悄回退成假数据。</p>
+            <h3>读取真实商品</h3>
+            <p>用你的 Ozon 店铺授权读取商品信息，没连上就明确告诉你哪里没好。</p>
           </article>
           <article>
             <Bot />
-            <h3>商品海报带事实校验</h3>
-            <p>读取商品图和属性后生成海报背景，文案叠加按 fact pack 校验，避免错货错词。</p>
+            <h3>生成不跑偏的海报</h3>
+            <p>先拿商品图片和属性，再生成宣传图，减少错图、错词和错卖点。</p>
           </article>
         </div>
       </section>
@@ -1270,55 +1285,53 @@ function App() {
       <section className="workflow-band" id="workflow">
         <div className="workflow-copy">
           <p className="eyebrow">上手路径</p>
-          <h2>登录、下载、检测、验证、读取商品。</h2>
+          <h2>登录、开通、安装、连接、开始用。</h2>
           <p>
-            门户负责账号和授权，本地控制台负责凭据、商品读取和海报生成。云端不接触 Ozon API Key，本机节点只接受经过授权的操作。
+            普通用户只需要照着按钮往下走。需要排查时，再打开排查信息查看连接状态和版本。
           </p>
         </div>
         <div className="workflow-steps">
           <div>
             <span>01</span>
             <strong>登录账号</strong>
-            <p>邮箱、手机号和 Nebula ID 都归同一个身份，登录后自动恢复下载和授权状态。</p>
+            <p>用邮箱或手机号进入工作台，后续状态会自动保存。</p>
           </div>
           <div>
             <span>02</span>
-            <strong>下载安装包</strong>
-            <p>安装并启动本机节点，门户会检测 `127.0.0.1:8790` 的在线状态。</p>
+            <strong>安装电脑助手</strong>
+            <p>电脑助手负责保存店铺授权信息，网页不会保存你的店铺密钥。</p>
           </div>
           <div>
             <span>03</span>
-            <strong>检测本机节点</strong>
-            <p>门户只探测 `127.0.0.1:8790` 有没有响应，不去越权读取你的本地密钥。</p>
+            <strong>连接这台电脑</strong>
+            <p>打开电脑助手后，网页会确认它是否已经在运行。</p>
           </div>
           <div>
             <span>04</span>
-            <strong>打开本地控制台</strong>
-            <p>在本地控制台验证 Ozon 凭据、读取真实商品，并生成带事实校验的海报。</p>
+            <strong>打开工作台</strong>
+            <p>在工作台检查店铺授权，读取真实商品，并生成不乱写卖点的海报。</p>
           </div>
         </div>
       </section>
+        </>
+      )}
 
       {session && (
-        <section className="account-console" id="console">
+        <section className="account-console account-console-simple" id="console">
           <aside className="identity-panel">
-            <p className="eyebrow">Nebula session</p>
-            <h2>账户与授权</h2>
+            <p className="eyebrow">已登录</p>
+            <h2>{displayLoginAlias(session.user)}</h2>
             <div className="rail-status">
-              <span>Nebula ID</span>
-              <strong>{displayNebulaId(session.user)}</strong>
+              <span>服务状态</span>
+              <strong>{activeEntitlement ? "已开通" : order ? "申请处理中" : "未开通"}</strong>
             </div>
             <div className="rail-status">
-              <span>登录别名</span>
-              <strong>{displayLoginAlias(session.user)}</strong>
+              <span>电脑助手</span>
+              <strong>{computerHelperOnline ? "已连接" : "未连接"}</strong>
             </div>
             <div className="rail-status">
-              <span>身份来源</span>
-              <strong>{identitySourceLabel(session.user.nebula_source)}</strong>
-            </div>
-            <div className="rail-status">
-              <span>授权状态</span>
-              <strong>{activeEntitlement ? "active" : "none"}</strong>
+              <span>电脑授权</span>
+              <strong>{computerAuthorized ? "已完成" : "未完成"}</strong>
             </div>
           </aside>
 
@@ -1378,7 +1391,7 @@ function App() {
                 </button>
                 {localMode === "login" && (
                   <button className={localMethod === "nebula" ? "active" : ""} onClick={() => setLocalMethod("nebula")}>
-                    <KeyRound size={18} /> Nebula ID
+                    <KeyRound size={18} /> 账号编号
                   </button>
                 )}
               </div>
@@ -1426,63 +1439,228 @@ function App() {
             <CheckCircle2 size={18} /> {statusMessage}
           </div>
 
-          <section className="operations">
+          <section className="operations setup-wizard">
             <div className={`setup-panel ${setupStatus.kind}`}>
               <div>
-                <span>当前下一步</span>
+                <span>下一步</span>
                 <h2>{setupStatus.title}</h2>
                 <p>{setupStatus.message}</p>
               </div>
               <div className="setup-actions">
-                {!activeEntitlement && (
-                  <button disabled={!canUseProtectedActions} onClick={createOrder}>
-                    <ArrowRight size={18} /> 提交开通申请
-                  </button>
-                )}
-                {localNode.phase !== "online" && (
+                {!activeEntitlement && order && (
                   <>
-                    {localNodeDownloadOptions.length > 0 ? (
-                      localNodeDownloadOptions.map((option, index) => (
-                        <a className={`download ${index > 0 ? "secondary" : ""}`} href={option.url} key={option.key}>
-                          <Download size={18} /> {option.shortLabel}
-                        </a>
-                      ))
-                    ) : (
-                      <button className="secondary" disabled>
-                        <Download size={18} /> 安装包待同步
-                      </button>
-                    )}
-                    <button className="secondary" disabled={localNode.phase === "checking"} onClick={probeLocalNode}>
-                      <RefreshCcw size={18} /> 检测本机节点
+                    <button disabled={authBusy} onClick={refreshOrder}>
+                      <RefreshCcw size={18} /> 刷新开通状态
+                    </button>
+                    <button className="secondary" onClick={copyOrderInfo}>
+                      复制申请信息
                     </button>
                   </>
                 )}
-                {activeEntitlement && localNode.phase === "online" && !device && (
+                {!activeEntitlement && !order && (
+                  <button disabled={!canUseProtectedActions} onClick={createOrder}>
+                    <ArrowRight size={18} /> 开通服务
+                  </button>
+                )}
+                {activeEntitlement && !computerHelperOnline && primaryDownloadOption && (
+                  <a className="download" href={primaryDownloadOption.url}>
+                    <Download size={18} /> {primaryDownloadOption.shortLabel}
+                  </a>
+                )}
+                {activeEntitlement && !computerHelperOnline && (
+                  <button className="secondary" disabled={localNode.phase === "checking"} onClick={probeLocalNode}>
+                    <RefreshCcw size={18} /> 我已打开，检测一下
+                  </button>
+                )}
+                {activeEntitlement && computerHelperOnline && !device && (
                   <button disabled={!canBindLocalDevice} onClick={activateDevice}>
-                    <MonitorCheck size={18} /> 绑定设备
+                    <MonitorCheck size={18} /> 授权这台电脑
                   </button>
                 )}
                 {activeEntitlement && device && !lease && (
-                  <button className="secondary" onClick={issueLease} disabled={authBusy}>
-                    <Radio size={18} /> 签发租约
+                  <button onClick={issueLease} disabled={authBusy}>
+                    <Radio size={18} /> 完成电脑授权
                   </button>
                 )}
-                {setupStatus.kind === "online" && canOpenLocalConsole && (
+                {canStartWorkspace && (
                   <a className="download" href={LOCAL_CONSOLE_URL} target="_blank" rel="noreferrer">
-                    <MonitorCheck size={18} /> 打开本地控制台
+                    <MonitorCheck size={18} /> 打开工作台
                   </a>
                 )}
               </div>
             </div>
 
-            <div className="op-section">
-              <div className="section-title">
-                  <Clipboard />
-                  <div>
-                    <h2>开通申请</h2>
-                  <p>收款通道打开前，这里用于提交授权申请；运营确认后会发送卡密，兑换后授权同步到账户。</p>
-                  </div>
+            <div className="wizard-steps" aria-label="接入步骤">
+              <article className={wizardStepClass(Boolean(activeEntitlement), !activeEntitlement)}>
+                <span className="step-number">1</span>
+                <div>
+                  <h3>开通服务</h3>
+                  <p>
+                    {activeEntitlement
+                      ? "服务已开通，可以继续连接电脑。"
+                      : order
+                        ? "申请已经提交。付款或客服确认后，点刷新查看结果。"
+                        : "先开通服务，后面才能连接电脑和读取商品。"}
+                  </p>
+                  {!activeEntitlement && (
+                    <div className="step-actions">
+                      {order ? (
+                        <>
+                          <button disabled={authBusy} onClick={refreshOrder}>
+                            <RefreshCcw size={18} /> 刷新开通状态
+                          </button>
+                          <button className="secondary" onClick={copyOrderInfo}>
+                            复制申请信息
+                          </button>
+                        </>
+                      ) : (
+                        <button disabled={!canUseProtectedActions} onClick={createOrder}>
+                          <ArrowRight size={18} /> 开通服务
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
+              </article>
+
+              <article className={wizardStepClass(computerHelperOnline, Boolean(activeEntitlement) && !computerHelperOnline)}>
+                <span className="step-number">2</span>
+                <div>
+                  <h3>安装并打开电脑助手</h3>
+                  <p>
+                    {computerHelperOnline
+                      ? "电脑助手已经打开。"
+                      : activeEntitlement
+                        ? "下载安装到这台电脑，打开后回到这里点“检测一下”。"
+                        : "服务开通后，这里会给你下载入口。"}
+                  </p>
+                  {activeEntitlement && !computerHelperOnline && (
+                    <div className="step-actions">
+                      {primaryDownloadOption ? (
+                        <a className="download" href={primaryDownloadOption.url}>
+                          <Download size={18} /> {primaryDownloadOption.shortLabel}
+                        </a>
+                      ) : (
+                        <button className="secondary" disabled>
+                          <Download size={18} /> 安装包准备中
+                        </button>
+                      )}
+                      <button disabled={localNode.phase === "checking"} onClick={probeLocalNode}>
+                        <RefreshCcw size={18} /> 我已打开，检测一下
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </article>
+
+              <article className={wizardStepClass(computerAuthorized, Boolean(activeEntitlement) && computerHelperOnline && !computerAuthorized)}>
+                <span className="step-number">3</span>
+                <div>
+                  <h3>授权这台电脑</h3>
+                  <p>
+                    {computerAuthorized
+                      ? "这台电脑已经可以使用你的服务。"
+                      : "只允许已授权的电脑读取商品和生成海报。"}
+                  </p>
+                  {activeEntitlement && computerHelperOnline && !computerAuthorized && (
+                    <div className="step-actions">
+                      {!device ? (
+                        <button disabled={!canBindLocalDevice} onClick={activateDevice}>
+                          <MonitorCheck size={18} /> 授权这台电脑
+                        </button>
+                      ) : (
+                        <button disabled={authBusy} onClick={issueLease}>
+                          <Radio size={18} /> 完成授权
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </article>
+
+              <article className={wizardStepClass(canStartWorkspace, canStartWorkspace)}>
+                <span className="step-number">4</span>
+                <div>
+                  <h3>开始读取商品</h3>
+                  <p>
+                    {canStartWorkspace
+                      ? "打开工作台，添加店铺授权信息，然后读取商品并生成海报。"
+                      : "前面几步完成后，这里会出现进入工作台的按钮。"}
+                  </p>
+                  {canStartWorkspace && (
+                    <div className="step-actions">
+                      <a className="download" href={LOCAL_CONSOLE_URL} target="_blank" rel="noreferrer">
+                        <MonitorCheck size={18} /> 打开工作台
+                      </a>
+                    </div>
+                  )}
+                </div>
+              </article>
+            </div>
+
+            {paymentSession && (
+              <div className="payment-note">
+                <CheckCircle2 size={18} />
+                <div className="payment-note-body">
+                  <span>{paymentSession.message}</span>
+                  {paymentSession.native_code_url && (
+                    <div className="wechat-pay-box">
+                      <QRCodeSVG value={paymentSession.native_code_url} size={148} marginSize={2} />
+                      <div>
+                        <strong>微信扫码支付</strong>
+                        <p>
+                          支付备注：{paymentSession.payment_reference} ·{" "}
+                          {formatMoney(paymentSession.amount_minor, paymentSession.currency)}
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                  {paymentSession.checkout_url && (
+                    <a href={paymentSession.checkout_url}>
+                      <ExternalLink size={16} /> 打开支付页
+                    </a>
+                  )}
+                </div>
+              </div>
+            )}
+
+            <details className="op-section support-section">
+              <summary>
+                <KeyRound size={20} />
+                <div>
+                  <strong>客服给了开通码？</strong>
+                  <span>有开通码时再打开这里。</span>
+                </div>
+              </summary>
+              <div className="form-grid">
+                <label>
+                  开通码
+                  <input value={cardKey} onChange={(event) => setCardKey(event.target.value)} placeholder="ORS-..." />
+                </label>
+                <label>
+                  服务状态
+                  <input value={activeEntitlement ? "已开通" : "未开通"} readOnly />
+                </label>
+                <label>
+                  有效期
+                  <input value={activeEntitlement?.expires_at ?? "开通后显示"} readOnly />
+                </label>
+              </div>
+              <div className="command-row">
+                <button disabled={!canUseProtectedActions} onClick={redeem}>
+                  <KeyRound size={18} /> 使用开通码
+                </button>
+              </div>
+            </details>
+
+            <details className="op-section support-section">
+              <summary>
+                <Clipboard size={20} />
+                <div>
+                  <strong>申请详情</strong>
+                  <span>需要发给客服或核对付款时再打开。</span>
+                </div>
+              </summary>
               {order ? (
                 <div className="form-grid">
                   <label>
@@ -1494,12 +1672,12 @@ function App() {
                     <input value={order.payment_reference} readOnly />
                   </label>
                   <label>
-                    开通状态
-                    <input value={order.status} readOnly />
+                    状态
+                    <input value={orderStatusLabel(order.status)} readOnly />
                   </label>
                   <label>
                     通道
-                    <input value={order.payment_provider} readOnly />
+                    <input value={paymentProviderLabel(order.payment_provider)} readOnly />
                   </label>
                   <label>
                     金额
@@ -1507,39 +1685,9 @@ function App() {
                   </label>
                 </div>
               ) : (
-                <p className="section-hint">
-                  当前账号还没有开通记录。提交申请后会生成编号；如果你已有卡密，也可以直接在下方兑换。
-                </p>
-              )}
-              {paymentSession && (
-                <div className="payment-note">
-                  <CheckCircle2 size={18} />
-                  <div className="payment-note-body">
-                    <span>{paymentSession.message}</span>
-                    {paymentSession.native_code_url && (
-                      <div className="wechat-pay-box">
-                        <QRCodeSVG value={paymentSession.native_code_url} size={148} marginSize={2} />
-                        <div>
-                          <strong>微信扫码支付</strong>
-                          <p>
-                            支付备注：{paymentSession.payment_reference} ·{" "}
-                            {formatMoney(paymentSession.amount_minor, paymentSession.currency)}
-                          </p>
-                        </div>
-                      </div>
-                    )}
-                    {paymentSession.checkout_url && (
-                      <a href={paymentSession.checkout_url}>
-                        <ExternalLink size={16} /> 打开支付页
-                      </a>
-                    )}
-                  </div>
-                </div>
+                <p className="section-hint">还没有申请记录。点“开通服务”后，这里会显示申请编号和付款备注。</p>
               )}
               <div className="command-row">
-                <button disabled={!canUseProtectedActions} onClick={createOrder}>
-                  <ArrowRight size={18} /> 提交开通申请
-                </button>
                 <button className="secondary" onClick={copyOrderInfo} disabled={!order}>
                   复制申请信息
                 </button>
@@ -1547,74 +1695,45 @@ function App() {
                   <RefreshCcw size={18} /> 刷新状态
                 </button>
               </div>
-            </div>
-
-            <details className="op-section support-section">
-              <summary>
-                <KeyRound size={20} />
-                <div>
-                  <strong>已有卡密？兑换授权</strong>
-                  <span>客服确认、企业内测或线下开通时使用。</span>
-                </div>
-              </summary>
-              <div className="form-grid">
-                <label>
-                  卡密
-                  <input value={cardKey} onChange={(event) => setCardKey(event.target.value)} placeholder="ORS-..." />
-                </label>
-                <label>
-                  当前计划
-                  <input value={activeEntitlement?.plan_code ?? "未授权"} readOnly />
-                </label>
-                <label>
-                  到期时间
-                  <input value={activeEntitlement?.expires_at ?? "无"} readOnly />
-                </label>
-              </div>
-              <div className="command-row">
-                <button disabled={!canUseProtectedActions} onClick={redeem}>
-                  <KeyRound size={18} /> 兑换授权
-                </button>
-              </div>
             </details>
 
-            <div className="op-section local-node-section">
-              <div className="section-title">
-                  <MonitorCheck />
-                  <div>
-                    <h2>本机节点与 OpenClaw</h2>
-                  <p>门户检测本机服务并下发授权，本地控制台负责凭据校验、商品读取和海报生成。</p>
-                  </div>
+            <details className="op-section support-section local-node-section" id="advanced">
+              <summary>
+                <MonitorCheck size={20} />
+                <div>
+                  <strong>排查用信息</strong>
+                  <span>一般不用看；客服排查安装或插件问题时再打开。</span>
                 </div>
+              </summary>
               <div className="local-node-grid">
                 <div className={`local-node-card ${localNode.phase}`}>
-                  <span>本机服务</span>
+                  <span>电脑助手</span>
                   <strong>{localNodeStatusLabel(localNode.phase)}</strong>
                   <p>{localNode.message}</p>
                 </div>
                 <div className={`local-node-card ${localPairingStatus.kind}`}>
-                  <span>配对/授权</span>
+                  <span>电脑授权</span>
                   <strong>{localPairingStatus.title}</strong>
                   <p>{localPairingStatus.message}</p>
                 </div>
                 <div className="local-node-card">
-                  <span>安装包 manifest</span>
+                  <span>安装包版本</span>
                   <strong>{releaseVersion}</strong>
-                  <p>{downloads?.release_manifest_url ?? "等待 cloud /downloads 同步"}</p>
+                  <p>{downloads?.release_manifest_url ?? "等待下载信息同步"}</p>
                 </div>
                 <div className="local-node-card">
-                  <span>Release commit</span>
+                  <span>发布校验</span>
                   <strong>{releaseCommit}</strong>
                   <p>{releaseChecksum}</p>
                 </div>
               </div>
               <div className="command-row">
                 <button disabled={localNode.phase === "checking"} onClick={probeLocalNode}>
-                  <RefreshCcw size={18} /> 检测本机节点
+                  <RefreshCcw size={18} /> 检测连接
                 </button>
                 {localNodeDownloadOptions.length === 0 && (
                   <button className="secondary" disabled>
-                    <Download size={18} /> 安装包待同步
+                    <Download size={18} /> 安装包准备中
                   </button>
                 )}
                 {localNodeDownloadOptions.map((option, index) => (
@@ -1624,97 +1743,85 @@ function App() {
                 ))}
                 {canOpenLocalConsole && (
                   <a className="download secondary" href={LOCAL_CONSOLE_URL} target="_blank" rel="noreferrer">
-                    <MonitorCheck size={18} /> 打开本地控制台
+                    <MonitorCheck size={18} /> 打开工作台
                   </a>
                 )}
                 {canDownloadOpenClawPlugin && (
-                  <a className="download" href={openclawPluginUrl} target="_blank" rel="noreferrer">
-                    <Download size={18} /> OpenClaw 插件
+                  <a className="download secondary" href={openclawPluginUrl} target="_blank" rel="noreferrer">
+                    <Download size={18} /> 插件安装包
                   </a>
                 )}
                 <button className="secondary" disabled={!canCopyLocalManifest} onClick={copyLocalManifestUrl}>
-                  <Clipboard size={18} /> 复制本机 manifest
+                  <Clipboard size={18} /> 复制插件连接地址
                 </button>
               </div>
-              {localNode.phase !== "online" && (
-                <p className="action-reason">安装并启动本机节点后，回到这里点击“检测本机节点”。检测到 online 后才能复制 manifest、绑定设备和签发租约。</p>
-              )}
-              <p className="section-hint">
-                安装并启动本机节点后，复制本机 manifest 给 OpenClaw；授权信息由本机节点提供。
-              </p>
               {localNode.manifest && (
                 <div className="manifest-tools">
                   {localNode.manifest.tools.map((tool) => (
                     <div key={tool.name}>
                       <span>{tool.risk}</span>
                       <strong>{tool.name}</strong>
-                      <em>{tool.approval_required ? "本地审批" : "只读"}</em>
+                      <em>{tool.approval_required ? "需要确认" : "只读"}</em>
                     </div>
                   ))}
                 </div>
               )}
-            </div>
+            </details>
 
-            <div className="op-section">
-              <div className="section-title">
-                  <MonitorCheck />
-                  <div>
-                    <h2>设备绑定</h2>
-                  <p>使用本机节点生成的指纹绑定设备；超出 `max_devices` 会被云端拒绝。</p>
-                  </div>
+            <details className="op-section support-section">
+              <summary>
+                <ShieldCheck size={20} />
+                <div>
+                  <strong>更换电脑或改名称</strong>
+                  <span>需要改设备名、查看授权时间时再打开。</span>
                 </div>
+              </summary>
               <div className="form-grid">
                 <label>
                   设备名
                   <input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} />
                 </label>
                 <label>
-                  设备指纹
+                  设备码
                   <input
                     value={deviceFingerprint}
                     readOnly
-                    placeholder="先检测本机节点"
-                    title="设备指纹由本机节点生成，门户不再允许手写伪造"
+                    placeholder="连接电脑助手后自动生成"
+                    title="设备码由电脑助手生成，门户不允许手写伪造"
                   />
                 </label>
                 <label>
-                  绑定状态
-                  <input value={device ? `${device.name} · ${device.status}` : "未绑定"} readOnly />
+                  授权状态
+                  <input value={computerAuthorized ? "已完成" : device ? "还差最后一步" : "未授权"} readOnly />
                 </label>
               </div>
               <div className="command-row">
                 <button disabled={!canBindLocalDevice} onClick={activateDevice}>
-                  <MonitorCheck size={18} /> 绑定设备
+                  <MonitorCheck size={18} /> 授权这台电脑
                 </button>
                 <button className="secondary" onClick={issueLease} disabled={!device || authBusy}>
-                  <Radio size={18} /> 签发租约
+                  <Radio size={18} /> 完成授权
                 </button>
               </div>
-              {!activeEntitlement && <p className="action-reason">设备绑定需要有效授权。请先提交开通申请，或兑换已有卡密。</p>}
-              {activeEntitlement && localNode.phase !== "online" && (
-                <p className="action-reason">设备绑定需要本机节点 online。请先启动本机节点并重新检测。</p>
-              )}
-              {activeEntitlement && localNode.phase === "online" && !device && (
-                <p className="action-reason">本机节点已在线，可以绑定这台设备。</p>
-              )}
               {lease && (
                 <div className="lease-line">
-                  <span>Lease</span>
+                  <span>授权</span>
                   <strong>{lease.lease_id}</strong>
-                  <em>expires {lease.expires_at}</em>
+                  <em>有效期至 {lease.expires_at}</em>
                 </div>
               )}
-            </div>
+            </details>
           </section>
         </section>
         </section>
       )}
 
+      {!session && (
       <section className="pricing-band" id="pricing">
         <div>
           <p className="eyebrow">开始接入</p>
-          <h2>进入工作台，完成授权、本机节点和 Ozon 商品读取。</h2>
-          <p>账号、安装包、设备、租约和本机控制台已经连在同一条路径里。登录后按状态提示完成接入即可。</p>
+          <h2>进入工作台，按步骤完成 Ozon 商品读取。</h2>
+          <p>登录后页面会告诉你下一步该点什么：开通服务、安装电脑助手、连接这台电脑，然后开始读取商品。</p>
         </div>
         {session ? (
           <a className="download" href="#console">
@@ -1726,6 +1833,7 @@ function App() {
           </button>
         )}
       </section>
+      )}
 
       {authDialogOpen && (
         <div className="auth-backdrop" role="presentation" onMouseDown={() => setAuthDialogMode(null)}>
@@ -1747,7 +1855,7 @@ function App() {
 
             <div className="auth-context-line">
               <ShieldCheck size={17} />
-              <span>{SKYBRIDGE_AUTH_CONFIGURED ? "安全登录后可进入授权工作台。" : "账号服务正在维护，请联系运营支持。"}</span>
+              <span>{SKYBRIDGE_AUTH_CONFIGURED ? "安全登录后就能继续下一步。" : "账号服务正在维护，请联系运营支持。"}</span>
             </div>
 
             <form className="form-grid skybridge-auth-grid auth-card-form" onSubmit={handleSkybridgePasswordSubmit}>
@@ -1758,11 +1866,6 @@ function App() {
                 <button className={authMethod === "phone" ? "active" : ""} type="button" onClick={() => setAuthMethod("phone")}>
                   <Smartphone size={18} /> 手机号
                 </button>
-                {authMode === "login" && (
-                  <button className={authMethod === "nebula" ? "active" : ""} type="button" onClick={() => setAuthMethod("nebula")}>
-                    <KeyRound size={18} /> Nebula ID
-                  </button>
-                )}
               </div>
 
               {!SKYBRIDGE_AUTH_CONFIGURED && (
@@ -1848,18 +1951,18 @@ function App() {
             )}
 
             {directAuthNeedsTurnstile && (
-              <p className="identity-note">Nebula 已启用人机验证；完成安全验证后再提交兼容入口。</p>
+              <p className="identity-note">当前登录需要先完成安全验证，验证通过后再提交。</p>
             )}
 
             {NEBULA_OAUTH_ENTRY_ENABLED && (
               <details className="compat-panel">
-                <summary>统一身份页</summary>
+                <summary>网页登录入口</summary>
                 <section className="nebula-oauth-panel">
                   <div className="section-title compact-title">
                     <ShieldCheck />
                     <div>
-                      <h2>统一身份页</h2>
-                      <p>通过 Nebula 完成账号授权并返回当前工作台。</p>
+                      <h2>网页登录入口</h2>
+                      <p>如果上方登录不可用，可以打开独立登录页完成验证后返回这里。</p>
                     </div>
                   </div>
                   <div className="oauth-actions">
@@ -1868,7 +1971,7 @@ function App() {
                     </button>
                   </div>
                   {!NEBULA_OAUTH_CONFIGURED && (
-                    <p className="identity-note">统一身份页暂不可用，请使用上方账号入口。</p>
+                    <p className="identity-note">网页登录入口暂不可用，请使用上方账号入口。</p>
                   )}
                 </section>
               </details>
@@ -1892,10 +1995,9 @@ function App() {
               <div className="captcha-callout">
                 <AlertCircle />
                 <div>
-                  <strong>Nebula 安全策略已拦截这次密码交换</strong>
+                  <strong>这次登录还差安全验证</strong>
                   <p>
-                    请求已经到达身份服务，但安全策略要求 captcha_token。这个门户不会绕过验证码；推荐改用统一授权页，
-                    由身份服务完成验证码、MFA 和风控后再回调 Ozon。
+                    账号服务要求先完成验证码或二次确认。请使用“网页登录入口”，完成验证后会回到当前工作台。
                   </p>
                 </div>
               </div>
@@ -1965,7 +2067,7 @@ async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}
     });
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") {
-      throw new Error("请求超时，请检查 Nebula/Ozon 服务是否可访问");
+      throw new Error("请求超时，请检查账号服务或 Ozon 服务是否可访问");
     }
     throw error;
   } finally {
@@ -2011,13 +2113,13 @@ async function localNodePost<T>(path: string, body: unknown): Promise<T> {
 }
 
 function localNodeOnlineMessage(health: LocalNodeHealth, portalError: unknown | null) {
-  const mode = health.real_ozon_enabled ? "真实 Ozon API 模式" : "开发连接器";
+  const mode = health.real_ozon_enabled ? "真实 Ozon 商品读取已开启" : "开发模式";
   const version = health.package_version ? ` v${health.package_version}` : "";
   const protocol = health.protocol_version ? `，协议 ${health.protocol_version}` : "";
   if (portalError) {
-    return `本机节点${version}已响应 /health 和 manifest，当前是${mode}${protocol}；但 /portal/status 失败：${errorMessage(portalError)}`;
+    return `电脑助手${version}已打开，当前是${mode}${protocol}；但账户状态读取失败：${errorMessage(portalError)}`;
   }
-  return `本机节点${version}在线，当前是${mode}${protocol}`;
+  return `电脑助手${version}已连接，${mode}${protocol}`;
 }
 
 function localNodeFailedEndpoint(error: unknown) {
@@ -2035,17 +2137,17 @@ function localNodeFailureMessage(error: unknown, endpoint: string | null = local
   const message = stripLocalNodeEndpointPrefix(errorMessage(error));
   if (endpoint === "health") {
     if (isLocalNodeBrowserBlock(error)) {
-      return "浏览器没拿到 /health 响应。请先打开 Ozon Rust Local；如果已经打开，多半是旧安装包缺少 ozon66.com 本地网络预检允许，直接安装最新版。";
+    return "网页没有找到电脑助手。请先打开电脑助手；如果已经打开，安装最新版后再试。";
     }
-    return `本机 /health 检测失败：${message}`;
+    return `电脑助手检测失败：${message}`;
   }
   if (endpoint === "manifest") {
-    return `本机节点已启动，但 /openclaw/manifest 读取失败：${message}。请重启或安装最新版 Ozon Rust Local。`;
+    return `电脑助手已打开，但 OpenClaw 连接信息读取失败：${message}。请重启或安装最新版。`;
   }
   if (isLocalNodeBrowserBlock(error)) {
-    return "浏览器没拿到本机节点响应。请打开 Ozon Rust Local；如果还是不行，安装最新版后再点检测。";
+    return "网页没有找到电脑助手。请打开电脑助手；如果还是不行，安装最新版后再点检测。";
   }
-  return `未检测到本机节点：${message}`;
+  return `未检测到电脑助手：${message}`;
 }
 
 function isLocalNodeBrowserBlock(error: unknown) {
@@ -2072,9 +2174,43 @@ function localNodeStatusLabel(phase: LocalNodePhase) {
 
 function confirmedOrderMessage(order: Order) {
   if (order.payment_provider === "manual") {
-    return "申请已人工确认。请使用运营发送的卡密兑换授权。";
+    return "申请已人工确认。请使用运营发送的开通码完成开通。";
   }
-  return "订单已确认，授权状态会在账户刷新后生效";
+  return "开通已确认，刷新账户后即可继续下一步";
+}
+
+function wizardStepClass(done: boolean, current: boolean) {
+  if (done) return "wizard-step done";
+  if (current) return "wizard-step current";
+  return "wizard-step";
+}
+
+function orderStatusLabel(status: string) {
+  switch (status) {
+    case "confirmed":
+      return "已开通";
+    case "pending_manual_payment":
+      return "等待付款确认";
+    case "pending":
+      return "处理中";
+    case "cancelled":
+      return "已取消";
+    default:
+      return status;
+  }
+}
+
+function paymentProviderLabel(provider: string) {
+  switch (provider) {
+    case "manual":
+      return "人工确认";
+    case "wechat":
+      return "微信支付";
+    case "stripe":
+      return "Stripe";
+    default:
+      return provider;
+  }
 }
 
 function localNodePairingStatus(
@@ -2086,35 +2222,35 @@ function localNodePairingStatus(
   if (!entitlement) {
     return {
       kind: "warn",
-      title: "未授权",
-      message: "先兑换卡密或完成付款确认，才可签发本地节点租约。"
+      title: "服务未开通",
+      message: "先开通服务或输入开通码，才能连接店铺和生成海报。"
     };
   }
   if (!device) {
     if (localNode.phase !== "online") {
       return {
         kind: "warn",
-        title: "先连上本机节点",
-        message: "授权已存在；检测到本机节点在线后，会读取设备指纹并开放绑定。"
+        title: "先连接电脑助手",
+        message: "服务已开通。打开电脑助手并检测成功后，就能授权这台电脑。"
       };
     }
     return {
       kind: "warn",
-      title: "待绑定设备",
-      message: "授权已存在；下一步绑定本机设备，再签发租约。"
+      title: "还没授权这台电脑",
+      message: "点“授权这台电脑”，把当前电脑加入你的账号。"
     };
   }
   if (!lease) {
     return {
       kind: localNode.phase === "online" ? "warn" : "offline",
-      title: "待签发租约",
-      message: "设备已绑定；点击签发租约后，本机节点可展示授权状态。"
+      title: "还差最后一步",
+      message: "再点一次“完成授权”，电脑助手就能开始工作。"
     };
   }
   return {
     kind: localNode.phase === "online" ? "online" : "warn",
-    title: localNode.phase === "online" ? "已配对" : "云端已授权",
-    message: `Lease ${lease.lease_id} 已签发，过期时间 ${lease.expires_at}。`
+    title: localNode.phase === "online" ? "这台电脑已授权" : "电脑授权已保存",
+    message: `有效期至 ${lease.expires_at}。`
   };
 }
 
@@ -2126,48 +2262,40 @@ function setupStatusModel(input: {
   order: Order | null;
 }) {
   const nodeOnline = input.localNode.phase === "online";
-  if (!input.activeEntitlement && !nodeOnline) {
+  if (!input.activeEntitlement) {
     return {
       kind: "warn",
-      title: "本机节点和授权都还没接上",
-      message:
-        "下载安装包并启动本机节点，同时提交开通申请或兑换已有卡密。两件事完成后，设备绑定和租约会自动变成可操作。"
+      title: input.order ? "等待服务开通" : "先开通服务",
+      message: input.order
+        ? "申请已经提交。付款或客服确认后，点“刷新开通状态”。"
+        : "开通后按提示安装电脑助手，再授权这台电脑。"
     };
   }
   if (!nodeOnline) {
     return {
       kind: "warn",
-      title: "启动本机节点",
-      message: "授权已经存在。现在下载安装包并启动本机节点，检测到 online 后即可绑定设备。"
-    };
-  }
-  if (!input.activeEntitlement) {
-    return {
-      kind: input.order ? "warn" : "offline",
-      title: input.order ? "等待授权开通" : "开通账户授权",
-      message: input.order
-        ? "开通申请已生成。收到卡密并兑换后，设备绑定和租约会变成可操作。"
-        : "本机节点已经在线。提交开通申请或兑换已有卡密后，就能绑定设备并签发本机租约。"
+      title: "安装并打开电脑助手",
+      message: "下载电脑助手，打开后回到这里点“检测一下”。"
     };
   }
   if (!input.device) {
     return {
       kind: "warn",
-      title: "绑定这台设备",
-      message: "本机节点在线且授权有效。使用本机节点生成的设备指纹完成绑定。"
+      title: "授权这台电脑",
+      message: "服务已开通，电脑助手也在线。现在把这台电脑加入账号。"
     };
   }
   if (!input.lease) {
     return {
       kind: "warn",
-      title: "签发本机租约",
-      message: "设备已绑定。签发租约后，本机控制台会显示云端授权状态。"
+      title: "完成电脑授权",
+      message: "再确认一次授权，电脑助手就可以读取商品和生成海报。"
     };
   }
   return {
     kind: "online",
-    title: "工作台已接通",
-    message: "账号授权、设备绑定和本机租约都已就绪，可以打开本地控制台读取 Ozon 商品并生成海报。"
+    title: "可以开始了",
+    message: "服务和这台电脑都已准备好。打开工作台，添加店铺凭据后读取商品。"
   };
 }
 
@@ -2202,8 +2330,8 @@ function localNodeDownloads(
     ? [{ key: "mac-dmg", label: "Mac 安装包", shortLabel: "下载 Mac 版", url: macDmgUrl }]
     : [];
   const windows = [
-    ...(msiUrl ? [{ key: "windows-msi", label: "Windows MSI", shortLabel: "下载 MSI", url: msiUrl }] : []),
-    ...(exeUrl ? [{ key: "windows-exe", label: "Windows EXE", shortLabel: "下载 EXE", url: exeUrl }] : [])
+    ...(msiUrl ? [{ key: "windows-msi", label: "Windows 安装包", shortLabel: "下载 Windows 版", url: msiUrl }] : []),
+    ...(exeUrl ? [{ key: "windows-exe", label: "Windows 备用安装包", shortLabel: "备用下载", url: exeUrl }] : [])
   ];
 
   if (platform === "mac") return [...mac, ...windows];
@@ -2265,7 +2393,7 @@ async function skybridgePasswordAuth(input: {
     throw new Error("邮箱/手机号登录未配置");
   }
   if (input.mode === "register" && input.method === "nebula") {
-    throw new Error("Nebula ID 由 Nebula 分配，注册请使用邮箱或手机号");
+    throw new Error("账号编号由系统分配，注册请使用邮箱或手机号");
   }
   if (input.method === "nebula") {
     return skybridgeNebulaLogin(input.identifier, input.password);
@@ -2424,11 +2552,11 @@ async function skybridgeNebulaLogin(nebulaId: string, password: string): Promise
   });
   const result = await response.json().catch(() => null);
   if (!response.ok) {
-    throw new Error(skybridgeErrorMessage(result, "Nebula ID 登录失败"));
+    throw new Error(skybridgeErrorMessage(result, "账号编号登录失败"));
   }
   const session = extractSkybridgeSession(result);
   if (!session?.access_token) {
-    throw new Error("Nebula ID 登录响应无效");
+    throw new Error("账号编号登录响应无效");
   }
   return session;
 }
@@ -2490,11 +2618,11 @@ async function exchangeNebulaOAuthCode(
   });
   const result = await response.json().catch(() => null);
   if (!response.ok) {
-    throw new Error(skybridgeErrorMessage(result, "Nebula 授权换取会话失败"));
+    throw new Error(skybridgeErrorMessage(result, "网页登录失败"));
   }
   const session = extractSkybridgeSession(result);
   if (!session?.access_token) {
-    throw new Error("Nebula 授权返回的 access_token 无效");
+    throw new Error("网页登录返回信息无效");
   }
   return session;
 }
@@ -2712,19 +2840,19 @@ function identitySourceLabel(source: User["nebula_source"]) {
 function methodLabel(method: LoginMethod) {
   if (method === "email") return "邮箱";
   if (method === "phone") return "手机号";
-  return "Nebula ID";
+  return "账号编号";
 }
 
 function identifierLabel(mode: AuthMode, loginMethod: LoginMethod) {
   if (loginMethod === "email") return "邮箱";
   if (loginMethod === "phone") return "手机号";
-  return mode === "login" ? "Nebula ID" : "邮箱";
+  return mode === "login" ? "账号编号" : "邮箱";
 }
 
 function identifierPlaceholder(mode: AuthMode, loginMethod: LoginMethod) {
   if (loginMethod === "email") return "name@example.com";
   if (loginMethod === "phone") return "请输入手机号";
-  return mode === "login" ? "请输入 Nebula ID" : "name@example.com";
+  return mode === "login" ? "请输入账号编号" : "name@example.com";
 }
 
 function identifierAutocomplete(loginMethod: LoginMethod) {
@@ -2766,7 +2894,7 @@ function isInvalidSessionError(error: unknown) {
 function skybridgeDirectAuthFailureMessage(error: unknown) {
   const message = errorMessage(error);
   if (isCaptchaProtectionMessage(message)) {
-    return "请求已到达身份服务，但当前入口缺少 captcha_token，已被安全策略拒绝。请使用统一授权页，或在后续接入 Turnstile 验证组件。";
+    return "这次登录需要先完成安全验证。请刷新页面重试，或改用网页登录入口。";
   }
   return message;
 }

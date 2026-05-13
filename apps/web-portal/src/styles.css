@@ -969,15 +969,11 @@ input[readonly] {
   align-items: center;
   background: #ffffff;
   border: 1px solid #d2dad2;
-  border-radius: 8px 8px 0 0;
+  border-radius: 8px;
   display: grid;
   gap: 14px;
   grid-template-columns: minmax(0, 1fr) auto;
   padding: 18px;
-}
-
-.setup-panel + .op-section {
-  border-radius: 0;
 }
 
 .setup-panel span {
@@ -1019,20 +1015,81 @@ input[readonly] {
   justify-content: flex-end;
 }
 
-.op-section {
+.setup-wizard {
+  gap: 14px;
+}
+
+.wizard-steps {
+  display: grid;
+  gap: 12px;
+}
+
+.wizard-step {
+  align-items: flex-start;
   background: #ffffff;
   border: 1px solid #d2dad2;
+  border-radius: 8px;
   display: grid;
   gap: 14px;
+  grid-template-columns: 40px minmax(0, 1fr);
   padding: 18px;
 }
 
-.op-section:first-child {
-  border-radius: 8px 8px 0 0;
+.wizard-step.current {
+  border-color: #92d8c0;
+  box-shadow: 0 12px 34px rgba(8, 122, 89, 0.08);
 }
 
-.op-section:last-child {
-  border-radius: 0 0 8px 8px;
+.wizard-step.done {
+  background: #f2fbf6;
+  border-color: #b9e4ce;
+}
+
+.step-number {
+  align-items: center;
+  background: #edf2ed;
+  border-radius: 999px;
+  color: #526057;
+  display: inline-flex;
+  font-size: 14px;
+  font-weight: 950;
+  height: 32px;
+  justify-content: center;
+  width: 32px;
+}
+
+.wizard-step.current .step-number,
+.wizard-step.done .step-number {
+  background: #0ca678;
+  color: #06241a;
+}
+
+.wizard-step h3 {
+  font-size: 20px;
+  margin-bottom: 5px;
+}
+
+.wizard-step p {
+  color: #526057;
+  font-size: 14px;
+  font-weight: 760;
+  line-height: 1.5;
+}
+
+.step-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 13px;
+}
+
+.op-section {
+  background: #ffffff;
+  border: 1px solid #d2dad2;
+  border-radius: 8px;
+  display: grid;
+  gap: 14px;
+  padding: 18px;
 }
 
 .support-section summary {
@@ -1252,6 +1309,7 @@ input[readonly] {
   .account-console,
   .pricing-band,
   .setup-panel,
+  .wizard-step,
   .form-grid,
   .auth-grid,
   .skybridge-auth-grid,
@@ -1292,6 +1350,10 @@ input[readonly] {
   .auth-strip {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .setup-actions {
+    justify-content: flex-start;
   }
 
   .auth-pills,
