@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, fs, net::SocketAddr, str::FromStr};
+use std::{collections::HashMap, env, fs, net::SocketAddr, str::FromStr, sync::Arc};
 
 use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
@@ -630,6 +630,7 @@ struct AppState {
     config: AppConfig,
     db: PgPool,
     http_client: reqwest::Client,
+    release_manifest_cache: Arc<tokio::sync::RwLock<Option<CachedReleaseManifest>>>,
 }
 
 impl AppState {
@@ -638,8 +639,15 @@ impl AppState {
             config,
             db,
             http_client: reqwest::Client::new(),
+            release_manifest_cache: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct CachedReleaseManifest {
+    manifest: LocalNodeReleaseManifest,
+    fetched_at: DateTime<Utc>,
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -1984,6 +1992,30 @@ async fn downloads(State(state): State<AppState>) -> Result<Json<DownloadsRespon
 }
 
 async fn fetch_local_node_release_manifest(
+    state: &AppState,
+) -> Result<LocalNodeReleaseManifest, ApiError> {
+    match fetch_remote_local_node_release_manifest(state).await {
+        Ok(manifest) => {
+            *state.release_manifest_cache.write().await = Some(CachedReleaseManifest {
+                manifest: manifest.clone(),
+                fetched_at: Utc::now(),
+            });
+            Ok(manifest)
+        }
+        Err(error) => {
+            if let Some(cached) = state.release_manifest_cache.read().await.clone() {
+                tracing::warn!(
+                    cached_at = %cached.fetched_at,
+                    "using cached local node release manifest after remote fetch failed"
+                );
+                return Ok(cached.manifest);
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn fetch_remote_local_node_release_manifest(
     state: &AppState,
 ) -> Result<LocalNodeReleaseManifest, ApiError> {
     let manifest_url = state.config.download_manifest_url.clone();
