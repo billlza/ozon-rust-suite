@@ -1293,6 +1293,9 @@ async fn inspect_ozon_credentials(state: &LocalState) -> InspectedOzonCredential
             issue: None,
         };
     }
+    if let Some(env_credentials) = inspect_ozon_env_credentials() {
+        return env_credentials;
+    }
     match get_secret_for_status(state, SECRET_OZON_CONFIG).await {
         Ok(Some(bundle)) => {
             let stored: Result<StoredOzonConfig, _> = serde_json::from_str(bundle.expose_secret());
@@ -1393,6 +1396,33 @@ async fn inspect_legacy_ozon_credentials(state: &LocalState) -> InspectedOzonCre
     }
 }
 
+fn inspect_ozon_env_credentials() -> Option<InspectedOzonCredentials> {
+    let client_id =
+        optional_env("OZON_CLIENT_ID").or_else(|| optional_env("OZON_SELLER_CLIENT_ID"));
+    let api_key = optional_env("OZON_API_KEY").or_else(|| optional_env("OZON_SELLER_API_KEY"));
+    match (client_id, api_key) {
+        (Some(client_id), Some(api_key)) => Some(InspectedOzonCredentials {
+            configured: true,
+            source: "env",
+            client_id: Some(redact(&client_id)),
+            api_key_fingerprint: Some(fingerprint_secret(&SecretString::from(api_key))),
+            secret_store_available: true,
+            issue: None,
+        }),
+        (Some(_), None) | (None, Some(_)) => Some(InspectedOzonCredentials {
+            configured: false,
+            source: "env",
+            client_id: None,
+            api_key_fingerprint: None,
+            secret_store_available: true,
+            issue: Some(
+                "OZON_CLIENT_ID/OZON_API_KEY environment credentials are incomplete".to_string(),
+            ),
+        }),
+        (None, None) => None,
+    }
+}
+
 async fn load_ozon_credentials(state: &LocalState) -> Result<OzonCredentials, ApiError> {
     if !state.config.use_real_ozon {
         return Ok(debug_mock_ozon_credentials());
@@ -1403,6 +1433,10 @@ async fn load_ozon_credentials(state: &LocalState) -> Result<OzonCredentials, Ap
             client_id: stored.client_id,
             api_key: SecretString::from(stored.api_key),
         });
+    }
+
+    if let Some(credentials) = load_ozon_env_credentials()? {
+        return Ok(credentials);
     }
 
     if let Some(bundle) = state
@@ -1441,6 +1475,22 @@ async fn load_ozon_credentials(state: &LocalState) -> Result<OzonCredentials, Ap
     })
 }
 
+fn load_ozon_env_credentials() -> Result<Option<OzonCredentials>, ApiError> {
+    let client_id =
+        optional_env("OZON_CLIENT_ID").or_else(|| optional_env("OZON_SELLER_CLIENT_ID"));
+    let api_key = optional_env("OZON_API_KEY").or_else(|| optional_env("OZON_SELLER_API_KEY"));
+    match (client_id, api_key) {
+        (Some(client_id), Some(api_key)) => Ok(Some(OzonCredentials {
+            client_id,
+            api_key: SecretString::from(api_key),
+        })),
+        (Some(_), None) | (None, Some(_)) => Err(ApiError::bad_request(
+            "OZON_CLIENT_ID/OZON_API_KEY environment credentials are incomplete",
+        )),
+        (None, None) => Ok(None),
+    }
+}
+
 async fn load_or_create_device_fingerprint(state: &LocalState) -> Result<String, ApiError> {
     if let Some(existing) = state
         .secrets
@@ -1477,6 +1527,16 @@ async fn inspect_openai_config(state: &LocalState) -> OpenAiCredentialStatus {
             issue: None,
         };
     }
+    if let Ok(env_config) = load_openai_env_config() {
+        return OpenAiCredentialStatus {
+            configured: true,
+            source: "env",
+            base_url: env_config.base_url,
+            image_model: env_config.image_model,
+            api_key_fingerprint: Some(fingerprint_secret(&SecretString::from(env_config.api_key))),
+            issue: None,
+        };
+    }
     match get_secret_for_status(state, SECRET_OPENAI_CONFIG).await {
         Ok(Some(bundle)) => {
             match serde_json::from_str::<StoredOpenAiConfig>(bundle.expose_secret()) {
@@ -1500,29 +1560,33 @@ async fn inspect_openai_config(state: &LocalState) -> OpenAiCredentialStatus {
                 },
             }
         }
-        Ok(None) => {
-            let api_key = env::var("OPENAI_API_KEY").ok();
-            OpenAiCredentialStatus {
-                configured: api_key.is_some(),
-                source: if api_key.is_some() { "env" } else { "missing" },
-                base_url: state.config.openai_base_url.clone(),
-                image_model: state.config.openai_image_model.clone(),
-                api_key_fingerprint: api_key
-                    .map(|value| fingerprint_secret(&SecretString::from(value))),
-                issue: if env::var("OPENAI_API_KEY").is_ok() {
-                    None
-                } else {
-                    Some("OpenAI API key is not configured".to_string())
-                },
-            }
-        }
-        Err(_) => OpenAiCredentialStatus {
+        Ok(None) => OpenAiCredentialStatus {
             configured: false,
-            source: "unavailable",
+            source: "missing",
             base_url: state.config.openai_base_url.clone(),
             image_model: state.config.openai_image_model.clone(),
             api_key_fingerprint: None,
-            issue: Some("secret store unavailable".to_string()),
+            issue: Some("OpenAI API key is not configured".to_string()),
+        },
+        Err(_) => match load_openai_env_config() {
+            Ok(env_config) => OpenAiCredentialStatus {
+                configured: true,
+                source: "env",
+                base_url: env_config.base_url,
+                image_model: env_config.image_model,
+                api_key_fingerprint: Some(fingerprint_secret(&SecretString::from(
+                    env_config.api_key,
+                ))),
+                issue: None,
+            },
+            Err(_) => OpenAiCredentialStatus {
+                configured: false,
+                source: "unavailable",
+                base_url: state.config.openai_base_url.clone(),
+                image_model: state.config.openai_image_model.clone(),
+                api_key_fingerprint: None,
+                issue: Some("secret store unavailable".to_string()),
+            },
         },
     }
 }
@@ -1530,6 +1594,10 @@ async fn inspect_openai_config(state: &LocalState) -> OpenAiCredentialStatus {
 async fn load_openai_config(state: &LocalState) -> Result<StoredOpenAiConfig, ApiError> {
     if let Some(stored) = state.openai_config_cache.read().await.clone() {
         return Ok(stored);
+    }
+
+    if let Ok(env_config) = load_openai_env_config() {
+        return Ok(env_config);
     }
 
     if let Some(bundle) = state
@@ -1550,6 +1618,23 @@ async fn load_openai_config(state: &LocalState) -> Result<StoredOpenAiConfig, Ap
         api_key,
         base_url: normalize_openai_base_url(&state.config.openai_base_url)?,
         image_model: state.config.openai_image_model.clone(),
+    })
+}
+
+fn load_openai_env_config() -> Result<StoredOpenAiConfig, ApiError> {
+    let api_key = optional_env("OPENAI_API_KEY").ok_or_else(|| {
+        ApiError::bad_request("OpenAI API key is not configured for poster generation")
+    })?;
+    Ok(StoredOpenAiConfig {
+        api_key,
+        base_url: normalize_openai_base_url(
+            optional_env("OPENAI_BASE_URL")
+                .or_else(|| optional_env("OPENAI_API_BASE_URL"))
+                .as_deref()
+                .unwrap_or(DEFAULT_OPENAI_BASE_URL),
+        )?,
+        image_model: optional_env("OPENAI_IMAGE_MODEL")
+            .unwrap_or_else(|| DEFAULT_OPENAI_IMAGE_MODEL.to_string()),
     })
 }
 
@@ -1834,7 +1919,7 @@ async fn generate_poster_background(
             .unwrap_or_else(|_| "unknown error".to_string());
         return Err(ApiError::bad_gateway(format!(
             "OpenAI image generation failed: {}",
-            body.trim()
+            summarize_openai_error(&body)
         )));
     }
     let payload: OpenAiImageGenerationResponse = response.json().await.map_err(|error| {
@@ -1857,6 +1942,28 @@ async fn generate_poster_background(
         revised_prompt: image.revised_prompt,
         background_data_url: format!("data:image/png;base64,{}", BASE64_STANDARD.encode(bytes)),
     })
+}
+
+fn summarize_openai_error(body: &str) -> String {
+    if let Ok(envelope) = serde_json::from_str::<OpenAiErrorEnvelope>(body) {
+        let message = envelope
+            .error
+            .message
+            .unwrap_or_else(|| "upstream returned an error without a message".to_string());
+        if envelope.error.code.as_deref() == Some("model_not_found") {
+            return format!(
+                "image model is not available on this relay key: {message}. Change the Image model to one enabled by the relay, or use a key with an image generation channel."
+            );
+        }
+        if let Some(code) = envelope.error.code {
+            return format!("{code}: {message}");
+        }
+        if let Some(error_type) = envelope.error.error_type {
+            return format!("{error_type}: {message}");
+        }
+        return message;
+    }
+    truncate_text(body.trim(), 600)
 }
 
 fn preferred_headline(product: &ozon_connector::OzonProductDetail) -> String {
@@ -2420,6 +2527,19 @@ struct OpenAiImageGenerationResponse {
 struct OpenAiImageData {
     b64_json: Option<String>,
     revised_prompt: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiErrorEnvelope {
+    error: OpenAiErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiErrorBody {
+    code: Option<String>,
+    message: Option<String>,
+    #[serde(rename = "type")]
+    error_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
