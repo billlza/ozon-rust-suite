@@ -29,7 +29,9 @@ services:
       OZON_SUITE_JWT_SECRET: ${OZON_SUITE_JWT_SECRET:?set-a-long-jwt-secret}
       OZON_SUITE_ADMIN_TOKEN: ${OZON_SUITE_ADMIN_TOKEN:?set-admin-token}
       OZON_SUITE_SKYBRIDGE_API_BASE_URL: ${OZON_SUITE_SKYBRIDGE_API_BASE_URL:?set-skybridge-api-base-url}
-      OZON_SUITE_PORTAL_DOWNLOAD_URL: ${OZON_SUITE_PORTAL_DOWNLOAD_URL:?set-portal-download-url}
+      OZON_SUITE_LOCAL_NODE_RELEASE_MANIFEST_URL: ${OZON_SUITE_LOCAL_NODE_RELEASE_MANIFEST_URL:?set-local-node-release-manifest-url}
+      OZON_SUITE_OPENCLAW_PLUGIN_URL: ${OZON_SUITE_OPENCLAW_PLUGIN_URL:?set-openclaw-plugin-url}
+      OZON_SUITE_OPENCLAW_MANIFEST_URL: ${OZON_SUITE_OPENCLAW_MANIFEST_URL:?set-openclaw-manifest-url}
       OZON_SUITE_ALLOW_LOCAL_NEBULA_REGISTRATION: "false"
     depends_on:
       postgres:

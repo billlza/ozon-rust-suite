@@ -2695,6 +2695,10 @@ mod tests {
             openai_image_model: DEFAULT_OPENAI_IMAGE_MODEL.to_string(),
             default_ecommerce_interval_secs: 900,
             default_ecommerce_limit: 20,
+            lease_public_key_pem: None,
+            lease_issuer: "ozon66-cloud".to_string(),
+            lease_audience: "ozon-rust-local-node".to_string(),
+            allow_unsigned_lease: true,
         }
     }
 

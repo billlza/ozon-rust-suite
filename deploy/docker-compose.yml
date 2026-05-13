@@ -8,7 +8,9 @@ services:
       DATABASE_URL: postgres://ozon:${POSTGRES_PASSWORD:?set-postgres-password}@postgres:5432/ozon_rust_suite
       OZON_SUITE_JWT_SECRET: ${OZON_SUITE_JWT_SECRET:?set-a-long-secret}
       OZON_SUITE_ADMIN_TOKEN: ${OZON_SUITE_ADMIN_TOKEN:?set-admin-token}
-      OZON_SUITE_PORTAL_DOWNLOAD_URL: ${OZON_SUITE_PORTAL_DOWNLOAD_URL:-https://downloads.example.com/ozon-local-node.msi}
+      OZON_SUITE_LOCAL_NODE_RELEASE_MANIFEST_URL: ${OZON_SUITE_LOCAL_NODE_RELEASE_MANIFEST_URL:-https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/release-manifest.json}
+      OZON_SUITE_OPENCLAW_PLUGIN_URL: ${OZON_SUITE_OPENCLAW_PLUGIN_URL:-https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/openclaw-plugin.zip}
+      OZON_SUITE_OPENCLAW_MANIFEST_URL: ${OZON_SUITE_OPENCLAW_MANIFEST_URL:-https://ozon66.com/openclaw/manifest.json}
     depends_on:
       postgres:
         condition: service_healthy
