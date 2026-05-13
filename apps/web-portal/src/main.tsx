@@ -60,10 +60,6 @@ const NEBULA_OAUTH_CONFIGURED = Boolean(NEBULA_OAUTH_BASE && NEBULA_CLIENT_ID);
 const SKYBRIDGE_TURNSTILE_SITE_KEY = (import.meta.env.VITE_TURNSTILE_SITE_KEY ?? "").trim();
 const SKYBRIDGE_TURNSTILE_CONFIGURED = Boolean(SKYBRIDGE_TURNSTILE_SITE_KEY);
 const REQUEST_TIMEOUT_MS = 15_000;
-const DEFAULT_LOCAL_NODE_MSI_URL =
-  "https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/OzonRustLocal-x64.msi";
-const DEFAULT_LOCAL_NODE_EXE_URL =
-  "https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/OzonRustLocalSetup-x64.exe";
 
 type User = {
   id: string;
@@ -133,12 +129,28 @@ type Lease = {
   expires_at: string;
 };
 
+type ReleaseArtifact = {
+  url: string;
+  sha256: string;
+};
+
+type LocalNodeReleaseManifest = {
+  version: string;
+  commit: string;
+  msi: ReleaseArtifact;
+  exe: ReleaseArtifact;
+};
+
 type Downloads = {
-  local_node: string;
+  release_manifest_url: string;
+  release_manifest: LocalNodeReleaseManifest;
+  local_node?: string;
   local_node_msi?: string;
   local_node_exe?: string;
+  local_node_msi_sha256?: string;
+  local_node_exe_sha256?: string;
   version?: string;
-  checksum: string;
+  checksum?: string;
   checksum_sha256?: string;
   openclaw_plugin?: string;
   openclaw_manifest?: string;
@@ -150,13 +162,17 @@ type Session = {
   user: User;
 };
 
-type LocalNodePhase = "idle" | "checking" | "online" | "offline" | "blocked";
+type LocalNodePhase = "idle" | "checking" | "online" | "degraded" | "offline" | "blocked";
 
 type LocalNodeHealth = {
   service: string;
   status: string;
   skill_port: number;
   agent_port: number;
+  protocol_version?: string;
+  build_commit?: string;
+  package_version?: string;
+  supervisor?: string;
   features: string[];
   real_ozon_enabled: boolean;
 };
@@ -186,6 +202,9 @@ type LocalPortalStatus = {
   agent_api: string;
   manifest_url: string;
   bridge_auth_header: string;
+  protocol_version?: string;
+  build_commit?: string;
+  package_version?: string;
   real_ozon_enabled: boolean;
   device_fingerprint: string;
   lease: {
@@ -344,8 +363,14 @@ function App() {
   const directAuthNeedsTurnstile = SKYBRIDGE_TURNSTILE_CONFIGURED && !turnstileToken;
   const authDialogOpen = authDialogMode !== null;
   const localPairingStatus = localNodePairingStatus(localNode, activeEntitlement, device, lease);
-  const localNodeMsiUrl = downloads?.local_node_msi ?? downloads?.local_node ?? DEFAULT_LOCAL_NODE_MSI_URL;
-  const localNodeExeUrl = downloads?.local_node_exe ?? DEFAULT_LOCAL_NODE_EXE_URL;
+  const releaseManifest = downloads?.release_manifest;
+  const localNodeMsiUrl = releaseManifest?.msi.url ?? "";
+  const localNodeExeUrl = releaseManifest?.exe.url ?? "";
+  const releaseVersion = releaseManifest?.version ?? "待同步";
+  const releaseCommit = releaseManifest?.commit ? shortCommit(releaseManifest.commit) : "待同步";
+  const releaseChecksum = releaseManifest
+    ? `MSI ${shortSha256(releaseManifest.msi.sha256)} / EXE ${shortSha256(releaseManifest.exe.sha256)}`
+    : "等待 release-manifest.json";
   const openclawPluginUrl = downloads?.openclaw_plugin ? absolutePortalUrl(downloads.openclaw_plugin) : "";
   const localManifestUrl = localNode.portal?.manifest_url ?? `${LOCAL_NODE_API}/openclaw/manifest`;
   const canOpenLocalConsole = Boolean(LOCAL_CONSOLE_URL);
@@ -925,26 +950,32 @@ function App() {
       message: "正在检测本机 127.0.0.1:8790 节点"
     });
     try {
-      const [health, manifest, portal] = await Promise.all([
-        localNodeJson<LocalNodeHealth>("/health"),
-        localNodeJson<LocalNodeManifest>("/openclaw/manifest"),
-        localNodeJson<LocalPortalStatus>("/portal/status").catch(() => null)
-      ]);
+      const health = await localNodeJson<LocalNodeHealth>("/health").catch((error) => {
+        throw new Error(`health: ${errorMessage(error)}`);
+      });
+      const manifest = await localNodeJson<LocalNodeManifest>("/openclaw/manifest").catch((error) => {
+        throw new Error(`manifest: ${errorMessage(error)}`);
+      });
+      const portalResult = await localNodeJson<LocalPortalStatus>("/portal/status")
+        .then((portal) => ({ ok: true as const, portal }))
+        .catch((error) => ({ ok: false as const, error }));
+      const portal = portalResult.ok ? portalResult.portal : null;
       if (portal?.device_fingerprint) {
         setDeviceFingerprint(portal.device_fingerprint);
       }
       setLocalNode({
         phase: "online",
-        message: health.real_ozon_enabled ? "本机节点在线，当前是真实 Ozon API 模式" : "本机节点在线，当前使用开发连接器",
+        message: localNodeOnlineMessage(health, portalResult.ok ? null : portalResult.error),
         checkedAt: new Date().toISOString(),
         health,
         manifest,
         portal: portal ?? undefined
       });
     } catch (error) {
+      const endpoint = localNodeFailedEndpoint(error);
       setLocalNode({
-        phase: isLocalNodeBrowserBlock(error) ? "blocked" : "offline",
-        message: localNodeFailureMessage(error),
+        phase: endpoint === "manifest" ? "degraded" : isLocalNodeBrowserBlock(error) ? "blocked" : "offline",
+        message: localNodeFailureMessage(error, endpoint),
         checkedAt: new Date().toISOString()
       });
     }
@@ -967,7 +998,7 @@ function App() {
           if (!cancelled) setDownloads(downloadData);
         })
         .catch(() => {
-          // Download links have stable release fallbacks; keep the account flow usable.
+          // /downloads is the single package source; keep account flow usable when it is unavailable.
         });
       const handledCallback = await completeNebulaOAuthCallback();
       if (cancelled || handledCallback) return;
@@ -1401,12 +1432,20 @@ function App() {
                 )}
                 {localNode.phase !== "online" && (
                   <>
-                    <a className="download" href={localNodeMsiUrl}>
-                      <Download size={18} /> 下载 MSI
-                    </a>
-                    <a className="download secondary" href={localNodeExeUrl}>
-                      <Download size={18} /> 下载 EXE
-                    </a>
+                    {localNodeMsiUrl ? (
+                      <a className="download" href={localNodeMsiUrl}>
+                        <Download size={18} /> 下载 MSI
+                      </a>
+                    ) : (
+                      <button className="secondary" disabled>
+                        <Download size={18} /> 安装包待同步
+                      </button>
+                    )}
+                    {localNodeExeUrl && (
+                      <a className="download secondary" href={localNodeExeUrl}>
+                        <Download size={18} /> 下载 EXE
+                      </a>
+                    )}
                     <button className="secondary" disabled={localNode.phase === "checking"} onClick={probeLocalNode}>
                       <RefreshCcw size={18} /> 检测本机节点
                     </button>
@@ -1553,15 +1592,25 @@ function App() {
                   <p>{localPairingStatus.message}</p>
                 </div>
                 <div className="local-node-card">
-                  <span>OpenClaw manifest</span>
-                  <strong>{localNode.manifest?.version ?? downloads?.version ?? "待检测"}</strong>
-                  <p>{localManifestUrl}</p>
+                  <span>安装包 manifest</span>
+                  <strong>{releaseVersion}</strong>
+                  <p>{downloads?.release_manifest_url ?? "等待 cloud /downloads 同步"}</p>
+                </div>
+                <div className="local-node-card">
+                  <span>Release commit</span>
+                  <strong>{releaseCommit}</strong>
+                  <p>{releaseChecksum}</p>
                 </div>
               </div>
               <div className="command-row">
                 <button disabled={localNode.phase === "checking"} onClick={probeLocalNode}>
                   <RefreshCcw size={18} /> 检测本机节点
                 </button>
+                {!localNodeMsiUrl && !localNodeExeUrl && (
+                  <button className="secondary" disabled>
+                    <Download size={18} /> 安装包待同步
+                  </button>
+                )}
                 {localNodeMsiUrl && (
                   <a className="download" href={localNodeMsiUrl}>
                     <Download size={18} /> MSI 安装包
@@ -1960,10 +2009,40 @@ async function localNodePost<T>(path: string, body: unknown): Promise<T> {
   return parseResponse<T>(response);
 }
 
-function localNodeFailureMessage(error: unknown) {
+function localNodeOnlineMessage(health: LocalNodeHealth, portalError: unknown | null) {
+  const mode = health.real_ozon_enabled ? "真实 Ozon API 模式" : "开发连接器";
+  const version = health.package_version ? ` v${health.package_version}` : "";
+  const protocol = health.protocol_version ? `，协议 ${health.protocol_version}` : "";
+  if (portalError) {
+    return `本机节点${version}已响应 /health 和 manifest，当前是${mode}${protocol}；但 /portal/status 失败：${errorMessage(portalError)}`;
+  }
+  return `本机节点${version}在线，当前是${mode}${protocol}`;
+}
+
+function localNodeFailedEndpoint(error: unknown) {
   const message = errorMessage(error);
+  if (message.startsWith("health:")) return "health";
+  if (message.startsWith("manifest:")) return "manifest";
+  return null;
+}
+
+function stripLocalNodeEndpointPrefix(message: string) {
+  return message.replace(/^(health|manifest):\s*/i, "");
+}
+
+function localNodeFailureMessage(error: unknown, endpoint: string | null = localNodeFailedEndpoint(error)) {
+  const message = stripLocalNodeEndpointPrefix(errorMessage(error));
+  if (endpoint === "health") {
+    if (isLocalNodeBrowserBlock(error)) {
+      return "浏览器没拿到 /health 响应。请先打开 Ozon Rust Local；如果已经打开，多半是旧安装包缺少 ozon66.com 本地网络预检允许，直接安装最新版。";
+    }
+    return `本机 /health 检测失败：${message}`;
+  }
+  if (endpoint === "manifest") {
+    return `本机节点已启动，但 /openclaw/manifest 读取失败：${message}。请重启或安装最新版 Ozon Rust Local。`;
+  }
   if (isLocalNodeBrowserBlock(error)) {
-    return "浏览器没拿到本机节点响应。请安装/启动新版本地节点；旧版本可能缺少 ozon66.com 的本地网络预检允许。";
+    return "浏览器没拿到本机节点响应。请打开 Ozon Rust Local；如果还是不行，安装最新版后再点检测。";
   }
   return `未检测到本机节点：${message}`;
 }
@@ -1979,6 +2058,8 @@ function localNodeStatusLabel(phase: LocalNodePhase) {
       return "checking";
     case "online":
       return "online";
+    case "degraded":
+      return "degraded";
     case "blocked":
       return "blocked";
     case "offline":
@@ -2084,6 +2165,14 @@ function setupStatusModel(input: {
 
 function absolutePortalUrl(pathOrUrl: string) {
   return new URL(pathOrUrl, window.location.origin).toString();
+}
+
+function shortCommit(commit: string) {
+  return commit.length > 12 ? commit.slice(0, 12) : commit;
+}
+
+function shortSha256(hash: string) {
+  return hash.length > 12 ? `${hash.slice(0, 12)}...` : hash;
 }
 
 function defaultCloudApiBase() {

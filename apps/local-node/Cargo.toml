@@ -17,9 +17,11 @@ ozon-domain = { path = "../../crates/domain" }
 ozon-secret-store = { path = "../../crates/secret-store" }
 ozon-task-engine = { path = "../../crates/task-engine" }
 reqwest.workspace = true
+rsa = { version = "0.9.10", features = ["sha2", "pem"] }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true

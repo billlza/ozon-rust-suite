@@ -28,12 +28,8 @@ services:
         generateValue: true
       - key: OZON_SUITE_SKYBRIDGE_API_BASE_URL
         value: https://hloqytmhjludmuhwyyzb.supabase.co/functions/v1
-      - key: OZON_SUITE_PORTAL_DOWNLOAD_URL
-        value: https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/OzonRustLocal-x64.msi
-      - key: OZON_SUITE_PORTAL_DOWNLOAD_MSI_URL
-        value: https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/OzonRustLocal-x64.msi
-      - key: OZON_SUITE_PORTAL_DOWNLOAD_EXE_URL
-        value: https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/OzonRustLocalSetup-x64.exe
+      - key: OZON_SUITE_LOCAL_NODE_RELEASE_MANIFEST_URL
+        value: https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/release-manifest.json
       - key: OZON_SUITE_OPENCLAW_PLUGIN_URL
         value: https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/openclaw-plugin.zip
       - key: OZON_SUITE_OPENCLAW_MANIFEST_URL
@@ -82,6 +78,14 @@ services:
         value: "365"
       - key: OZON_SUITE_TEST_FULL_ACCESS_MAX_DEVICES
         value: "10"
+      - key: OZON_SUITE_LEASE_SIGNING_PRIVATE_KEY_PEM
+        sync: false
+      - key: OZON_SUITE_LEASE_SIGNING_KEY_ID
+        value: ozon66-local-node-v1
+      - key: OZON_SUITE_LEASE_ISSUER
+        value: ozon66-cloud
+      - key: OZON_SUITE_LEASE_AUDIENCE
+        value: ozon-rust-local-node
       - key: RUST_LOG
         value: ozon_cloud_api=info,tower_http=info,axum=info
 

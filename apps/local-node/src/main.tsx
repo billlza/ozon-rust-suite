@@ -34,11 +34,21 @@ type RuntimeConfig = {
   openclaw_token: string;
   connector_mode: "mock" | "real" | string;
   sidecar_pid: number | null;
+  sidecar_status: "starting" | "running" | "restarting" | "stopped" | "failed" | string;
+  sidecar_restart_count: number;
+  sidecar_last_started_at_ms: number | null;
+  sidecar_last_exit: string | null;
+  sidecar_last_error: string | null;
+  sidecar_log_path: string;
 };
 
 type Health = {
   service: string;
   status: string;
+  protocol_version?: string;
+  build_commit?: string;
+  package_version?: string;
+  supervisor?: string;
   features: string[];
   real_ozon_enabled: boolean;
 };
@@ -674,16 +684,42 @@ function App() {
     setMessage("OpenClaw bridge token 已复制");
   }
 
+  async function restartSidecar() {
+    setMessage("正在重启本地节点");
+    try {
+      const nextRuntime = await restartRuntimeConfig();
+      setRuntime(nextRuntime);
+      setRuntimeReady(true);
+      setEventState("connecting");
+      setMessage("本地节点已请求重启，正在重新检测");
+      window.setTimeout(() => {
+        checkHealth();
+      }, 1200);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "当前环境不支持重启本地节点");
+    }
+  }
+
   useEffect(() => {
     let cancelled = false;
-    loadRuntimeConfig().then((nextRuntime) => {
-      if (!cancelled) {
-        setRuntime(nextRuntime);
+    async function syncRuntime(markReady = false) {
+      const nextRuntime = await loadRuntimeConfig();
+      if (cancelled) {
+        return;
+      }
+      setRuntime(nextRuntime);
+      if (markReady) {
         setRuntimeReady(true);
       }
-    });
+    }
+
+    syncRuntime(true);
+    const interval = window.setInterval(() => {
+      syncRuntime();
+    }, 3000);
     return () => {
       cancelled = true;
+      window.clearInterval(interval);
     };
   }, []);
 
@@ -763,15 +799,40 @@ function App() {
           <span>Ozon mode</span>
           <strong>{configStatus?.connector_mode === "real" ? "real API" : (configStatus?.connector_mode ?? runtime.connector_mode)}</strong>
         </div>
-        <div>
+        <div className="overview-sidecar">
           <TerminalSquare />
           <span>Sidecar</span>
-          <strong>{runtime.sidecar_pid ? `pid ${runtime.sidecar_pid}` : "external"}</strong>
+          <strong>{sidecarSummary(runtime)}</strong>
+          <button className="mini-action" onClick={restartSidecar} title="重启本地节点">
+            <RefreshCcw size={15} />
+          </button>
         </div>
         <div>
           <Repeat2 />
           <span>Read schedule</span>
           <strong>{schedule?.enabled ? "enabled" : "paused"}</strong>
+        </div>
+      </section>
+
+      <section className={`runtime-strip ${runtime.sidecar_status === "running" ? "runtime-ok" : "runtime-warn"}`}>
+        <div>
+          <strong>{sidecarStatusLabel(runtime)}</strong>
+          <span>{sidecarDiagnostic(runtime)}</span>
+        </div>
+        <button className="secondary-button" onClick={restartSidecar}>
+          <RefreshCcw size={16} />
+          重启节点
+        </button>
+      </section>
+
+      <section className="runtime-strip runtime-ok">
+        <div>
+          <strong>节点协议 {health?.protocol_version ?? "等待 /health"}</strong>
+          <span>
+            {health
+              ? `版本 ${health.package_version ?? "unknown"} / ${shortCommit(health.build_commit)} / ${health.supervisor ?? "unknown supervisor"}`
+              : "检测通过后这里会显示协议、构建和 supervisor 信息。"}
+          </span>
         </div>
       </section>
 
@@ -1316,7 +1377,13 @@ function defaultRuntimeConfig(): RuntimeConfig {
     local_token: DEFAULT_LOCAL_TOKEN,
     openclaw_token: DEFAULT_OPENCLAW_TOKEN,
     connector_mode: import.meta.env.DEV ? "mock" : "real",
-    sidecar_pid: null
+    sidecar_pid: null,
+    sidecar_status: "external",
+    sidecar_restart_count: 0,
+    sidecar_last_started_at_ms: null,
+    sidecar_last_exit: null,
+    sidecar_last_error: null,
+    sidecar_log_path: "not available outside the desktop app"
   };
 }
 
@@ -1327,6 +1394,56 @@ async function loadRuntimeConfig(): Promise<RuntimeConfig> {
   } catch {
     return defaultRuntimeConfig();
   }
+}
+
+async function restartRuntimeConfig(): Promise<RuntimeConfig> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return await invoke<RuntimeConfig>("restart_local_node");
+}
+
+function sidecarSummary(runtime: RuntimeConfig) {
+  if (runtime.sidecar_status === "running" && runtime.sidecar_pid) {
+    return `pid ${runtime.sidecar_pid}`;
+  }
+  return runtime.sidecar_status || "external";
+}
+
+function sidecarStatusLabel(runtime: RuntimeConfig) {
+  if (runtime.sidecar_status === "running") {
+    return runtime.sidecar_restart_count > 0
+      ? `本地节点运行中，已自恢复 ${runtime.sidecar_restart_count} 次`
+      : "本地节点运行中";
+  }
+  if (runtime.sidecar_status === "failed") {
+    return "本地节点启动失败";
+  }
+  if (runtime.sidecar_status === "restarting") {
+    return "本地节点正在重启";
+  }
+  return "本地节点未确认运行";
+}
+
+function sidecarDiagnostic(runtime: RuntimeConfig) {
+  if (runtime.sidecar_last_error) {
+    return `${runtime.sidecar_last_error} · log ${runtime.sidecar_log_path}`;
+  }
+  if (runtime.sidecar_last_exit) {
+    return `${runtime.sidecar_last_exit} · log ${runtime.sidecar_log_path}`;
+  }
+  if (runtime.sidecar_status === "running" && runtime.sidecar_pid) {
+    const started = runtime.sidecar_last_started_at_ms
+      ? new Date(runtime.sidecar_last_started_at_ms).toLocaleString()
+      : "刚刚";
+    return `监听 127.0.0.1:8790 / 17870，启动时间 ${started}，日志 ${runtime.sidecar_log_path}`;
+  }
+  return "桌面端会托管 local-node；若端口被占用或 sidecar 缺失，这里会显示具体错误。";
+}
+
+function shortCommit(value?: string) {
+  if (!value || value === "local-build") {
+    return value ?? "unknown";
+  }
+  return value.slice(0, 8);
 }
 
 function maskSecret(value: string) {

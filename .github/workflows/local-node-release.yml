@@ -14,12 +14,16 @@ on:
 permissions:
   contents: write
 
+env:
+  DOWNLOADS_REPOSITORY: ${{ vars.OZON_DOWNLOADS_REPOSITORY || 'billlza/ozon-rust-suite-downloads' }}
+
 jobs:
   windows-installers:
     name: Build Windows MSI and EXE
     runs-on: windows-latest
     env:
       CARGO_TERM_COLOR: always
+      OZON_SUITE_LEASE_PUBLIC_KEY_PEM: ${{ vars.OZON_SUITE_LEASE_PUBLIC_KEY_PEM || secrets.OZON_SUITE_LEASE_PUBLIC_KEY_PEM }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,7 +53,13 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build local-node sidecar
+        if: ${{ env.OZON_SUITE_LEASE_PUBLIC_KEY_PEM != '' }}
         run: cargo build -p ozon-local-node --release --target x86_64-pc-windows-msvc
+
+      - name: Require lease public key
+        if: ${{ env.OZON_SUITE_LEASE_PUBLIC_KEY_PEM == '' }}
+        shell: pwsh
+        run: throw "Set repository variable or secret OZON_SUITE_LEASE_PUBLIC_KEY_PEM before releasing local-node. The installer must embed the public key used to verify cloud leases."
 
       - name: Stage sidecar for Tauri
         shell: pwsh
@@ -68,6 +78,8 @@ jobs:
           if (-not $version) {
             $version = "${{ github.ref_name }}".Replace("local-node-v", "")
           }
+          $tagName = "local-node-v$version"
+          $releaseBaseUrl = "https://github.com/${{ env.DOWNLOADS_REPOSITORY }}/releases/download/$tagName"
           New-Item -ItemType Directory -Force dist/release | Out-Null
           $msi = Get-ChildItem -Path target,apps/local-node/src-tauri/target -Recurse -Filter *.msi | Select-Object -First 1
           $exe = Get-ChildItem -Path target,apps/local-node/src-tauri/target -Recurse -Filter *.exe |
@@ -79,12 +91,23 @@ jobs:
           Copy-Item $exe.FullName dist/release/OzonRustLocalSetup-x64.exe
           Copy-Item $msi.FullName "dist/release/OzonRustLocal-$version-x64.msi"
           Copy-Item $exe.FullName "dist/release/OzonRustLocalSetup-$version-x64.exe"
-          Get-FileHash dist/release/OzonRustLocal-x64.msi -Algorithm SHA256 |
-            ForEach-Object { "$($_.Hash.ToLowerInvariant())  OzonRustLocal-x64.msi" } |
-            Set-Content dist/release/SHA256SUMS.txt
-          Get-FileHash dist/release/OzonRustLocalSetup-x64.exe -Algorithm SHA256 |
-            ForEach-Object { "$($_.Hash.ToLowerInvariant())  OzonRustLocalSetup-x64.exe" } |
-            Add-Content dist/release/SHA256SUMS.txt
+          $msiHash = (Get-FileHash dist/release/OzonRustLocal-x64.msi -Algorithm SHA256).Hash.ToLowerInvariant()
+          $exeHash = (Get-FileHash dist/release/OzonRustLocalSetup-x64.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$msiHash  OzonRustLocal-x64.msi" | Set-Content dist/release/SHA256SUMS.txt
+          "$exeHash  OzonRustLocalSetup-x64.exe" | Add-Content dist/release/SHA256SUMS.txt
+          $manifest = [ordered]@{
+            version = $version
+            commit = "${{ github.sha }}"
+            msi = [ordered]@{
+              url = "$releaseBaseUrl/OzonRustLocal-x64.msi"
+              sha256 = $msiHash
+            }
+            exe = [ordered]@{
+              url = "$releaseBaseUrl/OzonRustLocalSetup-x64.exe"
+              sha256 = $exeHash
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content dist/release/release-manifest.json
 
       - name: Upload Windows installers
         uses: actions/upload-artifact@v4
@@ -96,6 +119,8 @@ jobs:
       - name: Publish Windows installers
         uses: softprops/action-gh-release@v2
         with:
+          repository: ${{ env.DOWNLOADS_REPOSITORY }}
+          token: ${{ secrets.OZON_DOWNLOADS_REPO_TOKEN || github.token }}
           tag_name: ${{ github.event_name == 'workflow_dispatch' && format('local-node-v{0}', github.event.inputs.version) || github.ref_name }}
           name: Ozon Rust Local ${{ github.event.inputs.version || github.ref_name }}
           make_latest: true
@@ -137,6 +162,8 @@ jobs:
       - name: Publish OpenClaw plugin
         uses: softprops/action-gh-release@v2
         with:
+          repository: ${{ env.DOWNLOADS_REPOSITORY }}
+          token: ${{ secrets.OZON_DOWNLOADS_REPO_TOKEN || github.token }}
           tag_name: ${{ github.event_name == 'workflow_dispatch' && format('local-node-v{0}', github.event.inputs.version) || github.ref_name }}
           name: Ozon Rust Local ${{ github.event.inputs.version || github.ref_name }}
           make_latest: true

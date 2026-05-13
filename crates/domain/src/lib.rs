@@ -256,6 +256,29 @@ pub struct EntitlementLease {
     pub features: Vec<Feature>,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<EntitlementLeaseSignature>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EntitlementLeaseSignature {
+    pub alg: String,
+    pub kid: String,
+    pub issuer: String,
+    pub audience: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EntitlementLeaseClaims {
+    pub lease_id: Uuid,
+    pub tenant_id: TenantId,
+    pub user_id: UserId,
+    pub device_id: DeviceId,
+    pub entitlement_id: EntitlementId,
+    pub features: Vec<Feature>,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
 }
 
 impl EntitlementLease {
@@ -276,6 +299,20 @@ impl EntitlementLease {
             features: entitlement.features.clone(),
             issued_at,
             expires_at: requested_expiry.min(entitlement.expires_at),
+            signature: None,
+        }
+    }
+
+    pub fn claims(&self) -> EntitlementLeaseClaims {
+        EntitlementLeaseClaims {
+            lease_id: self.lease_id,
+            tenant_id: self.tenant_id,
+            user_id: self.user_id,
+            device_id: self.device_id,
+            entitlement_id: self.entitlement_id,
+            features: self.features.clone(),
+            issued_at: self.issued_at,
+            expires_at: self.expires_at,
         }
     }
 }

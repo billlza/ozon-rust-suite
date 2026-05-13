@@ -126,6 +126,16 @@ pub trait OzonReadConnector: Send + Sync {
         limit: u16,
         last_id: Option<String>,
     ) -> Result<OzonProductListPage, OzonConnectorError>;
+    async fn product_list_page_with_visibility(
+        &self,
+        credentials: &OzonCredentials,
+        limit: u16,
+        last_id: Option<String>,
+        visibility: Option<String>,
+    ) -> Result<OzonProductListPage, OzonConnectorError> {
+        let _ = visibility;
+        self.product_list_page(credentials, limit, last_id).await
+    }
     async fn product_get(
         &self,
         credentials: &OzonCredentials,
@@ -213,6 +223,17 @@ impl OzonReadConnector for OzonHttpClient {
         limit: u16,
         last_id: Option<String>,
     ) -> Result<OzonProductListPage, OzonConnectorError> {
+        self.product_list_page_with_visibility(credentials, limit, last_id, None)
+            .await
+    }
+
+    async fn product_list_page_with_visibility(
+        &self,
+        credentials: &OzonCredentials,
+        limit: u16,
+        last_id: Option<String>,
+        visibility: Option<String>,
+    ) -> Result<OzonProductListPage, OzonConnectorError> {
         let url = self
             .base_url
             .join("/v3/product/list")
@@ -223,7 +244,9 @@ impl OzonReadConnector for OzonHttpClient {
             .header("Client-Id", &credentials.client_id)
             .header("Api-Key", credentials.api_key.expose_secret())
             .json(&ProductListRequest {
-                filter: ProductListFilter::default(),
+                filter: ProductListFilter {
+                    visibility: normalize_product_list_visibility(visibility)?,
+                },
                 limit: limit.clamp(1, 1000),
                 last_id: last_id.unwrap_or_default(),
             })
@@ -420,13 +443,26 @@ impl OzonReadConnector for MockOzonConnector {
         limit: u16,
         _last_id: Option<String>,
     ) -> Result<OzonProductListPage, OzonConnectorError> {
+        self.product_list_page_with_visibility(_credentials, limit, _last_id, None)
+            .await
+    }
+
+    async fn product_list_page_with_visibility(
+        &self,
+        _credentials: &OzonCredentials,
+        limit: u16,
+        _last_id: Option<String>,
+        visibility: Option<String>,
+    ) -> Result<OzonProductListPage, OzonConnectorError> {
+        let visibility = normalize_product_list_visibility(visibility)?;
+        let archived = visibility == "ARCHIVED";
         let products = (0..limit.min(3))
             .map(|idx| OzonProductSummary {
                 product_id: format!("mock-product-{idx}"),
                 offer_id: format!("SKU-MOCK-{idx}"),
                 name: Some(format!("Mock Ozon product {}", idx + 1)),
-                visibility: Some("visible".to_string()),
-                archived: Some(false),
+                visibility: Some(visibility.to_lowercase()),
+                archived: Some(archived),
                 has_fbo_stocks: Some(idx % 2 == 0),
                 has_fbs_stocks: Some(true),
             })
@@ -956,6 +992,27 @@ fn ordered_unique(values: Vec<String>) -> Vec<String> {
 fn sanitize_api_error_body(body: &str) -> String {
     let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
     compact.chars().take(500).collect()
+}
+
+fn normalize_product_list_visibility(
+    visibility: Option<String>,
+) -> Result<String, OzonConnectorError> {
+    let Some(visibility) = visibility else {
+        return Ok(ProductListFilter::default().visibility);
+    };
+    let visibility = visibility.trim().to_ascii_uppercase();
+    if visibility.is_empty() {
+        return Ok(ProductListFilter::default().visibility);
+    }
+    if !visibility
+        .chars()
+        .all(|value| value.is_ascii_alphanumeric() || value == '_')
+    {
+        return Err(OzonConnectorError::UnexpectedResponse(format!(
+            "invalid product list visibility: {visibility}"
+        )));
+    }
+    Ok(visibility)
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, net::SocketAddr, str::FromStr};
+use std::{collections::HashMap, env, fs, net::SocketAddr, str::FromStr};
 
 use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
@@ -25,8 +25,9 @@ use hmac::{Hmac, Mac};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use ozon_domain::{
     AuditEvent, AuditEventId, CardKey, CardKeyId, CardKeyStatus, Device, DeviceId, DeviceStatus,
-    Email, Entitlement, EntitlementId, EntitlementLease, Feature, NebulaId, NebulaSource, Order,
-    OrderId, OrderStatus, PaymentProvider, PhoneNumber, PlanCode, TenantId, User, UserId, UserRole,
+    Email, Entitlement, EntitlementId, EntitlementLease, EntitlementLeaseSignature, Feature,
+    NebulaId, NebulaSource, Order, OrderId, OrderStatus, PaymentProvider, PhoneNumber, PlanCode,
+    TenantId, User, UserId, UserRole,
 };
 use rand::{Rng, distr::Alphanumeric};
 use rand_core::OsRng;
@@ -63,6 +64,9 @@ const DEV_CORS_ORIGINS: &[&str] = &[
     "http://127.0.0.1:5172",
     "http://localhost:5172",
 ];
+const DEFAULT_LOCAL_NODE_RELEASE_MANIFEST_URL: &str = "https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/release-manifest.json";
+const DEFAULT_LEASE_ISSUER: &str = "ozon66-cloud";
+const DEFAULT_LEASE_AUDIENCE: &str = "ozon-rust-local-node";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -126,11 +130,7 @@ struct AppConfig {
     environment: String,
     jwt_secret: String,
     admin_token: String,
-    download_url: String,
-    download_msi_url: String,
-    download_exe_url: String,
-    download_sha256: String,
-    local_node_version: String,
+    download_manifest_url: String,
     openclaw_plugin_url: String,
     openclaw_manifest_url: String,
     payment_provider: ConfiguredPaymentProvider,
@@ -154,6 +154,10 @@ struct AppConfig {
     test_full_access_identities: Vec<String>,
     test_full_access_duration_days: u16,
     test_full_access_max_devices: u8,
+    lease_signing_private_key_pem: Option<SecretString>,
+    lease_signing_key_id: String,
+    lease_issuer: String,
+    lease_audience: String,
     skybridge_api_base_urls: Vec<String>,
     allow_local_nebula_registration: bool,
     cors_allowed_origins: Vec<String>,
@@ -213,21 +217,9 @@ impl AppConfig {
                 .unwrap_or_else(|_| DEFAULT_DEV_JWT_SECRET.to_string()),
             admin_token: env::var("OZON_SUITE_ADMIN_TOKEN")
                 .unwrap_or_else(|_| DEFAULT_DEV_ADMIN_TOKEN.to_string()),
-            download_url: env::var("OZON_SUITE_PORTAL_DOWNLOAD_URL").unwrap_or_else(|_| {
-                "https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/OzonRustLocal-x64.msi".to_string()
-            }),
-            download_msi_url: env::var("OZON_SUITE_PORTAL_DOWNLOAD_MSI_URL").unwrap_or_else(|_| {
-                env::var("OZON_SUITE_PORTAL_DOWNLOAD_URL").unwrap_or_else(|_| {
-                    "https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/OzonRustLocal-x64.msi".to_string()
-                })
-            }),
-            download_exe_url: env::var("OZON_SUITE_PORTAL_DOWNLOAD_EXE_URL").unwrap_or_else(|_| {
-                "https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/OzonRustLocalSetup-x64.exe".to_string()
-            }),
-            download_sha256: env::var("OZON_SUITE_PORTAL_DOWNLOAD_SHA256")
-                .unwrap_or_else(|_| "pending-release-sha256".to_string()),
-            local_node_version: env::var("OZON_SUITE_LOCAL_NODE_VERSION")
-                .unwrap_or_else(|_| "0.1.0".to_string()),
+            download_manifest_url: env::var("OZON_SUITE_LOCAL_NODE_RELEASE_MANIFEST_URL")
+                .or_else(|_| env::var("OZON_SUITE_PORTAL_DOWNLOAD_MANIFEST_URL"))
+                .unwrap_or_else(|_| DEFAULT_LOCAL_NODE_RELEASE_MANIFEST_URL.to_string()),
             openclaw_plugin_url: env::var("OZON_SUITE_OPENCLAW_PLUGIN_URL").unwrap_or_else(|_| {
                 "https://github.com/billlza/ozon-rust-suite-downloads/releases/latest/download/openclaw-plugin.zip".to_string()
             }),
@@ -287,6 +279,15 @@ impl AppConfig {
                 "OZON_SUITE_TEST_FULL_ACCESS_MAX_DEVICES",
                 10,
             )?,
+            lease_signing_private_key_pem: optional_env("OZON_SUITE_LEASE_SIGNING_PRIVATE_KEY_PEM")
+                .or_else(|| read_optional_file_env("OZON_SUITE_LEASE_SIGNING_PRIVATE_KEY_PATH"))
+                .map(SecretString::from),
+            lease_signing_key_id: env::var("OZON_SUITE_LEASE_SIGNING_KEY_ID")
+                .unwrap_or_else(|_| "default".to_string()),
+            lease_issuer: env::var("OZON_SUITE_LEASE_ISSUER")
+                .unwrap_or_else(|_| DEFAULT_LEASE_ISSUER.to_string()),
+            lease_audience: env::var("OZON_SUITE_LEASE_AUDIENCE")
+                .unwrap_or_else(|_| DEFAULT_LEASE_AUDIENCE.to_string()),
             skybridge_api_base_urls: skybridge_api_base_urls_from_env(),
             allow_local_nebula_registration: env::var("OZON_SUITE_ALLOW_LOCAL_NEBULA_REGISTRATION")
                 .ok()
@@ -330,6 +331,7 @@ impl AppConfig {
         }
         if production_like && !dev_override {
             validate_production_download_config(self)?;
+            validate_production_lease_signing_config(self)?;
         }
         if self.cors_allowed_origins.is_empty() {
             anyhow::bail!("at least one CORS origin must be configured");
@@ -495,16 +497,8 @@ fn validate_required_secret(name: &str, value: Option<&SecretString>) -> anyhow:
 fn validate_production_download_config(config: &AppConfig) -> anyhow::Result<()> {
     for (name, value) in [
         (
-            "OZON_SUITE_PORTAL_DOWNLOAD_URL",
-            config.download_url.as_str(),
-        ),
-        (
-            "OZON_SUITE_PORTAL_DOWNLOAD_MSI_URL",
-            config.download_msi_url.as_str(),
-        ),
-        (
-            "OZON_SUITE_PORTAL_DOWNLOAD_EXE_URL",
-            config.download_exe_url.as_str(),
+            "OZON_SUITE_LOCAL_NODE_RELEASE_MANIFEST_URL",
+            config.download_manifest_url.as_str(),
         ),
         (
             "OZON_SUITE_OPENCLAW_PLUGIN_URL",
@@ -521,11 +515,23 @@ fn validate_production_download_config(config: &AppConfig) -> anyhow::Result<()>
             anyhow::bail!("{name} must use https in production");
         }
     }
-    if config.download_sha256 == "pending-release-sha256" {
-        anyhow::bail!("OZON_SUITE_PORTAL_DOWNLOAD_SHA256 must be set to a real SHA256");
+    Ok(())
+}
+
+fn validate_production_lease_signing_config(config: &AppConfig) -> anyhow::Result<()> {
+    let Some(private_key) = &config.lease_signing_private_key_pem else {
+        anyhow::bail!(
+            "OZON_SUITE_LEASE_SIGNING_PRIVATE_KEY_PEM or OZON_SUITE_LEASE_SIGNING_PRIVATE_KEY_PATH must be set in production"
+        );
+    };
+    RsaPrivateKey::from_pkcs8_pem(private_key.expose_secret())
+        .or_else(|_| RsaPrivateKey::from_pkcs1_pem(private_key.expose_secret()))
+        .map_err(|_| anyhow::anyhow!("lease signing private key must be a valid RSA PEM"))?;
+    if config.lease_signing_key_id.trim().is_empty() {
+        anyhow::bail!("OZON_SUITE_LEASE_SIGNING_KEY_ID must not be empty in production");
     }
-    if !is_sha256_hex(&config.download_sha256) {
-        anyhow::bail!("OZON_SUITE_PORTAL_DOWNLOAD_SHA256 must be a 64-character hex digest");
+    if config.lease_issuer.trim().is_empty() || config.lease_audience.trim().is_empty() {
+        anyhow::bail!("lease issuer and audience must not be empty in production");
     }
     Ok(())
 }
@@ -536,6 +542,13 @@ fn is_sha256_hex(value: &str) -> bool {
 
 fn optional_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn read_optional_file_env(name: &str) -> Option<String> {
+    let path = optional_env(name)?;
+    fs::read_to_string(path)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn parse_env_or_default<T>(name: &str, default: T) -> anyhow::Result<T>
@@ -1875,8 +1888,55 @@ async fn issue_lease(
     enforce_device_limit_for_lease(&mut tx, claims.sub).await?;
     touch_device_last_seen(&mut tx, device.id, Utc::now()).await?;
     tx.commit().await.map_err(db_internal)?;
-    let lease = EntitlementLease::new(claims.tenant_id, claims.sub, device.id, &entitlement);
+    let lease = sign_entitlement_lease(
+        &state.config,
+        EntitlementLease::new(claims.tenant_id, claims.sub, device.id, &entitlement),
+    )?;
     Ok(Json(LeaseResponse { lease }))
+}
+
+fn sign_entitlement_lease(
+    config: &AppConfig,
+    mut lease: EntitlementLease,
+) -> Result<EntitlementLease, ApiError> {
+    let pem = config
+        .lease_signing_private_key_pem
+        .as_ref()
+        .ok_or_else(|| ApiError::service_unavailable("lease signing key is not configured"))?
+        .expose_secret();
+    let private_key = RsaPrivateKey::from_pkcs8_pem(pem)
+        .or_else(|_| RsaPrivateKey::from_pkcs1_pem(pem))
+        .map_err(|_| ApiError::service_unavailable("lease signing key is invalid"))?;
+    let signing_key = SigningKey::<Sha256>::new(private_key);
+    let payload = lease_signing_payload(&lease, &config.lease_issuer, &config.lease_audience)?;
+    let signature = signing_key.sign_with_rng(&mut OsRng, payload.as_bytes());
+    lease.signature = Some(EntitlementLeaseSignature {
+        alg: "RS256".to_string(),
+        kid: config.lease_signing_key_id.clone(),
+        issuer: config.lease_issuer.clone(),
+        audience: config.lease_audience.clone(),
+        value: BASE64_STANDARD.encode(signature.to_bytes()),
+    });
+    Ok(lease)
+}
+
+fn lease_signing_payload(
+    lease: &EntitlementLease,
+    issuer: &str,
+    audience: &str,
+) -> Result<String, ApiError> {
+    #[derive(Serialize)]
+    struct SignedLeasePayload<'a> {
+        issuer: &'a str,
+        audience: &'a str,
+        claims: ozon_domain::EntitlementLeaseClaims,
+    }
+    serde_json::to_string(&SignedLeasePayload {
+        issuer,
+        audience,
+        claims: lease.claims(),
+    })
+    .map_err(|_| ApiError::internal("failed to serialize lease signing payload"))
 }
 
 async fn revoke_entitlement(
@@ -1904,18 +1964,94 @@ async fn revoke_entitlement(
     Ok(Json(EntitlementResponse { entitlement }))
 }
 
-async fn downloads(State(state): State<AppState>) -> Json<DownloadsResponse> {
-    Json(DownloadsResponse {
-        local_node: state.config.download_url,
-        local_node_msi: state.config.download_msi_url,
-        local_node_exe: state.config.download_exe_url,
-        version: state.config.local_node_version,
-        checksum: state.config.download_sha256.clone(),
-        checksum_sha256: state.config.download_sha256,
+async fn downloads(State(state): State<AppState>) -> Result<Json<DownloadsResponse>, ApiError> {
+    let release_manifest = fetch_local_node_release_manifest(&state).await?;
+    Ok(Json(DownloadsResponse {
+        local_node: release_manifest.msi.url.clone(),
+        local_node_msi: release_manifest.msi.url.clone(),
+        local_node_exe: release_manifest.exe.url.clone(),
+        version: release_manifest.version.clone(),
+        checksum: release_manifest.msi.sha256.clone(),
+        checksum_sha256: release_manifest.msi.sha256.clone(),
+        local_node_msi_sha256: release_manifest.msi.sha256.clone(),
+        local_node_exe_sha256: release_manifest.exe.sha256.clone(),
+        release_manifest_url: state.config.download_manifest_url,
+        release_manifest,
         openclaw_plugin: state.config.openclaw_plugin_url,
         openclaw_manifest: state.config.openclaw_manifest_url,
         local_manifest_url: "http://127.0.0.1:8790/openclaw/manifest".to_string(),
-    })
+    }))
+}
+
+async fn fetch_local_node_release_manifest(
+    state: &AppState,
+) -> Result<LocalNodeReleaseManifest, ApiError> {
+    let manifest_url = state.config.download_manifest_url.clone();
+    let response = state
+        .http_client
+        .get(&manifest_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::warn!(%manifest_url, %error, "local node release manifest request failed");
+            ApiError::bad_gateway("local node release manifest is unavailable")
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        tracing::warn!(%manifest_url, %status, "local node release manifest returned an error");
+        return Err(ApiError::bad_gateway(
+            "local node release manifest is unavailable",
+        ));
+    }
+    let manifest = response
+        .json::<LocalNodeReleaseManifest>()
+        .await
+        .map_err(|error| {
+            tracing::warn!(%manifest_url, %error, "local node release manifest was not valid JSON");
+            ApiError::bad_gateway("local node release manifest is invalid")
+        })?;
+    validate_local_node_release_manifest(&manifest).map_err(|reason| {
+        tracing::warn!(%manifest_url, %reason, "local node release manifest failed validation");
+        ApiError::bad_gateway("local node release manifest is invalid")
+    })?;
+    Ok(manifest)
+}
+
+fn validate_local_node_release_manifest(
+    manifest: &LocalNodeReleaseManifest,
+) -> Result<(), &'static str> {
+    if manifest.version.trim().is_empty() {
+        return Err("version is required");
+    }
+    if !is_git_commit_hash(&manifest.commit) {
+        return Err("commit must be a git hash");
+    }
+    validate_release_artifact("msi", &manifest.msi)?;
+    validate_release_artifact("exe", &manifest.exe)?;
+    Ok(())
+}
+
+fn validate_release_artifact(
+    name: &'static str,
+    artifact: &ReleaseArtifact,
+) -> Result<(), &'static str> {
+    let url = url::Url::parse(&artifact.url).map_err(|_| "artifact URL must be absolute")?;
+    if url.scheme() != "https" {
+        return Err("artifact URL must use https");
+    }
+    if !is_sha256_hex(&artifact.sha256) {
+        return match name {
+            "msi" => Err("msi sha256 must be a 64-character hex digest"),
+            "exe" => Err("exe sha256 must be a 64-character hex digest"),
+            _ => Err("artifact sha256 must be a 64-character hex digest"),
+        };
+    }
+    Ok(())
+}
+
+fn is_git_commit_hash(value: &str) -> bool {
+    (7..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 async fn audit_log(
@@ -3944,9 +4080,27 @@ struct DownloadsResponse {
     version: String,
     checksum: String,
     checksum_sha256: String,
+    local_node_msi_sha256: String,
+    local_node_exe_sha256: String,
+    release_manifest_url: String,
+    release_manifest: LocalNodeReleaseManifest,
     openclaw_plugin: String,
     openclaw_manifest: String,
     local_manifest_url: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LocalNodeReleaseManifest {
+    version: String,
+    commit: String,
+    msi: ReleaseArtifact,
+    exe: ReleaseArtifact,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ReleaseArtifact {
+    url: String,
+    sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -4047,6 +4201,30 @@ mod tests {
         let hash = hash_password(&password).unwrap();
         assert!(!hash.contains(password.expose_secret()));
         verify_password(&hash, &password).unwrap();
+    }
+
+    #[test]
+    fn release_manifest_validation_requires_commit_urls_and_hashes() {
+        let mut manifest = LocalNodeReleaseManifest {
+            version: "0.1.0".to_string(),
+            commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            msi: ReleaseArtifact {
+                url: "https://downloads.example.com/OzonRustLocal-x64.msi".to_string(),
+                sha256: "a".repeat(64),
+            },
+            exe: ReleaseArtifact {
+                url: "https://downloads.example.com/OzonRustLocalSetup-x64.exe".to_string(),
+                sha256: "b".repeat(64),
+            },
+        };
+        validate_local_node_release_manifest(&manifest).unwrap();
+
+        manifest.commit = "not-a-commit".to_string();
+        assert!(validate_local_node_release_manifest(&manifest).is_err());
+
+        manifest.commit = "0123456789abcdef0123456789abcdef01234567".to_string();
+        manifest.exe.sha256 = "pending-release-sha256".to_string();
+        assert!(validate_local_node_release_manifest(&manifest).is_err());
     }
 
     #[test]
@@ -4295,11 +4473,8 @@ mod tests {
             environment: "development".to_string(),
             jwt_secret: DEFAULT_DEV_JWT_SECRET.to_string(),
             admin_token: DEFAULT_DEV_ADMIN_TOKEN.to_string(),
-            download_url: "https://downloads.example.com/ozon-local-node.msi".to_string(),
-            download_msi_url: "https://downloads.example.com/ozon-local-node.msi".to_string(),
-            download_exe_url: "https://downloads.example.com/ozon-local-node.exe".to_string(),
-            download_sha256: "test-sha256".to_string(),
-            local_node_version: "0.1.0".to_string(),
+            download_manifest_url: "https://downloads.example.com/release-manifest.json"
+                .to_string(),
             openclaw_plugin_url: "https://downloads.example.com/openclaw-plugin.zip".to_string(),
             openclaw_manifest_url: "https://downloads.example.com/openclaw/manifest.json"
                 .to_string(),
@@ -4324,6 +4499,10 @@ mod tests {
             test_full_access_identities: vec![],
             test_full_access_duration_days: 365,
             test_full_access_max_devices: 10,
+            lease_signing_private_key_pem: None,
+            lease_signing_key_id: "default".to_string(),
+            lease_issuer: DEFAULT_LEASE_ISSUER.to_string(),
+            lease_audience: DEFAULT_LEASE_AUDIENCE.to_string(),
             skybridge_api_base_urls: vec![],
             allow_local_nebula_registration: false,
             cors_allowed_origins: DEV_CORS_ORIGINS

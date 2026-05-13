@@ -1174,7 +1174,7 @@ input[readonly] {
 .local-node-grid {
   display: grid;
   gap: 12px;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
 }
 
 .local-node-card {
@@ -1214,6 +1214,7 @@ input[readonly] {
 }
 
 .local-node-card.warn,
+.local-node-card.degraded,
 .local-node-card.blocked {
   border-color: #efd4a1;
 }

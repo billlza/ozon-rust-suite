@@ -196,6 +196,33 @@ The WeChat login phone or personal WeChat ID is not a payment API credential.
 Use it only to sign in to the WeChat Pay merchant platform, then copy the
 merchant parameters above into the deployment environment.
 
+## Local node release manifest
+
+The Windows installer workflow publishes MSI/EXE assets plus
+`release-manifest.json` to `billlza/ozon-rust-suite-downloads` by default. Set
+the repository variable `OZON_DOWNLOADS_REPOSITORY` to publish to another
+downloads repository, and set `OZON_DOWNLOADS_REPO_TOKEN` when the workflow needs
+cross-repository release permissions.
+
+`cloud-api` treats the manifest as the single package source for `GET
+/downloads`. Production deployments should point
+`OZON_SUITE_LOCAL_NODE_RELEASE_MANIFEST_URL` at the release asset:
+
+```json
+{
+  "version": "0.1.0",
+  "commit": "0123456789abcdef0123456789abcdef01234567",
+  "msi": {
+    "url": "https://github.com/billlza/ozon-rust-suite-downloads/releases/download/local-node-v0.1.0/OzonRustLocal-x64.msi",
+    "sha256": "64-character-lowercase-hex"
+  },
+  "exe": {
+    "url": "https://github.com/billlza/ozon-rust-suite-downloads/releases/download/local-node-v0.1.0/OzonRustLocalSetup-x64.exe",
+    "sha256": "64-character-lowercase-hex"
+  }
+}
+```
+
 ## OpenClaw bridge
 
 Static package: [openclaw/manifest.json](openclaw/manifest.json) and

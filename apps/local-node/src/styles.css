@@ -116,6 +116,24 @@ nav > span {
   padding: 16px;
 }
 
+.overview .overview-sidecar {
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+}
+
+.overview .overview-sidecar .mini-action {
+  background: #304139;
+  color: #dff9ed;
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  justify-self: end;
+  min-height: 30px;
+  padding: 0 9px;
+}
+
+.overview .overview-sidecar .mini-action:hover {
+  background: #3c5247;
+}
+
 .overview svg {
   color: #00d08b;
   grid-row: span 2;
@@ -136,6 +154,50 @@ article span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.runtime-strip {
+  align-items: center;
+  background: #fffefa;
+  border: 1px solid #ddd8cc;
+  border-radius: 8px;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+  margin: -8px 0 20px;
+  padding: 13px 16px;
+}
+
+.runtime-strip > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.runtime-strip strong,
+.runtime-strip span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-strip strong {
+  font-size: 15px;
+}
+
+.runtime-strip span {
+  color: #68746d;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.runtime-ok {
+  border-color: #b8dfc9;
+}
+
+.runtime-warn {
+  border-color: #e8be79;
 }
 
 .grid,

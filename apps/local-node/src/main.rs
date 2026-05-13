@@ -1,5 +1,5 @@
 use std::{
-    env,
+    env, fs,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -27,8 +27,15 @@ use ozon_domain::{
 };
 use ozon_secret_store::{SecretName, SecretStore, SystemSecretStore, fingerprint_secret, redact};
 use ozon_task_engine::{CreateTask, TaskEvent, TaskStore};
+use rsa::{
+    RsaPublicKey,
+    pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey},
+    pkcs8::DecodePublicKey,
+    signature::Verifier,
+};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use tokio::{
     net::TcpListener,
     sync::{RwLock, broadcast},
@@ -48,6 +55,12 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
 const SECRET_OZON_CONFIG: &str = "ozon_config";
 const SECRET_OPENAI_CONFIG: &str = "openai_config";
 const SECRET_CLOUD_LEASE: &str = "cloud_lease";
+const SECRET_DEVICE_FINGERPRINT: &str = "device_fingerprint";
+const PROTOCOL_VERSION: &str = "2026-05-13.local-node.v1";
+const BUILD_COMMIT: &str = match option_env!("GITHUB_SHA") {
+    Some(value) => value,
+    None => "local-build",
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -84,6 +97,7 @@ async fn run_server(addr: SocketAddr, router: Router) -> anyhow::Result<()> {
 fn skill_router(state: LocalState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/diagnostics", get(diagnostics))
         .route("/portal/status", get(portal_status))
         .route("/portal/lease", post(save_portal_lease))
         .route("/openclaw/manifest", get(openclaw_manifest))
@@ -162,6 +176,10 @@ struct LocalConfig {
     openai_image_model: String,
     default_ecommerce_interval_secs: u64,
     default_ecommerce_limit: u16,
+    lease_public_key_pem: Option<String>,
+    lease_issuer: String,
+    lease_audience: String,
+    allow_unsigned_lease: bool,
 }
 
 impl LocalConfig {
@@ -196,6 +214,17 @@ impl LocalConfig {
                 .unwrap_or_else(|_| DEFAULT_OPENAI_IMAGE_MODEL.to_string()),
             default_ecommerce_interval_secs: env_u64("OZON_ECOMMERCE_READ_INTERVAL_SECS", 15 * 60),
             default_ecommerce_limit: env_u16("OZON_ECOMMERCE_READ_LIMIT", 20),
+            lease_public_key_pem: optional_env("OZON_SUITE_LEASE_PUBLIC_KEY_PEM")
+                .or_else(|| read_optional_file_env("OZON_SUITE_LEASE_PUBLIC_KEY_PATH"))
+                .or_else(|| option_env!("OZON_SUITE_LEASE_PUBLIC_KEY_PEM").map(str::to_string)),
+            lease_issuer: env::var("OZON_SUITE_LEASE_ISSUER")
+                .unwrap_or_else(|_| "ozon66-cloud".to_string()),
+            lease_audience: env::var("OZON_SUITE_LEASE_AUDIENCE")
+                .unwrap_or_else(|_| "ozon-rust-local-node".to_string()),
+            allow_unsigned_lease: env::var("OZON_LOCAL_ALLOW_UNSIGNED_LEASE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(cfg!(debug_assertions)),
         }
     }
 
@@ -295,6 +324,10 @@ async fn health(State(state): State<LocalState>) -> Json<HealthResponse> {
         status: "ok",
         skill_port: local_port(&state.config.skill_bind),
         agent_port: local_port(&state.config.agent_bind),
+        protocol_version: PROTOCOL_VERSION,
+        build_commit: BUILD_COMMIT,
+        package_version: env!("CARGO_PKG_VERSION"),
+        supervisor: "tauri-sidecar",
         features: vec![
             Feature::OzonRead,
             Feature::OzonWriteMock,
@@ -303,6 +336,37 @@ async fn health(State(state): State<LocalState>) -> Json<HealthResponse> {
             Feature::LocalApproval,
         ],
         real_ozon_enabled: state.config.use_real_ozon,
+    })
+}
+
+async fn diagnostics(State(state): State<LocalState>) -> Json<DiagnosticsResponse> {
+    let ozon = inspect_ozon_credentials(&state).await;
+    let openai = inspect_openai_config(&state).await;
+    let lease = inspect_cloud_lease(&state).await;
+    Json(DiagnosticsResponse {
+        service: "ozon-local-node",
+        status: "ok",
+        checked_at: Utc::now().to_rfc3339(),
+        protocol_version: PROTOCOL_VERSION,
+        build_commit: BUILD_COMMIT,
+        package_version: env!("CARGO_PKG_VERSION"),
+        skill_api: local_http_url(&state.config.skill_bind),
+        agent_api: local_http_url(&state.config.agent_bind),
+        connector_mode: connector_mode(&state),
+        real_ozon_enabled: state.config.use_real_ozon,
+        secret_store: SecretStoreStatus {
+            backend: "system",
+            available: ozon.secret_store_available,
+        },
+        ozon: OzonCredentialStatus {
+            configured: ozon.configured,
+            source: ozon.source,
+            client_id: ozon.client_id,
+            api_key_fingerprint: ozon.api_key_fingerprint,
+            issue: ozon.issue,
+        },
+        openai,
+        lease,
     })
 }
 
@@ -322,6 +386,9 @@ async fn portal_status(
             local_http_url(&state.config.skill_bind)
         ),
         bridge_auth_header: "x-openclaw-token",
+        protocol_version: PROTOCOL_VERSION,
+        build_commit: BUILD_COMMIT,
+        package_version: env!("CARGO_PKG_VERSION"),
         real_ozon_enabled: state.config.use_real_ozon,
         device_fingerprint,
         lease,
@@ -503,7 +570,7 @@ async fn save_portal_lease(
     State(state): State<LocalState>,
     Json(input): Json<PortalLeaseRequest>,
 ) -> Result<Json<PortalLeaseResponse>, ApiError> {
-    validate_cloud_lease(&input.lease)?;
+    validate_cloud_lease(&state, &input.lease)?;
     let lease_json = serde_json::to_string(&input.lease)
         .map_err(|_| ApiError::internal("failed to serialize lease"))?;
     state
@@ -517,7 +584,7 @@ async fn save_portal_lease(
     *state.cloud_lease_cache.write().await = Some(input.lease.clone());
     Ok(Json(PortalLeaseResponse {
         accepted: true,
-        lease: lease_status(&input.lease),
+        lease: lease_status(&state, &input.lease),
         saved_at: Utc::now().to_rfc3339(),
     }))
 }
@@ -589,12 +656,32 @@ async fn ozon_products_count(
 ) -> Result<Json<ProductCountResponse>, ApiError> {
     require_bridge_or_operator_token(&state, &headers)?;
     let credentials = load_ozon_credentials(&state).await?;
-    let count = state
+    let mut count = state
         .ozon_connector
         .product_count(&credentials)
         .await
         .map_err(|error| ApiError::bad_gateway(format!("ozon connector failed: {error}")))?;
-    Ok(Json(ProductCountResponse { count }))
+    let mut visibility = "ALL".to_string();
+    let mut archived_fallback = false;
+    if count == 0 {
+        let archived_page = state
+            .ozon_connector
+            .product_list_page_with_visibility(&credentials, 1, None, Some("ARCHIVED".into()))
+            .await
+            .map_err(|error| {
+                ApiError::bad_gateway(format!("ozon archived connector failed: {error}"))
+            })?;
+        if archived_page.total > 0 {
+            count = archived_page.total;
+            visibility = "ARCHIVED".to_string();
+            archived_fallback = true;
+        }
+    }
+    Ok(Json(ProductCountResponse {
+        count,
+        visibility,
+        archived_fallback,
+    }))
 }
 
 async fn ozon_products_list(
@@ -604,16 +691,46 @@ async fn ozon_products_list(
 ) -> Result<Json<ProductListResponse>, ApiError> {
     require_bridge_or_operator_token(&state, &headers)?;
     let credentials = load_ozon_credentials(&state).await?;
-    let products = state
+    let limit = input.limit.unwrap_or(20);
+    let requested_visibility = normalize_product_list_visibility(input.visibility)?;
+    let mut resolved_visibility = requested_visibility
+        .clone()
+        .unwrap_or_else(|| "ALL".to_string());
+    let mut archived_fallback = false;
+    let mut products = state
         .ozon_connector
-        .product_list_page(&credentials, input.limit.unwrap_or(20), None)
+        .product_list_page_with_visibility(
+            &credentials,
+            limit,
+            input.last_id,
+            requested_visibility.clone(),
+        )
         .await
         .map_err(|error| ApiError::bad_gateway(format!("ozon connector failed: {error}")))?;
+    if requested_visibility.is_none()
+        && input.include_archived_if_empty.unwrap_or(true)
+        && products.total == 0
+        && products.products.is_empty()
+    {
+        products = state
+            .ozon_connector
+            .product_list_page_with_visibility(&credentials, limit, None, Some("ARCHIVED".into()))
+            .await
+            .map_err(|error| {
+                ApiError::bad_gateway(format!("ozon archived connector failed: {error}"))
+            })?;
+        if products.total > 0 || !products.products.is_empty() {
+            resolved_visibility = "ARCHIVED".to_string();
+            archived_fallback = true;
+        }
+    }
     Ok(Json(ProductListResponse {
         connector_mode: connector_mode(&state),
         products: products.products,
         total: products.total,
         last_id: products.last_id,
+        visibility: resolved_visibility,
+        archived_fallback,
     }))
 }
 
@@ -1040,11 +1157,28 @@ async fn execute_ecommerce_read_once(
     let started_at = Utc::now();
     let start = Instant::now();
     let credentials = load_ozon_credentials(state).await?;
-    let page = state
+    let mut page = state
         .ozon_connector
-        .product_list_page(&credentials, limit.clamp(1, 100), None)
+        .product_list_page_with_visibility(&credentials, limit.clamp(1, 100), None, None)
         .await
         .map_err(|error| ApiError::bad_gateway(format!("scheduled Ozon read failed: {error}")))?;
+    if page.total == 0 && page.products.is_empty() {
+        let archived_page = state
+            .ozon_connector
+            .product_list_page_with_visibility(
+                &credentials,
+                limit.clamp(1, 100),
+                None,
+                Some("ARCHIVED".into()),
+            )
+            .await
+            .map_err(|error| {
+                ApiError::bad_gateway(format!("scheduled archived Ozon read failed: {error}"))
+            })?;
+        if archived_page.total > 0 || !archived_page.products.is_empty() {
+            page = archived_page;
+        }
+    }
     let OzonProductListPage {
         products,
         total,
@@ -1307,18 +1441,29 @@ async fn load_ozon_credentials(state: &LocalState) -> Result<OzonCredentials, Ap
     })
 }
 
-async fn load_or_create_device_fingerprint(_state: &LocalState) -> Result<String, ApiError> {
-    let user = env::var("USER")
-        .or_else(|_| env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown-user".to_string());
-    let home = env::var("HOME")
-        .or_else(|_| env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "unknown-home".to_string());
-    let seed = format!("{}:{user}:{home}", env::consts::OS);
-    Ok(format!(
-        "ors-local-{}",
-        fingerprint_secret(&SecretString::from(seed))
-    ))
+async fn load_or_create_device_fingerprint(state: &LocalState) -> Result<String, ApiError> {
+    if let Some(existing) = state
+        .secrets
+        .get(&SecretName::new(SECRET_DEVICE_FINGERPRINT))
+        .await
+        .map_err(|_| ApiError::internal("secret store unavailable"))?
+    {
+        let value = existing.expose_secret().trim();
+        if value.starts_with("ors-local-") && value.len() >= 20 {
+            return Ok(value.to_string());
+        }
+    }
+
+    let value = format!("ors-local-{}", Uuid::new_v4());
+    state
+        .secrets
+        .put(
+            SecretName::new(SECRET_DEVICE_FINGERPRINT),
+            SecretString::from(value.clone()),
+        )
+        .await
+        .map_err(|_| ApiError::internal("failed to persist device fingerprint"))?;
+    Ok(value)
 }
 
 async fn inspect_openai_config(state: &LocalState) -> OpenAiCredentialStatus {
@@ -1410,12 +1555,12 @@ async fn load_openai_config(state: &LocalState) -> Result<StoredOpenAiConfig, Ap
 
 async fn inspect_cloud_lease(state: &LocalState) -> LeaseStatus {
     if let Some(lease) = state.cloud_lease_cache.read().await.clone() {
-        return lease_status(&lease);
+        return lease_status(state, &lease);
     }
     match get_secret_for_status(state, SECRET_CLOUD_LEASE).await {
         Ok(Some(bundle)) => {
             match serde_json::from_str::<EntitlementLease>(bundle.expose_secret()) {
-                Ok(lease) => lease_status(&lease),
+                Ok(lease) => lease_status(state, &lease),
                 Err(_) => LeaseStatus {
                     configured: false,
                     valid: false,
@@ -1461,7 +1606,7 @@ async fn get_secret_for_status(
     .map_err(|_| ())
 }
 
-fn validate_cloud_lease(lease: &EntitlementLease) -> Result<(), ApiError> {
+fn validate_cloud_lease(state: &LocalState, lease: &EntitlementLease) -> Result<(), ApiError> {
     if lease.expires_at <= Utc::now() {
         return Err(ApiError::bad_request("lease is expired"));
     }
@@ -1470,11 +1615,13 @@ fn validate_cloud_lease(lease: &EntitlementLease) -> Result<(), ApiError> {
             "lease does not include Ozon read access",
         ));
     }
+    verify_cloud_lease_signature(state, lease)?;
     Ok(())
 }
 
-fn lease_status(lease: &EntitlementLease) -> LeaseStatus {
-    let valid = lease.expires_at > Utc::now() && lease.features.contains(&Feature::OzonRead);
+fn lease_status(state: &LocalState, lease: &EntitlementLease) -> LeaseStatus {
+    let validation = validate_cloud_lease(state, lease);
+    let valid = validation.is_ok();
     LeaseStatus {
         configured: true,
         valid,
@@ -1485,9 +1632,75 @@ fn lease_status(lease: &EntitlementLease) -> LeaseStatus {
         issue: if valid {
             None
         } else {
-            Some("lease is expired or missing Ozon read access".to_string())
+            Some(
+                validation
+                    .err()
+                    .map(|error| error.message)
+                    .unwrap_or_else(|| "lease is invalid".to_string()),
+            )
         },
     }
+}
+
+fn verify_cloud_lease_signature(
+    state: &LocalState,
+    lease: &EntitlementLease,
+) -> Result<(), ApiError> {
+    let Some(signature) = &lease.signature else {
+        if state.config.allow_unsigned_lease {
+            return Ok(());
+        }
+        return Err(ApiError::bad_request("lease is missing a cloud signature"));
+    };
+    if signature.alg != "RS256" {
+        return Err(ApiError::bad_request(
+            "lease signature algorithm is not supported",
+        ));
+    }
+    if signature.issuer != state.config.lease_issuer {
+        return Err(ApiError::bad_request("lease signature issuer mismatch"));
+    }
+    if signature.audience != state.config.lease_audience {
+        return Err(ApiError::bad_request("lease signature audience mismatch"));
+    }
+    let public_key_pem = state
+        .config
+        .lease_public_key_pem
+        .as_deref()
+        .ok_or_else(|| {
+            ApiError::bad_request("lease public key is not configured on this local node")
+        })?;
+    let public_key = RsaPublicKey::from_public_key_pem(public_key_pem)
+        .map_err(|_| ApiError::bad_request("lease public key is invalid"))?;
+    let signature_bytes = BASE64_STANDARD
+        .decode(&signature.value)
+        .map_err(|_| ApiError::bad_request("lease signature encoding is invalid"))?;
+    let decoded_signature = RsaPkcs1v15Signature::try_from(signature_bytes.as_slice())
+        .map_err(|_| ApiError::bad_request("lease signature is invalid"))?;
+    let verifying_key = VerifyingKey::<Sha256>::new(public_key);
+    let payload = lease_signing_payload(lease, &signature.issuer, &signature.audience)?;
+    verifying_key
+        .verify(payload.as_bytes(), &decoded_signature)
+        .map_err(|_| ApiError::bad_request("lease signature verification failed"))
+}
+
+fn lease_signing_payload(
+    lease: &EntitlementLease,
+    issuer: &str,
+    audience: &str,
+) -> Result<String, ApiError> {
+    #[derive(Serialize)]
+    struct SignedLeasePayload<'a> {
+        issuer: &'a str,
+        audience: &'a str,
+        claims: ozon_domain::EntitlementLeaseClaims,
+    }
+    serde_json::to_string(&SignedLeasePayload {
+        issuer,
+        audience,
+        claims: lease.claims(),
+    })
+    .map_err(|_| ApiError::internal("failed to serialize lease verification payload"))
 }
 
 fn normalize_openai_base_url(value: &str) -> Result<String, ApiError> {
@@ -1758,6 +1971,27 @@ fn map_product_get_error(context: &str, error: ozon_connector::OzonConnectorErro
     }
 }
 
+fn normalize_product_list_visibility(
+    visibility: Option<String>,
+) -> Result<Option<String>, ApiError> {
+    let Some(visibility) = visibility else {
+        return Ok(None);
+    };
+    let visibility = visibility.trim().to_ascii_uppercase();
+    if visibility.is_empty() {
+        return Ok(None);
+    }
+    if !visibility
+        .chars()
+        .all(|value| value.is_ascii_alphanumeric() || value == '_')
+    {
+        return Err(ApiError::bad_request(format!(
+            "invalid product list visibility: {visibility}"
+        )));
+    }
+    Ok(Some(visibility))
+}
+
 fn local_http_url(bind: &str) -> String {
     format!("http://{bind}")
 }
@@ -1773,6 +2007,17 @@ fn env_u64(name: &str, fallback: u64) -> u64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(fallback)
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn read_optional_file_env(name: &str) -> Option<String> {
+    let path = optional_env(name)?;
+    fs::read_to_string(path)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn env_u16(name: &str, fallback: u16) -> u16 {
@@ -1824,6 +2069,10 @@ struct HealthResponse {
     status: &'static str,
     skill_port: u16,
     agent_port: u16,
+    protocol_version: &'static str,
+    build_commit: &'static str,
+    package_version: &'static str,
+    supervisor: &'static str,
     features: Vec<Feature>,
     real_ozon_enabled: bool,
 }
@@ -1837,10 +2086,31 @@ struct PortalStatusResponse {
     agent_api: String,
     manifest_url: String,
     bridge_auth_header: &'static str,
+    protocol_version: &'static str,
+    build_commit: &'static str,
+    package_version: &'static str,
     real_ozon_enabled: bool,
     device_fingerprint: String,
     lease: LeaseStatus,
     features: Vec<Feature>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticsResponse {
+    service: &'static str,
+    status: &'static str,
+    checked_at: String,
+    protocol_version: &'static str,
+    build_commit: &'static str,
+    package_version: &'static str,
+    skill_api: String,
+    agent_api: String,
+    connector_mode: &'static str,
+    real_ozon_enabled: bool,
+    secret_store: SecretStoreStatus,
+    ozon: OzonCredentialStatus,
+    openai: OpenAiCredentialStatus,
+    lease: LeaseStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -2000,11 +2270,16 @@ struct OzonCredentialValidationResponse {
 #[derive(Debug, Deserialize)]
 struct ProductListRequest {
     limit: Option<u16>,
+    last_id: Option<String>,
+    visibility: Option<String>,
+    include_archived_if_empty: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
 struct ProductCountResponse {
     count: u32,
+    visibility: String,
+    archived_fallback: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2013,6 +2288,8 @@ struct ProductListResponse {
     products: Vec<ozon_connector::OzonProductSummary>,
     total: u32,
     last_id: Option<String>,
+    visibility: String,
+    archived_fallback: bool,
 }
 
 #[derive(Debug, Deserialize)]
