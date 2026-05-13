@@ -67,6 +67,39 @@ jobs:
           New-Item -ItemType Directory -Force apps/local-node/src-tauri/binaries | Out-Null
           Copy-Item target/x86_64-pc-windows-msvc/release/ozon-local-node.exe apps/local-node/src-tauri/binaries/ozon-local-node-x86_64-pc-windows-msvc.exe
 
+      - name: Smoke test sidecar
+        shell: pwsh
+        run: |
+          $env:OZON_CONNECTOR_MODE = "real"
+          $env:OZON_LOCAL_TOKEN = [guid]::NewGuid().ToString("N")
+          $env:OZON_OPENCLAW_TOKEN = [guid]::NewGuid().ToString("N")
+          $env:OZON_LOCAL_SKILL_BIND = "127.0.0.1:8790"
+          $env:OZON_LOCAL_AGENT_BIND = "127.0.0.1:17870"
+          $sidecar = "apps/local-node/src-tauri/binaries/ozon-local-node-x86_64-pc-windows-msvc.exe"
+          $process = Start-Process -FilePath $sidecar -PassThru -WindowStyle Hidden
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              try {
+                $health = Invoke-RestMethod -Uri "http://127.0.0.1:8790/health" -TimeoutSec 2
+                $manifest = Invoke-RestMethod -Uri "http://127.0.0.1:8790/openclaw/manifest" -TimeoutSec 2
+                if ($health.status -eq "ok" -and $manifest.version) {
+                  $ready = $true
+                  break
+                }
+              } catch {
+                Start-Sleep -Seconds 1
+              }
+            }
+            if (-not $ready) {
+              throw "local-node sidecar did not pass /health + manifest smoke test"
+            }
+          } finally {
+            if ($process -and -not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
+
       - name: Build Tauri installers
         run: pnpm --dir apps/local-node tauri:build --target x86_64-pc-windows-msvc --bundles msi nsis
 
