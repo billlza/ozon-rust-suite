@@ -57,6 +57,15 @@ const SECRET_OPENAI_CONFIG: &str = "openai_config";
 const SECRET_CLOUD_LEASE: &str = "cloud_lease";
 const SECRET_DEVICE_FINGERPRINT: &str = "device_fingerprint";
 const PROTOCOL_VERSION: &str = "2026-05-13.local-node.v1";
+const DEFAULT_LEASE_PUBLIC_KEY_PEM: &str = r#"-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvZkEYHN2VhaoCxw2kNSU
+hIET4BU1k0ffjB6BRIBrvf73Uo3gX14swZ6TuuLUFvm6ovUDYsv3qYJEOUmwnaXK
+xE/QFwhKlny3vhC+g7LI3Pd6zRSTb9x0BwDH1yo6vctBU25o5L24FZ4qG/to/ga0
+p6Jla1IjK6kATX7ixsozQExIVaijs6tGW4WVUpizRWMmQL0VI4BpBZHLegvdDUNP
+k+s+IPC7WP3o7rl8UCU1LApyKAaQRdFxIym+mgTuKUEAR0/AJ9tPE1ez2XNCjmuN
+bJOrzcpKwBnpZOzbu4bIUanfNeCkGySqJeAIT7L/zj1j9j2Wh48mExLa0A77jxBS
+lwIDAQAB
+-----END PUBLIC KEY-----"#;
 const BUILD_COMMIT: &str = match option_env!("GITHUB_SHA") {
     Some(value) => value,
     None => "local-build",
@@ -220,7 +229,8 @@ impl LocalConfig {
             default_ecommerce_limit: env_u16("OZON_ECOMMERCE_READ_LIMIT", 20),
             lease_public_key_pem: optional_env("OZON_SUITE_LEASE_PUBLIC_KEY_PEM")
                 .or_else(|| read_optional_file_env("OZON_SUITE_LEASE_PUBLIC_KEY_PATH"))
-                .or_else(|| option_env!("OZON_SUITE_LEASE_PUBLIC_KEY_PEM").map(str::to_string)),
+                .or_else(|| option_env!("OZON_SUITE_LEASE_PUBLIC_KEY_PEM").map(str::to_string))
+                .or_else(|| Some(DEFAULT_LEASE_PUBLIC_KEY_PEM.to_string())),
             lease_issuer: env::var("OZON_SUITE_LEASE_ISSUER")
                 .unwrap_or_else(|_| "ozon66-cloud".to_string()),
             lease_audience: env::var("OZON_SUITE_LEASE_AUDIENCE")
@@ -240,6 +250,14 @@ impl LocalConfig {
             anyhow::bail!(
                 "OZON_LOCAL_TOKEN and OZON_OPENCLAW_TOKEN must be explicitly set when the real Ozon connector is enabled"
             );
+        }
+        if self.use_real_ozon && !self.allow_unsigned_lease {
+            let Some(public_key_pem) = self.lease_public_key_pem.as_deref() else {
+                anyhow::bail!("lease public key must be configured when real Ozon mode is enabled");
+            };
+            RsaPublicKey::from_public_key_pem(public_key_pem).map_err(|_| {
+                anyhow::anyhow!("lease public key must be a valid RSA public key PEM")
+            })?;
         }
         Ok(())
     }
@@ -2810,6 +2828,12 @@ mod tests {
         assert!(constant_time_eq("operator-token", "operator-token"));
         assert!(!constant_time_eq("operator-token", "operator-token-extra"));
         assert!(!constant_time_eq("operator-token", "operator-tokem"));
+    }
+
+    #[test]
+    fn bundled_lease_public_key_is_valid_rsa_pem() {
+        RsaPublicKey::from_public_key_pem(DEFAULT_LEASE_PUBLIC_KEY_PEM)
+            .expect("bundled lease public key must parse");
     }
 
     #[tokio::test]

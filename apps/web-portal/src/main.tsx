@@ -232,6 +232,14 @@ type LocalNodeProbe = {
   portal?: LocalPortalStatus;
 };
 
+type LocalLeaseStatus = LocalPortalStatus["lease"];
+
+type PortalLeaseResponse = {
+  accepted: boolean;
+  lease: LocalLeaseStatus;
+  saved_at: string;
+};
+
 type ApiError = {
   error: string;
 };
@@ -366,7 +374,8 @@ function App() {
   const captchaBlocked = isCaptchaProtectionMessage(authState.message);
   const directAuthNeedsTurnstile = SKYBRIDGE_TURNSTILE_CONFIGURED && !turnstileToken;
   const authDialogOpen = authDialogMode !== null;
-  const localPairingStatus = localNodePairingStatus(localNode, activeEntitlement, device, lease);
+  const localLeaseStatus = localNode.portal?.lease ?? null;
+  const localPairingStatus = localNodePairingStatus(localNode, activeEntitlement, device, localLeaseStatus, Boolean(lease));
   const releaseManifest = downloads?.release_manifest;
   const localNodeMsiUrl = releaseManifest?.msi.url ?? "";
   const localNodeExeUrl = releaseManifest?.exe.url ?? "";
@@ -407,13 +416,14 @@ function App() {
     authBusy || authState.phase === "failed" || authState.phase === "authenticated" || Boolean(operationStatus);
   const setupStatus = setupStatusModel({
     activeEntitlement,
+    computerAuthorized: localLeaseStatus?.valid === true,
     device,
-    lease,
+    localLeaseIssue: localLeaseStatus?.issue ?? null,
     localNode,
     order
   });
   const computerHelperOnline = localNode.phase === "online";
-  const computerAuthorized = Boolean(device && lease);
+  const computerAuthorized = localLeaseStatus?.valid === true;
   const canStartWorkspace = computerHelperOnline && computerAuthorized && canOpenLocalConsole;
 
   async function api<T>(path: string, init: RequestInit = {}, token = session?.token): Promise<T> {
@@ -944,17 +954,32 @@ function App() {
         method: "POST",
         body: JSON.stringify({ device_id: device.id })
       });
-      setLease(data.lease);
       try {
-        await localNodePost("/portal/lease", { lease: data.lease });
+        const localLease = await localNodePost<PortalLeaseResponse>("/portal/lease", { lease: data.lease });
+        setLease(data.lease);
+        applyLocalLeaseStatus(localLease.lease);
         setOperationStatus("这台电脑已完成授权");
         await probeLocalNode();
       } catch (localError) {
-        setOperationStatus(`云端已授权，但电脑助手写入失败：${errorMessage(localError)}`);
+        setLease(null);
+        setOperationStatus(localLeaseWriteFailureMessage(localError));
       }
     } catch (error) {
       setOperationStatus(`电脑授权失败：${errorMessage(error)}`);
     }
+  }
+
+  function applyLocalLeaseStatus(nextLease: LocalLeaseStatus) {
+    setLocalNode((current) => {
+      if (!current.portal) return current;
+      return {
+        ...current,
+        portal: {
+          ...current.portal,
+          lease: nextLease
+        }
+      };
+    });
   }
 
   async function probeLocalNode() {
@@ -1477,7 +1502,7 @@ function App() {
                     <MonitorCheck size={18} /> 授权这台电脑
                   </button>
                 )}
-                {activeEntitlement && device && !lease && (
+                {activeEntitlement && device && !computerAuthorized && (
                   <button onClick={issueLease} disabled={authBusy}>
                     <Radio size={18} /> 完成电脑授权
                   </button>
@@ -1799,7 +1824,7 @@ function App() {
                 <button disabled={!canBindLocalDevice} onClick={activateDevice}>
                   <MonitorCheck size={18} /> 授权这台电脑
                 </button>
-                <button className="secondary" onClick={issueLease} disabled={!device || authBusy}>
+                <button className="secondary" onClick={issueLease} disabled={!device || computerAuthorized || authBusy}>
                   <Radio size={18} /> 完成授权
                 </button>
               </div>
@@ -2217,7 +2242,8 @@ function localNodePairingStatus(
   localNode: LocalNodeProbe,
   entitlement: Entitlement | null,
   device: Device | null,
-  lease: Lease | null
+  leaseStatus: LocalLeaseStatus | null,
+  cloudLeaseIssued: boolean
 ) {
   if (!entitlement) {
     return {
@@ -2240,24 +2266,26 @@ function localNodePairingStatus(
       message: "点“授权这台电脑”，把当前电脑加入你的账号。"
     };
   }
-  if (!lease) {
+  if (!leaseStatus?.valid) {
+    const issue = userFacingLocalLeaseIssue(leaseStatus?.issue);
     return {
       kind: localNode.phase === "online" ? "warn" : "offline",
-      title: "还差最后一步",
-      message: "再点一次“完成授权”，电脑助手就能开始工作。"
+      title: cloudLeaseIssued ? "电脑助手还没保存授权" : "还差最后一步",
+      message: issue ?? "再点一次“完成授权”，电脑助手就能开始工作。"
     };
   }
   return {
     kind: localNode.phase === "online" ? "online" : "warn",
     title: localNode.phase === "online" ? "这台电脑已授权" : "电脑授权已保存",
-    message: `有效期至 ${lease.expires_at}。`
+    message: `有效期至 ${leaseStatus.expires_at ?? "授权到期前"}。`
   };
 }
 
 function setupStatusModel(input: {
   activeEntitlement: Entitlement | null;
+  computerAuthorized: boolean;
   device: Device | null;
-  lease: Lease | null;
+  localLeaseIssue: string | null;
   localNode: LocalNodeProbe;
   order: Order | null;
 }) {
@@ -2285,18 +2313,35 @@ function setupStatusModel(input: {
       message: "服务已开通，电脑助手也在线。现在把这台电脑加入账号。"
     };
   }
-  if (!input.lease) {
+  if (!input.computerAuthorized) {
+    const issue = userFacingLocalLeaseIssue(input.localLeaseIssue);
     return {
       kind: "warn",
-      title: "完成电脑授权",
-      message: "再确认一次授权，电脑助手就可以读取商品和生成海报。"
+      title: issue ? "电脑授权没有完成" : "完成电脑授权",
+      message: issue ?? "再确认一次授权，电脑助手就可以读取商品和生成海报。"
     };
   }
   return {
     kind: "online",
     title: "可以开始了",
-    message: "服务和这台电脑都已准备好。打开工作台，添加店铺凭据后读取商品。"
+    message: "服务和这台电脑都已准备好。打开工作台，添加店铺授权信息后读取商品。"
   };
+}
+
+function userFacingLocalLeaseIssue(issue?: string | null) {
+  if (!issue || issue === "cloud lease is not installed") return null;
+  if (issue.includes("public key") || issue.includes("signature")) {
+    return "电脑助手版本太旧或安装不完整，请下载安装最新版后再点“完成授权”。";
+  }
+  if (issue.includes("expired")) {
+    return "电脑授权已过期，请重新完成授权。";
+  }
+  return `电脑助手还不能保存授权：${issue}`;
+}
+
+function localLeaseWriteFailureMessage(error: unknown) {
+  const issue = userFacingLocalLeaseIssue(errorMessage(error));
+  return issue ?? `电脑助手授权写入失败：${errorMessage(error)}`;
 }
 
 function absolutePortalUrl(pathOrUrl: string) {
