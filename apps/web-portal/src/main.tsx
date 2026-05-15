@@ -396,6 +396,8 @@ function App() {
   const canCopyLocalManifest = localNode.phase === "online";
   const canDownloadOpenClawPlugin = Boolean(openclawPluginUrl);
   const canBindLocalDevice = canUseProtectedActions && localNode.phase === "online" && Boolean(localNode.portal?.device_fingerprint);
+  const computerHelperOnline = localNode.phase === "online";
+  const computerAuthorized = localLeaseStatus?.valid === true;
   const directAuthUnavailableMessage = "账号服务正在维护，请稍后再试或联系运营支持。";
   const authSubmitText =
     authMethod === "phone"
@@ -418,15 +420,14 @@ function App() {
   const StatusLineIcon = authBusy ? RefreshCcw : statusTone === "danger" ? AlertCircle : CheckCircle2;
   const setupStatus = setupStatusModel({
     activeEntitlement,
-    computerAuthorized: localLeaseStatus?.valid === true,
+    computerAuthorized,
     device,
     localLeaseIssue: localLeaseStatus?.issue ?? null,
     localNode,
     order
   });
-  const computerHelperOnline = localNode.phase === "online";
-  const computerAuthorized = localLeaseStatus?.valid === true;
   const canStartWorkspace = computerHelperOnline && computerAuthorized && canOpenLocalConsole;
+  const readyForWorkspace = computerHelperOnline && computerAuthorized;
 
   async function api<T>(path: string, init: RequestInit = {}, token = session?.token): Promise<T> {
     const response = await fetchWithTimeout(`${API_BASE}${path}`, {
@@ -1521,7 +1522,7 @@ function App() {
                     <RefreshCcw size={18} /> 我已打开，检测一下
                   </button>
                 )}
-                {activeEntitlement && computerHelperOnline && !device && (
+                {activeEntitlement && computerHelperOnline && !device && !computerAuthorized && (
                   <button disabled={!canBindLocalDevice} onClick={activateDevice}>
                     <MonitorCheck size={18} /> 授权这台电脑
                   </button>
@@ -1535,6 +1536,11 @@ function App() {
                   <a className="download" href={LOCAL_CONSOLE_URL} target="_blank" rel="noreferrer">
                     <MonitorCheck size={18} /> 打开工作台
                   </a>
+                )}
+                {readyForWorkspace && !canOpenLocalConsole && (
+                  <button className="secondary" disabled>
+                    <MonitorCheck size={18} /> 电脑助手已打开
+                  </button>
                 )}
               </div>
             </div>
@@ -1627,13 +1633,15 @@ function App() {
                 </div>
               </article>
 
-              <article className={wizardStepClass(canStartWorkspace, canStartWorkspace)}>
+              <article className={wizardStepClass(readyForWorkspace, readyForWorkspace)}>
                 <span className="step-number">4</span>
                 <div>
                   <h3>开始读取商品</h3>
                   <p>
-                    {canStartWorkspace
-                      ? "打开工作台，添加店铺授权信息，然后读取商品并生成海报。"
+                    {readyForWorkspace
+                      ? canOpenLocalConsole
+                        ? "打开工作台，添加店铺授权信息，然后读取商品并生成海报。"
+                        : "电脑助手已经打开。切到 Ozon Rust Local，添加店铺授权信息后读取商品。"
                       : "前面几步完成后，这里会出现进入工作台的按钮。"}
                   </p>
                   {canStartWorkspace && (
@@ -2329,6 +2337,13 @@ function setupStatusModel(input: {
       message: "下载电脑助手，打开后回到这里点“检测一下”。"
     };
   }
+  if (input.computerAuthorized) {
+    return {
+      kind: "online",
+      title: "可以开始了",
+      message: "服务和这台电脑都已准备好。打开电脑助手，添加店铺授权信息后读取商品。"
+    };
+  }
   if (!input.device) {
     return {
       kind: "warn",
@@ -2347,7 +2362,7 @@ function setupStatusModel(input: {
   return {
     kind: "online",
     title: "可以开始了",
-    message: "服务和这台电脑都已准备好。打开工作台，添加店铺授权信息后读取商品。"
+    message: "服务和这台电脑都已准备好。打开电脑助手，添加店铺授权信息后读取商品。"
   };
 }
 
