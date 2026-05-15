@@ -95,7 +95,7 @@ jobs:
           cargo run -p ozon-suite-qa -- \
             --base-url http://127.0.0.1:18790 \
             --openclaw-token "$OZON_OPENCLAW_TOKEN" \
-            memory --pid "$node_pid" --scenario health --duration-secs 3 --interval-ms 250 --growth-limit-mb 128
+            leak --pid "$node_pid" --scenario health --duration-secs 3 --interval-ms 250 --growth-limit-mb 128
 
       - name: Test workspace
         run: cargo test --workspace

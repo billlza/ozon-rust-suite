@@ -34,6 +34,7 @@ enum CommandKind {
     Perf(PerfArgs),
     Stability(StabilityArgs),
     Memory(MemoryArgs),
+    Leak(MemoryArgs),
     All(AllArgs),
 }
 
@@ -224,6 +225,7 @@ async fn main() -> Result<()> {
         CommandKind::Perf(args) => perf(&runner, args).await?,
         CommandKind::Stability(args) => stability(&runner, args).await?,
         CommandKind::Memory(args) => memory(&runner, args).await?,
+        CommandKind::Leak(args) => leak(&runner, args).await?,
         CommandKind::All(args) => all(&runner, args).await?,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -258,6 +260,7 @@ async fn smoke(runner: &Runner, args: SmokeArgs) -> Result<CommandReport> {
     .await;
     steps.push(product_count);
 
+    let list_started = Instant::now();
     let product_list = runner
         .post(
             "/tools/ozon.products.list",
@@ -287,7 +290,7 @@ async fn smoke(runner: &Runner, args: SmokeArgs) -> Result<CommandReport> {
                 name: "ozon.products.list".to_string(),
                 ok: result.status.is_success(),
                 status: Some(result.status.as_u16()),
-                elapsed_ms: 0,
+                elapsed_ms: list_started.elapsed().as_millis(),
                 detail: summarize_body(&result.body),
             });
         }
@@ -295,7 +298,7 @@ async fn smoke(runner: &Runner, args: SmokeArgs) -> Result<CommandReport> {
             name: "ozon.products.list".to_string(),
             ok: false,
             status: None,
-            elapsed_ms: 0,
+            elapsed_ms: list_started.elapsed().as_millis(),
             detail: error.to_string(),
         }),
     }
@@ -404,6 +407,18 @@ async fn stability(runner: &Runner, args: StabilityArgs) -> Result<CommandReport
 }
 
 async fn memory(runner: &Runner, args: MemoryArgs) -> Result<CommandReport> {
+    memory_check(runner, args, "memory").await
+}
+
+async fn leak(runner: &Runner, args: MemoryArgs) -> Result<CommandReport> {
+    memory_check(runner, args, "leak").await
+}
+
+async fn memory_check(
+    runner: &Runner,
+    args: MemoryArgs,
+    command: &'static str,
+) -> Result<CommandReport> {
     let started_at = Utc::now().to_rfc3339();
     let started = Instant::now();
     let input = scenario_input(args.list_limit, args.offer_id, args.product_id, args.sku);
@@ -421,7 +436,7 @@ async fn memory(runner: &Runner, args: MemoryArgs) -> Result<CommandReport> {
     let metrics = metrics_from_samples(args.scenario, request_samples, 1, started.elapsed());
     let ok = metrics.failed == 0 && memory.growth_mb <= args.growth_limit_mb;
     Ok(CommandReport {
-        command: "memory",
+        command,
         ok,
         started_at,
         finished_at: Utc::now().to_rfc3339(),
@@ -430,9 +445,9 @@ async fn memory(runner: &Runner, args: MemoryArgs) -> Result<CommandReport> {
         metrics: Some(metrics),
         memory: Some(memory),
         summary: if ok {
-            "memory run stayed within RSS growth limit".to_string()
+            "RSS growth stayed within the configured leak threshold".to_string()
         } else {
-            "memory run failed HTTP checks or exceeded RSS growth limit".to_string()
+            "HTTP checks failed or RSS growth exceeded the leak threshold".to_string()
         },
     })
 }

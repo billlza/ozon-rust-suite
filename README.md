@@ -258,7 +258,7 @@ specs.
 ## Test CLI
 
 `ozon-suite-qa` is a read-only Rust harness for local-node smoke, performance,
-stability, and RSS growth checks. It emits JSON and is safe to run against a
+stability, and memory-leak checks. It emits JSON and is safe to run against a
 real node because it does not call Ozon write endpoints or image-generation
 endpoints.
 
@@ -281,10 +281,12 @@ cargo run -p ozon-suite-qa -- \
 
 cargo run -p ozon-suite-qa -- \
   --base-url http://127.0.0.1:8790 \
-  memory --pid <local-node-pid> --scenario health --duration-secs 600
+  leak --pid <local-node-pid> --scenario health --duration-secs 600
 ```
 
-Use `all --pid <local-node-pid>` for a short combined run. Product-detail and
+`memory` is kept as an alias-style command for raw RSS growth checks; `leak` is
+the preferred command for release and stability gates. Use
+`all --pid <local-node-pid>` for a short combined run. Product-detail and
 poster-handoff scenarios require one lookup flag: `--offer-id`, `--product-id`,
 or `--sku`.
 
