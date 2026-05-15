@@ -414,6 +414,8 @@ function App() {
       : "登录后继续完成开通、安装和电脑授权。";
   const shouldShowAuthDialogStatus =
     authBusy || authState.phase === "failed" || authState.phase === "authenticated" || Boolean(operationStatus);
+  const statusTone = statusMessageTone(statusMessage, authState.phase, authBusy);
+  const StatusLineIcon = authBusy ? RefreshCcw : statusTone === "danger" ? AlertCircle : CheckCircle2;
   const setupStatus = setupStatusModel({
     activeEntitlement,
     computerAuthorized: localLeaseStatus?.valid === true,
@@ -962,6 +964,7 @@ function App() {
         await probeLocalNode();
       } catch (localError) {
         setLease(null);
+        applyLocalLeaseIssue(errorMessage(localError));
         setOperationStatus(localLeaseWriteFailureMessage(localError));
       }
     } catch (error) {
@@ -977,6 +980,27 @@ function App() {
         portal: {
           ...current.portal,
           lease: nextLease
+        }
+      };
+    });
+  }
+
+  function applyLocalLeaseIssue(issue: string) {
+    setLocalNode((current) => {
+      if (!current.portal) return current;
+      return {
+        ...current,
+        portal: {
+          ...current.portal,
+          lease: {
+            configured: current.portal.lease.configured,
+            valid: false,
+            lease_id: current.portal.lease.lease_id,
+            device_id: current.portal.lease.device_id,
+            features: current.portal.lease.features,
+            expires_at: current.portal.lease.expires_at,
+            issue
+          }
         }
       };
     });
@@ -1460,8 +1484,8 @@ function App() {
             </details>
             )}
 
-          <div className={`status-line ${authState.phase === "failed" ? "danger-line" : ""}`} aria-busy={authBusy}>
-            <CheckCircle2 size={18} /> {statusMessage}
+          <div className={`status-line ${statusTone}-line ${authBusy ? "busy-line" : ""}`} aria-busy={authBusy}>
+            <StatusLineIcon size={18} /> {statusMessage}
           </div>
 
           <section className="operations setup-wizard">
@@ -2142,7 +2166,7 @@ function localNodeOnlineMessage(health: LocalNodeHealth, portalError: unknown | 
   const version = health.package_version ? ` v${health.package_version}` : "";
   const protocol = health.protocol_version ? `，协议 ${health.protocol_version}` : "";
   if (portalError) {
-    return `电脑助手${version}已打开，当前是${mode}${protocol}；但账户状态读取失败：${errorMessage(portalError)}`;
+    return `电脑助手${version}已打开，${mode}${protocol}；${userFacingLocalNodeIssue(portalError)}`;
   }
   return `电脑助手${version}已连接，${mode}${protocol}`;
 }
@@ -2159,20 +2183,19 @@ function stripLocalNodeEndpointPrefix(message: string) {
 }
 
 function localNodeFailureMessage(error: unknown, endpoint: string | null = localNodeFailedEndpoint(error)) {
-  const message = stripLocalNodeEndpointPrefix(errorMessage(error));
   if (endpoint === "health") {
     if (isLocalNodeBrowserBlock(error)) {
-    return "网页没有找到电脑助手。请先打开电脑助手；如果已经打开，安装最新版后再试。";
+      return "网页没有找到电脑助手。请先打开电脑助手；如果已经打开，安装最新版后再试。";
     }
-    return `电脑助手检测失败：${message}`;
+    return "电脑助手没有回应。请确认已打开，或重启电脑助手后再点检测。";
   }
   if (endpoint === "manifest") {
-    return `电脑助手已打开，但 OpenClaw 连接信息读取失败：${message}。请重启或安装最新版。`;
+    return "电脑助手已打开，但连接信息读取失败。请重启电脑助手，仍不行就安装最新版。";
   }
   if (isLocalNodeBrowserBlock(error)) {
     return "网页没有找到电脑助手。请打开电脑助手；如果还是不行，安装最新版后再点检测。";
   }
-  return `未检测到电脑助手：${message}`;
+  return "未检测到电脑助手。请确认已打开，或安装最新版后再点检测。";
 }
 
 function isLocalNodeBrowserBlock(error: unknown) {
@@ -2330,18 +2353,41 @@ function setupStatusModel(input: {
 
 function userFacingLocalLeaseIssue(issue?: string | null) {
   if (!issue || issue === "cloud lease is not installed") return null;
+  if (isLocalNodeBrowserBlock(new Error(issue))) {
+    return "网页没有连上电脑助手。请先打开电脑助手，再点“我已打开，检测一下”。";
+  }
   if (issue.includes("public key") || issue.includes("signature")) {
-    return "电脑助手版本太旧或安装不完整，请下载安装最新版后再点“完成授权”。";
+    return "你现在打开的是旧版电脑助手。请下载安装最新版，打开后再点“完成授权”。";
   }
   if (issue.includes("expired")) {
     return "电脑授权已过期，请重新完成授权。";
   }
-  return `电脑助手还不能保存授权：${issue}`;
+  if (issue.includes("stored cloud lease is invalid")) {
+    return "电脑里的授权记录已失效，请重新点“完成授权”。";
+  }
+  return "电脑助手没有保存授权。请重启电脑助手，仍不行就安装最新版后再试。";
 }
 
 function localLeaseWriteFailureMessage(error: unknown) {
   const issue = userFacingLocalLeaseIssue(errorMessage(error));
-  return issue ?? `电脑助手授权写入失败：${errorMessage(error)}`;
+  return issue ?? "电脑助手没有保存授权。请重启电脑助手，仍不行就安装最新版后再试。";
+}
+
+function userFacingLocalNodeIssue(error: unknown) {
+  const issue = userFacingLocalLeaseIssue(stripLocalNodeEndpointPrefix(errorMessage(error)));
+  return issue ?? "账户授权状态读取失败。请重启电脑助手，仍不行就安装最新版。";
+}
+
+function statusMessageTone(message: string, phase: AuthPhase, busy: boolean) {
+  if (busy) return "ok";
+  if (phase === "failed") return "danger";
+  if (/(失败|不能|没有找到|没有保存|读取失败|未检测|太旧|不完整|失效|过期)/.test(message)) {
+    return "danger";
+  }
+  if (/(请|需要|等待|未开通|未启动|处理中)/.test(message)) {
+    return "warn";
+  }
+  return "ok";
 }
 
 function absolutePortalUrl(pathOrUrl: string) {

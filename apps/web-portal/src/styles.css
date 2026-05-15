@@ -944,6 +944,16 @@ input[readonly] {
   color: #087a59;
 }
 
+.ok-line {
+  background: #ffffff;
+}
+
+.warn-line {
+  background: #fffaf0;
+  border-color: #efd4a1;
+  color: #6b4815;
+}
+
 .danger-line {
   background: #fff8f5;
   border-color: #f0b3a4;
