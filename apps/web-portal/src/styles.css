@@ -1093,6 +1093,72 @@ input[readonly] {
   margin-top: 13px;
 }
 
+.inline-next-step {
+  align-items: center;
+  background: #f6f7f3;
+  border: 1px solid #d2dad2;
+  border-radius: 8px;
+  color: #1e2b25;
+  display: inline-flex;
+  font-size: 13px;
+  font-weight: 900;
+  gap: 8px;
+  min-height: 40px;
+  padding: 0 12px;
+}
+
+.inline-next-step svg {
+  color: #087a59;
+  flex: 0 0 auto;
+}
+
+.handoff-card {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #d2dad2;
+  border-radius: 8px;
+  display: grid;
+  gap: 14px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 18px;
+}
+
+.handoff-card.warn {
+  border-color: #efd4a1;
+}
+
+.handoff-card.online {
+  background: #f2fbf6;
+  border-color: #b9e4ce;
+}
+
+.handoff-card span {
+  color: #2c8a68;
+  font-size: 12px;
+  font-weight: 950;
+  text-transform: uppercase;
+}
+
+.handoff-card h3 {
+  font-size: 20px;
+  margin: 4px 0 6px;
+}
+
+.handoff-card p {
+  color: #526057;
+  font-size: 14px;
+  font-weight: 760;
+  line-height: 1.55;
+  max-width: 780px;
+}
+
+.handoff-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
 .op-section {
   background: #ffffff;
   border: 1px solid #d2dad2;
@@ -1319,6 +1385,7 @@ input[readonly] {
   .account-console,
   .pricing-band,
   .setup-panel,
+  .handoff-card,
   .wizard-step,
   .form-grid,
   .auth-grid,

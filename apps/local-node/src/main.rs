@@ -464,6 +464,8 @@ async fn portal_status(
     State(state): State<LocalState>,
 ) -> Result<Json<PortalStatusResponse>, ApiError> {
     let device_fingerprint = load_or_create_device_fingerprint(&state).await?;
+    let ozon = inspect_ozon_credentials(&state).await;
+    let openai = inspect_openai_config(&state).await;
     let lease = inspect_cloud_lease(&state).await;
     Ok(Json(PortalStatusResponse {
         service: "ozon-local-node",
@@ -481,6 +483,15 @@ async fn portal_status(
         package_version: package_version(),
         real_ozon_enabled: state.config.use_real_ozon,
         device_fingerprint,
+        ozon: PortalCredentialStatus {
+            configured: ozon.configured,
+            issue: ozon.issue,
+        },
+        openai: PortalOpenAiStatus {
+            configured: openai.configured,
+            image_model: openai.image_model,
+            issue: openai.issue,
+        },
         lease,
         features: vec![
             Feature::OzonRead,
@@ -2383,8 +2394,23 @@ struct PortalStatusResponse {
     package_version: &'static str,
     real_ozon_enabled: bool,
     device_fingerprint: String,
+    ozon: PortalCredentialStatus,
+    openai: PortalOpenAiStatus,
     lease: LeaseStatus,
     features: Vec<Feature>,
+}
+
+#[derive(Debug, Serialize)]
+struct PortalCredentialStatus {
+    configured: bool,
+    issue: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PortalOpenAiStatus {
+    configured: bool,
+    image_model: String,
+    issue: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2953,6 +2979,43 @@ mod tests {
         let stored = load_openai_config(&state).await.expect("stored config");
         assert_eq!(stored.api_key, "sk-test-openai-key");
         assert_eq!(stored.image_model, "gpt-image-1");
+    }
+
+    #[tokio::test]
+    async fn portal_status_exposes_safe_readiness_without_secrets() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-local-token", "operator-token".parse().unwrap());
+
+        let _ = save_ozon_config(
+            State(state.clone()),
+            headers.clone(),
+            Json(OzonConfigRequest {
+                client_id: "3169219".to_string(),
+                api_key: "ozon-secret".to_string(),
+            }),
+        )
+        .await
+        .expect("save Ozon config");
+        let _ = save_openai_config(
+            State(state.clone()),
+            headers,
+            Json(OpenAiConfigRequest {
+                api_key: "sk-test-openai-key".to_string(),
+                base_url: Some("https://relay.example.com".to_string()),
+                image_model: Some("gpt-image-1".to_string()),
+            }),
+        )
+        .await
+        .expect("save OpenAI config");
+
+        let response = portal_status(State(state)).await.expect("portal status").0;
+
+        assert!(response.ozon.configured);
+        assert!(response.openai.configured);
+        assert_eq!(response.openai.image_model, "gpt-image-1");
+        assert_eq!(response.ozon.issue, None);
+        assert_eq!(response.openai.issue, None);
     }
 
     #[test]

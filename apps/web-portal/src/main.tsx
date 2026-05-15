@@ -211,6 +211,15 @@ type LocalPortalStatus = {
   package_version?: string;
   real_ozon_enabled: boolean;
   device_fingerprint: string;
+  ozon?: {
+    configured: boolean;
+    issue?: string | null;
+  };
+  openai?: {
+    configured: boolean;
+    image_model: string;
+    issue?: string | null;
+  };
   lease: {
     configured: boolean;
     valid: boolean;
@@ -398,6 +407,8 @@ function App() {
   const canBindLocalDevice = canUseProtectedActions && localNode.phase === "online" && Boolean(localNode.portal?.device_fingerprint);
   const computerHelperOnline = localNode.phase === "online";
   const computerAuthorized = localLeaseStatus?.valid === true;
+  const storeCredentialsReady = localNode.portal?.ozon?.configured === true;
+  const posterConfigReady = localNode.portal?.openai?.configured === true;
   const directAuthUnavailableMessage = "账号服务正在维护，请稍后再试或联系运营支持。";
   const authSubmitText =
     authMethod === "phone"
@@ -424,7 +435,9 @@ function App() {
     device,
     localLeaseIssue: localLeaseStatus?.issue ?? null,
     localNode,
-    order
+    order,
+    posterConfigReady,
+    storeCredentialsReady
   });
   const canStartWorkspace = computerHelperOnline && computerAuthorized && canOpenLocalConsole;
   const readyForWorkspace = computerHelperOnline && computerAuthorized;
@@ -1383,6 +1396,10 @@ function App() {
               <span>电脑授权</span>
               <strong>{computerAuthorized ? "已完成" : "未完成"}</strong>
             </div>
+            <div className="rail-status">
+              <span>店铺授权</span>
+              <strong>{storeCredentialsReady ? "已保存" : readyForWorkspace ? "待填写" : "未开始"}</strong>
+            </div>
           </aside>
 
           <section className="workspace">
@@ -1538,9 +1555,9 @@ function App() {
                   </a>
                 )}
                 {readyForWorkspace && !canOpenLocalConsole && (
-                  <button className="secondary" disabled>
-                    <MonitorCheck size={18} /> 电脑助手已打开
-                  </button>
+                  <span className="inline-next-step">
+                    <MonitorCheck size={18} /> 去电脑上的 Ozon Rust Local 继续
+                  </span>
                 )}
               </div>
             </div>
@@ -1636,24 +1653,54 @@ function App() {
               <article className={wizardStepClass(readyForWorkspace, readyForWorkspace)}>
                 <span className="step-number">4</span>
                 <div>
-                  <h3>开始读取商品</h3>
+                  <h3>{storeCredentialsReady ? "开始读取商品" : "连接 Ozon 店铺"}</h3>
                   <p>
-                    {readyForWorkspace
-                      ? canOpenLocalConsole
-                        ? "打开工作台，添加店铺授权信息，然后读取商品并生成海报。"
-                        : "电脑助手已经打开。切到 Ozon Rust Local，添加店铺授权信息后读取商品。"
-                      : "前面几步完成后，这里会出现进入工作台的按钮。"}
+                    {!readyForWorkspace
+                      ? "前面几步完成后，这里会告诉你去哪里填写店铺授权。"
+                      : storeCredentialsReady
+                        ? "店铺授权已经保存。切到 Ozon Rust Local，点“读取商品”，再选择商品生成海报。"
+                        : "切到电脑上的 Ozon Rust Local，在“店铺授权”里填写 Ozon Client ID 和 API Key，保存后回这里刷新。"}
                   </p>
-                  {canStartWorkspace && (
+                  {readyForWorkspace && (
                     <div className="step-actions">
-                      <a className="download" href={LOCAL_CONSOLE_URL} target="_blank" rel="noreferrer">
-                        <MonitorCheck size={18} /> 打开工作台
-                      </a>
+                      {canStartWorkspace ? (
+                        <a className="download" href={LOCAL_CONSOLE_URL} target="_blank" rel="noreferrer">
+                          <MonitorCheck size={18} /> 打开工作台
+                        </a>
+                      ) : (
+                        <span className="inline-next-step">
+                          <MonitorCheck size={18} /> 请打开电脑上的 Ozon Rust Local
+                        </span>
+                      )}
+                      <button className="secondary" disabled={localNode.phase === "checking"} onClick={probeLocalNode}>
+                        <RefreshCcw size={18} /> 我已处理，刷新状态
+                      </button>
                     </div>
                   )}
                 </div>
               </article>
             </div>
+
+            {readyForWorkspace && (
+              <div className={`handoff-card ${storeCredentialsReady ? "online" : "warn"}`}>
+                <div>
+                  <span>{storeCredentialsReady ? "店铺已连好" : "现在去电脑助手"}</span>
+                  <h3>{storeCredentialsReady ? "可以读取真实商品了" : "把 Ozon API 填到电脑助手里"}</h3>
+                  <p>
+                    {storeCredentialsReady
+                      ? posterConfigReady
+                        ? "下一步在 Ozon Rust Local 里读取商品，选择商品后生成海报。"
+                        : "商品读取已经可用；如果要生成海报，再到电脑助手里补充图片生成 API 配置。"
+                      : "网页已经确认这台电脑能用。接下来不是在网页里填密钥，而是在电脑助手里保存店铺授权，这样密钥只留在你的电脑上。"}
+                  </p>
+                </div>
+                <div className="handoff-actions">
+                  <button className="secondary" disabled={localNode.phase === "checking"} onClick={probeLocalNode}>
+                    <RefreshCcw size={18} /> 刷新检查
+                  </button>
+                </div>
+              </div>
+            )}
 
             {paymentSession && (
               <div className="payment-note">
@@ -1772,6 +1819,24 @@ function App() {
                   <span>电脑授权</span>
                   <strong>{localPairingStatus.title}</strong>
                   <p>{localPairingStatus.message}</p>
+                </div>
+                <div className={`local-node-card ${storeCredentialsReady ? "online" : "warn"}`}>
+                  <span>店铺授权</span>
+                  <strong>{storeCredentialsReady ? "已保存" : "待填写"}</strong>
+                  <p>
+                    {storeCredentialsReady
+                      ? "电脑助手已保存 Ozon 店铺授权，可以读取商品。"
+                      : "切到 Ozon Rust Local，在店铺授权里填写 Client ID 和 API Key。"}
+                  </p>
+                </div>
+                <div className={`local-node-card ${posterConfigReady ? "online" : "warn"}`}>
+                  <span>海报生成</span>
+                  <strong>{posterConfigReady ? "已配置" : "待配置"}</strong>
+                  <p>
+                    {posterConfigReady
+                      ? `图片生成配置已保存：${localNode.portal?.openai?.image_model ?? "当前模型"}。`
+                      : "需要生成海报时，在电脑助手里保存图片生成 API 配置。"}
+                  </p>
                 </div>
                 <div className="local-node-card">
                   <span>安装包版本</span>
@@ -2172,11 +2237,10 @@ async function localNodePost<T>(path: string, body: unknown): Promise<T> {
 function localNodeOnlineMessage(health: LocalNodeHealth, portalError: unknown | null) {
   const mode = health.real_ozon_enabled ? "真实 Ozon 商品读取已开启" : "开发模式";
   const version = health.package_version ? ` v${health.package_version}` : "";
-  const protocol = health.protocol_version ? `，协议 ${health.protocol_version}` : "";
   if (portalError) {
-    return `电脑助手${version}已打开，${mode}${protocol}；${userFacingLocalNodeIssue(portalError)}`;
+    return `电脑助手${version}已打开，${mode}；${userFacingLocalNodeIssue(portalError)}`;
   }
-  return `电脑助手${version}已连接，${mode}${protocol}`;
+  return `电脑助手${version}已连接，${mode}`;
 }
 
 function localNodeFailedEndpoint(error: unknown) {
@@ -2319,6 +2383,8 @@ function setupStatusModel(input: {
   localLeaseIssue: string | null;
   localNode: LocalNodeProbe;
   order: Order | null;
+  posterConfigReady: boolean;
+  storeCredentialsReady: boolean;
 }) {
   const nodeOnline = input.localNode.phase === "online";
   if (!input.activeEntitlement) {
@@ -2338,10 +2404,24 @@ function setupStatusModel(input: {
     };
   }
   if (input.computerAuthorized) {
+    if (!input.storeCredentialsReady) {
+      return {
+        kind: "warn",
+        title: "去电脑助手填写店铺 API",
+        message: "这台电脑已经授权。现在切到 Ozon Rust Local，在店铺授权里保存 Ozon Client ID 和 API Key。"
+      };
+    }
+    if (!input.posterConfigReady) {
+      return {
+        kind: "warn",
+        title: "店铺已连上，补上海报配置",
+        message: "商品读取已经准备好。需要生成海报时，在电脑助手里保存图片生成 API 配置。"
+      };
+    }
     return {
       kind: "online",
       title: "可以开始了",
-      message: "服务和这台电脑都已准备好。打开电脑助手，添加店铺授权信息后读取商品。"
+      message: "服务、电脑和店铺授权都准备好了。切到 Ozon Rust Local 读取商品并生成海报。"
     };
   }
   if (!input.device) {
@@ -2362,7 +2442,7 @@ function setupStatusModel(input: {
   return {
     kind: "online",
     title: "可以开始了",
-    message: "服务和这台电脑都已准备好。打开电脑助手，添加店铺授权信息后读取商品。"
+    message: "服务、电脑和店铺授权都准备好了。切到 Ozon Rust Local 读取商品并生成海报。"
   };
 }
 
