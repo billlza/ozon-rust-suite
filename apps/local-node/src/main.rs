@@ -557,10 +557,20 @@ async fn save_openai_config(
     Json(input): Json<OpenAiConfigRequest>,
 ) -> Result<Json<OpenAiConfigResponse>, ApiError> {
     require_operator_token(&state, &headers)?;
-    let api_key = input.api_key.trim();
-    if api_key.is_empty() {
-        return Err(ApiError::bad_request("OpenAI API key is required"));
-    }
+    let api_key_input = input.api_key.trim();
+    let stored_config = if api_key_input.is_empty() {
+        Some(load_persisted_openai_config(&state).await.map_err(|_| {
+            ApiError::bad_request(
+                "OpenAI API key is required the first time you save this config",
+            )
+        })?)
+    } else {
+        None
+    };
+    let api_key = stored_config
+        .as_ref()
+        .map(|config| config.api_key.as_str())
+        .unwrap_or(api_key_input);
     let base_url = normalize_openai_base_url(
         input
             .base_url
@@ -1689,6 +1699,24 @@ async fn load_openai_config(state: &LocalState) -> Result<StoredOpenAiConfig, Ap
     })
 }
 
+async fn load_persisted_openai_config(state: &LocalState) -> Result<StoredOpenAiConfig, ApiError> {
+    if let Some(stored) = state.openai_config_cache.read().await.clone() {
+        return Ok(stored);
+    }
+
+    let Some(bundle) = state
+        .secrets
+        .get(&SecretName::new(SECRET_OPENAI_CONFIG))
+        .await
+        .map_err(|_| ApiError::internal("secret store unavailable"))?
+    else {
+        return Err(ApiError::bad_request("OpenAI API key is not stored in this app"));
+    };
+
+    serde_json::from_str(bundle.expose_secret())
+        .map_err(|_| ApiError::internal("stored OpenAI config is invalid"))
+}
+
 fn load_openai_env_config() -> Result<StoredOpenAiConfig, ApiError> {
     let api_key = optional_env("OPENAI_API_KEY").ok_or_else(|| {
         ApiError::bad_request("OpenAI API key is not configured for poster generation")
@@ -1923,38 +1951,31 @@ fn build_poster_brief(
     let attribute_points = product
         .attributes
         .iter()
-        .filter_map(|attribute| {
-            let name = attribute.name.as_deref()?.trim();
-            let value = attribute.values.first()?.trim();
-            if name.is_empty() || value.is_empty() {
-                return None;
-            }
-            Some(format!("{name}: {}", truncate_text(value, 22)))
-        })
+        .filter_map(attribute_selling_point)
         .take(3)
         .collect::<Vec<_>>();
     let selling_points = if attribute_points.is_empty() {
         vec![
-            format!("Ozon 实时商品：{}", product.offer_id),
-            format!("已读取 {} 张商品图", product.images.len()),
-            format!("已整理 {} 条属性", product.attributes.len()),
+            "商品图来自当前 Ozon 店铺".to_string(),
+            "保留包装、颜色和标签细节".to_string(),
+            "适合先做首图和活动海报".to_string(),
         ]
     } else {
         attribute_points
     };
     let image_count = product.images.len();
     let subheadline = if image_count > 0 {
-        format!("先用真实商品图站住画面，再把 Ozon 已有属性整理成能直接上图的卖点。")
+        "用真实商品图打底，背景只负责把质感和场景感补上。".to_string()
     } else {
         "这件商品还没带主图，先补图再出海报会更稳。".to_string()
     };
     let compliance_note = if state.config.use_real_ozon {
-        "商品主体与文案来自 Ozon 实时数据；AI 只负责背景氛围，不重画商品包装。".to_string()
+        "不改商品外观；文案和图片按 Ozon 实时数据校验。".to_string()
     } else {
         "当前是本地 mock 模式，正式出图前请切到真实 Ozon API 再校验一次。".to_string()
     };
     let cta_line = match locale {
-        "zh-CN" => "主图、卖点和活动视觉可以先在这一版里敲定".to_string(),
+        "zh-CN" => "先出一版能给运营看的海报，再微调标题和卖点".to_string(),
         _ => "Lock the hero image, then tune the selling points in one pass.".to_string(),
     };
     let image_stage = if product.primary_image.is_some() {
@@ -1979,6 +2000,23 @@ fn build_poster_brief(
             background_prompt,
         },
     })
+}
+
+fn attribute_selling_point(attribute: &ozon_connector::OzonProductAttribute) -> Option<String> {
+    let name = attribute.name.as_deref()?.trim();
+    let value = attribute.values.first()?.trim();
+    if name.is_empty() || value.is_empty() || is_low_value_attribute(name) {
+        return None;
+    }
+    Some(format!("{name}: {}", truncate_text(value, 22)))
+}
+
+fn is_low_value_attribute(name: &str) -> bool {
+    let normalized = name.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "id" | "sku" | "barcode" | "barcodes" | "offer id" | "offer_id"
+    )
 }
 
 async fn generate_poster_background(
@@ -2041,7 +2079,7 @@ fn summarize_openai_error(body: &str) -> String {
             .unwrap_or_else(|| "upstream returned an error without a message".to_string());
         if envelope.error.code.as_deref() == Some("model_not_found") {
             return format!(
-                "image model is not available on this relay key: {message}. Change the Image model to one enabled by the relay, or use a key with an image generation channel."
+                "当前 API Key 没有开通这个图片模型：{message}。请换成支持图片生成的 Key，或让中转商开通 gpt-image-1 / gpt-image-2 图片通道。"
             );
         }
         if let Some(code) = envelope.error.code {
@@ -2821,6 +2859,91 @@ mod tests {
         let mut operator_headers = HeaderMap::new();
         operator_headers.insert("x-local-token", "operator-token".parse().unwrap());
         require_bridge_or_operator_token(&state, &operator_headers).expect("operator token");
+    }
+
+    #[tokio::test]
+    async fn openai_config_save_preserves_existing_key_when_key_is_blank() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-local-token", "operator-token".parse().unwrap());
+
+        let _ = save_openai_config(
+            State(state.clone()),
+            headers.clone(),
+            Json(OpenAiConfigRequest {
+                api_key: "sk-test-openai-key".to_string(),
+                base_url: Some("https://relay.example.com".to_string()),
+                image_model: Some("gpt-image-2".to_string()),
+            }),
+        )
+        .await
+        .expect("initial OpenAI config save");
+
+        let response = save_openai_config(
+            State(state.clone()),
+            headers,
+            Json(OpenAiConfigRequest {
+                api_key: "".to_string(),
+                base_url: Some("https://relay.example.com".to_string()),
+                image_model: Some("gpt-image-1".to_string()),
+            }),
+        )
+        .await
+        .expect("OpenAI config update without retyping key");
+
+        assert_eq!(response.image_model, "gpt-image-1");
+        let stored = load_openai_config(&state).await.expect("stored config");
+        assert_eq!(stored.api_key, "sk-test-openai-key");
+        assert_eq!(stored.image_model, "gpt-image-1");
+    }
+
+    #[test]
+    fn poster_brief_fallback_copy_is_operator_friendly() {
+        let state = test_state();
+        let product = ozon_connector::OzonProductDetail {
+            lookup: ozon_connector::OzonProductLookup {
+                offer_id: Some("offer-1".to_string()),
+                ..Default::default()
+            },
+            product_id: "product-1".to_string(),
+            offer_id: "offer-1".to_string(),
+            sku: None,
+            name: Some("Pocket lighter".to_string()),
+            description_category_id: None,
+            type_id: None,
+            barcodes: vec![],
+            primary_image: Some("https://cdn.example.test/product.jpg".to_string()),
+            images: vec![ozon_connector::OzonProductImage {
+                url: "https://cdn.example.test/product.jpg".to_string(),
+                role: ozon_connector::OzonProductImageRole::Primary,
+                position: 0,
+            }],
+            gallery_images: vec![],
+            images360: vec![],
+            color_image: None,
+            attributes: vec![],
+            visibility: None,
+            archived: None,
+            autoarchived: None,
+            created_at: None,
+            updated_at: None,
+            statuses: None,
+            source_endpoints: vec![],
+            warnings: vec![],
+        };
+
+        let context = build_poster_brief(&state, product, "studio", "zh-CN").expect("poster brief");
+
+        assert_eq!(
+            context.brief.selling_points,
+            vec![
+                "商品图来自当前 Ozon 店铺".to_string(),
+                "保留包装、颜色和标签细节".to_string(),
+                "适合先做首图和活动海报".to_string(),
+            ]
+        );
+        assert!(!context.brief.subheadline.contains("已读取"));
+        assert!(!context.brief.cta_line.contains("接口"));
     }
 
     #[test]

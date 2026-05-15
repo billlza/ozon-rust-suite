@@ -336,6 +336,21 @@ function App() {
     return false;
   }
 
+  function userFacingError(error: string | undefined) {
+    const raw = error?.trim() || "未知错误";
+    if (
+      raw.includes("No available channel for model") ||
+      raw.includes("没有开通这个图片模型") ||
+      raw.includes("image model is not available")
+    ) {
+      return "当前中转/API Key 没有图片生成通道。请换一个支持 gpt-image-1 或 gpt-image-2 的 Key，或让中转商开通图片模型后再试。";
+    }
+    if (raw.includes("OpenAI API key is required")) {
+      return "第一次保存 OpenAI 中转配置需要填写 API Key；保存过以后，只改地址或模型可以留空。";
+    }
+    return raw;
+  }
+
   async function refresh() {
     const [tasksResponse, scheduleResponse] = await Promise.all([
       api("/tasks"),
@@ -394,8 +409,15 @@ function App() {
   }
 
   async function saveOpenAiConfig() {
-    if (!openAiApiKey.trim()) {
-      setMessage("请填写 OpenAI 或中转服务 API Key");
+    const keyIsBlank = !openAiApiKey.trim();
+    const canReuseStoredOpenAiKey =
+      configStatus?.openai.configured && configStatus.openai.source !== "env";
+    if (keyIsBlank && !canReuseStoredOpenAiKey) {
+      setMessage(
+        configStatus?.openai.source === "env"
+          ? "当前 Key 来自启动环境变量。要在界面里修改地址或模型，请重新填写一次 API Key 后保存。"
+          : "第一次保存 OpenAI 中转配置需要填写 API Key；以后只改地址或模型可以留空。"
+      );
       return;
     }
     const response = await api("/config/openai", {
@@ -410,7 +432,7 @@ function App() {
     setMessage(
       response.ok
         ? `OpenAI 中转已保存：${data.base_url} / ${data.image_model} / ${data.api_key_fingerprint}`
-        : `OpenAI 配置保存失败：${data.error}`
+        : `OpenAI 配置保存失败：${userFacingError(data.error)}`
     );
     if (response.ok) {
       setOpenAiApiKey("");
@@ -566,7 +588,7 @@ function App() {
     const data = await response.json();
     if (!response.ok) {
       setPosterBackground(null);
-      setMessage(`海报背景生成失败：${data.error}`);
+      setMessage(`海报背景生成失败：${userFacingError(data.error)}`);
       return;
     }
     setProductDetail({ connector_mode: data.connector_mode, product: data.product });
@@ -961,7 +983,7 @@ function App() {
               API Key
               <input
                 autoComplete="off"
-                placeholder="保存后只显示指纹"
+                placeholder={configStatus?.openai.configured ? "留空则沿用已保存的 Key" : "第一次保存需要填写"}
                 value={openAiApiKey}
                 onChange={(event) => setOpenAiApiKey(event.target.value)}
                 type="password"
