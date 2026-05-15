@@ -126,6 +126,7 @@ fn skill_router(state: LocalState) -> Router {
         .route("/tools/ozon.products.list", post(ozon_products_list))
         .route("/tools/ozon.products.get", post(ozon_products_get))
         .route("/poster/brief", post(poster_brief))
+        .route("/poster/handoff", post(poster_handoff))
         .route("/poster/generate", post(poster_generate))
         .route("/poster/verify", post(poster_verify))
         .route("/tasks/dry-run", post(create_dry_run))
@@ -433,6 +434,10 @@ async fn diagnostics(State(state): State<LocalState>) -> Json<DiagnosticsRespons
     let ozon = inspect_ozon_credentials(&state).await;
     let openai = inspect_openai_config(&state).await;
     let lease = inspect_cloud_lease(&state).await;
+    let manifest_url = format!(
+        "{}/openclaw/manifest",
+        local_http_url(&state.config.skill_bind)
+    );
     Json(DiagnosticsResponse {
         service: "ozon-local-node",
         status: "ok",
@@ -455,6 +460,7 @@ async fn diagnostics(State(state): State<LocalState>) -> Json<DiagnosticsRespons
             api_key_fingerprint: ozon.api_key_fingerprint,
             issue: ozon.issue,
         },
+        poster_generation: poster_generation_status(&openai, manifest_url),
         openai,
         lease,
     })
@@ -467,16 +473,18 @@ async fn portal_status(
     let ozon = inspect_ozon_credentials(&state).await;
     let openai = inspect_openai_config(&state).await;
     let lease = inspect_cloud_lease(&state).await;
+    let manifest_url = format!(
+        "{}/openclaw/manifest",
+        local_http_url(&state.config.skill_bind)
+    );
+    let poster_generation = poster_generation_status(&openai, manifest_url.clone());
     Ok(Json(PortalStatusResponse {
         service: "ozon-local-node",
         status: "online",
         checked_at: Utc::now().to_rfc3339(),
         skill_api: local_http_url(&state.config.skill_bind),
         agent_api: local_http_url(&state.config.agent_bind),
-        manifest_url: format!(
-            "{}/openclaw/manifest",
-            local_http_url(&state.config.skill_bind)
-        ),
+        manifest_url: manifest_url.clone(),
         bridge_auth_header: "x-openclaw-token",
         protocol_version: PROTOCOL_VERSION,
         build_commit: BUILD_COMMIT,
@@ -492,6 +500,7 @@ async fn portal_status(
             image_model: openai.image_model,
             issue: openai.issue,
         },
+        poster_generation,
         lease,
         features: vec![
             Feature::OzonRead,
@@ -537,6 +546,14 @@ async fn openclaw_manifest(State(state): State<LocalState>) -> Json<OpenClawMani
                 risk: "read_only",
                 approval_required: false,
                 description: "Read one Ozon product fact pack with stable details and image URLs",
+            },
+            OpenClawTool {
+                name: "poster.handoff",
+                method: "POST",
+                path: "/poster/handoff",
+                risk: "read_only",
+                approval_required: false,
+                description: "Return a product-grounded poster package for OpenClaw/Codex generation; no OpenAI API key required",
             },
             OpenClawTool {
                 name: "tasks.dry_run",
@@ -705,6 +722,11 @@ async fn config_status(
     require_operator_token(&state, &headers)?;
     let ozon = inspect_ozon_credentials(&state).await;
     let openai = inspect_openai_config(&state).await;
+    let manifest_url = format!(
+        "{}/openclaw/manifest",
+        local_http_url(&state.config.skill_bind)
+    );
+    let poster_generation = poster_generation_status(&openai, manifest_url.clone());
     Ok(Json(ConfigStatusResponse {
         service: "ozon-local-node",
         checked_at: Utc::now().to_rfc3339(),
@@ -721,15 +743,13 @@ async fn config_status(
             api_key_fingerprint: ozon.api_key_fingerprint,
             issue: ozon.issue,
         },
+        poster_generation,
         openai,
         lease: inspect_cloud_lease(&state).await,
         endpoints: LocalEndpointStatus {
             skill_api: local_http_url(&state.config.skill_bind),
             agent_api: local_http_url(&state.config.agent_bind),
-            manifest_url: format!(
-                "{}/openclaw/manifest",
-                local_http_url(&state.config.skill_bind)
-            ),
+            manifest_url,
         },
     }))
 }
@@ -869,7 +889,7 @@ async fn poster_brief(
     headers: HeaderMap,
     Json(input): Json<PosterBriefRequest>,
 ) -> Result<Json<PosterBriefResponse>, ApiError> {
-    require_operator_token(&state, &headers)?;
+    require_bridge_or_operator_token(&state, &headers)?;
     let PosterBriefRequest {
         lookup,
         theme,
@@ -885,6 +905,51 @@ async fn poster_brief(
         connector_mode: connector_mode(&state),
         product: brief.product.clone(),
         brief: brief.brief,
+    }))
+}
+
+async fn poster_handoff(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Json(input): Json<PosterBriefRequest>,
+) -> Result<Json<PosterHandoffResponse>, ApiError> {
+    require_bridge_or_operator_token(&state, &headers)?;
+    let PosterBriefRequest {
+        lookup,
+        theme,
+        locale,
+    } = input;
+    let poster = build_poster_brief(
+        &state,
+        load_product_for_lookup(&state, lookup.into_lookup()).await?,
+        theme.as_deref().unwrap_or("studio"),
+        locale.as_deref().unwrap_or("zh-CN"),
+    )?;
+    let source_images = poster_source_images(&poster.product);
+    let prompt = build_openclaw_poster_prompt(&poster.product, &poster.brief, &source_images);
+    Ok(Json(PosterHandoffResponse {
+        connector_mode: connector_mode(&state),
+        generated_at: Utc::now().to_rfc3339(),
+        mode: "openclaw_codex",
+        product: poster.product,
+        brief: poster.brief,
+        source_images,
+        openclaw: PosterOpenClawHandoff {
+            manifest_url: format!(
+                "{}/openclaw/manifest",
+                local_http_url(&state.config.skill_bind)
+            ),
+            auth_header: "x-openclaw-token",
+            token_policy: "Do not paste the bridge token into public prompts. Configure it only inside OpenClaw/Codex connector settings.",
+            recommended_tools: vec!["ozon.products.get", "poster.handoff"],
+        },
+        instructions: vec![
+            "Use the user's signed-in OpenClaw/Codex image capability when available; no OpenAI API key is required by Ozon Rust Local for this path.",
+            "Use the supplied Ozon image URLs as product references and preserve packaging, color, labels, proportions, and visible text.",
+            "Generate a finished 4:5 marketplace poster; do not invent certifications, discounts, brand partnerships, or product functions that are not present in the source facts.",
+            "If any product detail is ambiguous, keep the claim generic and ask the operator before adding stronger copy.",
+        ],
+        prompt,
     }))
 }
 
@@ -1997,6 +2062,26 @@ fn openai_images_endpoint(base_url: &str) -> String {
     }
 }
 
+fn poster_generation_status(
+    openai: &OpenAiCredentialStatus,
+    manifest_url: String,
+) -> PosterGenerationStatus {
+    PosterGenerationStatus {
+        preferred: "openclaw_codex",
+        openclaw_bridge_ready: true,
+        handoff_path: "/poster/handoff",
+        manifest_url,
+        api_fallback_configured: openai.configured,
+        api_fallback_model: openai.configured.then(|| openai.image_model.clone()),
+        api_fallback_issue: openai.issue.clone(),
+        message: if openai.configured {
+            "推荐使用龙虾/Codex 登录态出图；图片 API 已配置，可作为后台自动出图兜底。"
+        } else {
+            "推荐使用龙虾/Codex 登录态出图；未配置图片 API 不影响主流程。"
+        },
+    }
+}
+
 async fn load_product_for_lookup(
     state: &LocalState,
     lookup: OzonProductLookup,
@@ -2069,6 +2154,71 @@ fn build_poster_brief(
             background_prompt,
         },
     })
+}
+
+fn poster_source_images(product: &ozon_connector::OzonProductDetail) -> Vec<PosterSourceImage> {
+    let mut images = Vec::new();
+    if let Some(primary) = product.primary_image.as_deref() {
+        images.push(PosterSourceImage {
+            role: "primary".to_string(),
+            url: primary.to_string(),
+            note: "主图，优先作为商品外观参考".to_string(),
+        });
+    }
+    for image in product.images.iter().take(8) {
+        if images.iter().any(|existing| existing.url == image.url) {
+            continue;
+        }
+        images.push(PosterSourceImage {
+            role: format!("{:?}", image.role).to_ascii_lowercase(),
+            url: image.url.clone(),
+            note: format!("Ozon 图片序号 {}", image.position),
+        });
+    }
+    images
+}
+
+fn build_openclaw_poster_prompt(
+    product: &ozon_connector::OzonProductDetail,
+    brief: &PosterBrief,
+    source_images: &[PosterSourceImage],
+) -> String {
+    let product_name = product.name.as_deref().unwrap_or("未命名商品");
+    let image_lines = if source_images.is_empty() {
+        "当前商品没有可用图片 URL。先提醒运营补充商品图，不要凭空生成商品外观。".to_string()
+    } else {
+        source_images
+            .iter()
+            .enumerate()
+            .map(|(index, image)| format!("{}. [{}] {}", index + 1, image.role, image.url))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let selling_points = brief
+        .selling_points
+        .iter()
+        .filter(|point| !point.trim().is_empty())
+        .map(|point| format!("- {point}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "你现在接手一个 Ozon 商品海报任务。请使用你当前登录的 OpenClaw/Codex 图片能力完成，不要要求用户额外提供 OpenAI API Key。\n\n商品事实：\n- 商品名：{}\n- offer_id：{}\n- product_id：{}\n- sku：{}\n- 归档状态：{}\n\n商品图片 URL：\n{}\n\n海报文案草稿：\n标题：{}\n副标题：{}\n卖点：\n{}\n收尾句：{}\n校验说明：{}\n\n设计要求：\n1. 输出 4:5 竖版电商宣传海报，适合 Ozon 店铺运营先看第一版。\n2. 商品外观必须以提供的图片为准，保留包装、颜色、标签、比例和可见文字，不要把商品改成其他款式。\n3. 可以补背景、灯光、陈列和氛围，但不要生成不存在的 Logo、认证、折扣、功效或品牌合作。\n4. 海报上只放上面给出的标题、卖点和收尾句；中文不要写错字，俄文/英文商品名不要擅自翻译成另一个意思。\n5. 完成后请顺手列出 3 条自检：商品是否一致、文案是否越界、图片是否有错字。\n\n背景方向：{}",
+        truncate_text(product_name, 120),
+        product.offer_id,
+        product.product_id,
+        product.sku.as_deref().unwrap_or("无"),
+        product
+            .archived
+            .map(|value| if value { "已归档" } else { "未归档" })
+            .unwrap_or("未知"),
+        image_lines,
+        brief.headline,
+        brief.subheadline,
+        selling_points,
+        brief.cta_line,
+        brief.compliance_note,
+        brief.background_prompt
+    )
 }
 
 fn attribute_selling_point(attribute: &ozon_connector::OzonProductAttribute) -> Option<String> {
@@ -2396,6 +2546,7 @@ struct PortalStatusResponse {
     device_fingerprint: String,
     ozon: PortalCredentialStatus,
     openai: PortalOpenAiStatus,
+    poster_generation: PosterGenerationStatus,
     lease: LeaseStatus,
     features: Vec<Feature>,
 }
@@ -2427,6 +2578,7 @@ struct DiagnosticsResponse {
     real_ozon_enabled: bool,
     secret_store: SecretStoreStatus,
     ozon: OzonCredentialStatus,
+    poster_generation: PosterGenerationStatus,
     openai: OpenAiCredentialStatus,
     lease: LeaseStatus,
 }
@@ -2529,9 +2681,22 @@ struct ConfigStatusResponse {
     connector_mode: &'static str,
     secret_store: SecretStoreStatus,
     ozon: OzonCredentialStatus,
+    poster_generation: PosterGenerationStatus,
     openai: OpenAiCredentialStatus,
     lease: LeaseStatus,
     endpoints: LocalEndpointStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct PosterGenerationStatus {
+    preferred: &'static str,
+    openclaw_bridge_ready: bool,
+    handoff_path: &'static str,
+    manifest_url: String,
+    api_fallback_configured: bool,
+    api_fallback_model: Option<String>,
+    api_fallback_issue: Option<String>,
+    message: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -2663,6 +2828,34 @@ struct PosterBriefResponse {
     connector_mode: &'static str,
     product: ozon_connector::OzonProductDetail,
     brief: PosterBrief,
+}
+
+#[derive(Debug, Serialize)]
+struct PosterSourceImage {
+    role: String,
+    url: String,
+    note: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PosterOpenClawHandoff {
+    manifest_url: String,
+    auth_header: &'static str,
+    token_policy: &'static str,
+    recommended_tools: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct PosterHandoffResponse {
+    connector_mode: &'static str,
+    generated_at: String,
+    mode: &'static str,
+    product: ozon_connector::OzonProductDetail,
+    brief: PosterBrief,
+    source_images: Vec<PosterSourceImage>,
+    openclaw: PosterOpenClawHandoff,
+    instructions: Vec<&'static str>,
+    prompt: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -3014,6 +3207,9 @@ mod tests {
         assert!(response.ozon.configured);
         assert!(response.openai.configured);
         assert_eq!(response.openai.image_model, "gpt-image-1");
+        assert_eq!(response.poster_generation.preferred, "openclaw_codex");
+        assert!(response.poster_generation.openclaw_bridge_ready);
+        assert!(response.poster_generation.api_fallback_configured);
         assert_eq!(response.ozon.issue, None);
         assert_eq!(response.openai.issue, None);
     }
@@ -3065,6 +3261,51 @@ mod tests {
         );
         assert!(!context.brief.subheadline.contains("已读取"));
         assert!(!context.brief.cta_line.contains("接口"));
+    }
+
+    #[test]
+    fn openclaw_poster_handoff_is_account_first_and_secret_free() {
+        let state = test_state();
+        let product = ozon_connector::OzonProductDetail {
+            lookup: ozon_connector::OzonProductLookup {
+                offer_id: Some("offer-1".to_string()),
+                ..Default::default()
+            },
+            product_id: "product-1".to_string(),
+            offer_id: "offer-1".to_string(),
+            sku: Some("sku-1".to_string()),
+            name: Some("Pocket lighter".to_string()),
+            description_category_id: None,
+            type_id: None,
+            barcodes: vec![],
+            primary_image: Some("https://cdn.example.test/product.jpg".to_string()),
+            images: vec![ozon_connector::OzonProductImage {
+                url: "https://cdn.example.test/product.jpg".to_string(),
+                role: ozon_connector::OzonProductImageRole::Primary,
+                position: 0,
+            }],
+            gallery_images: vec![],
+            images360: vec![],
+            color_image: None,
+            attributes: vec![],
+            visibility: None,
+            archived: Some(false),
+            autoarchived: None,
+            created_at: None,
+            updated_at: None,
+            statuses: None,
+            source_endpoints: vec![],
+            warnings: vec![],
+        };
+        let context = build_poster_brief(&state, product, "studio", "zh-CN").expect("poster brief");
+        let images = poster_source_images(&context.product);
+        let prompt = build_openclaw_poster_prompt(&context.product, &context.brief, &images);
+
+        assert!(prompt.contains("OpenClaw/Codex"));
+        assert!(prompt.contains("不要要求用户额外提供 OpenAI API Key"));
+        assert!(prompt.contains("https://cdn.example.test/product.jpg"));
+        assert!(!prompt.contains("bridge-token"));
+        assert!(!prompt.contains("operator-token"));
     }
 
     #[test]

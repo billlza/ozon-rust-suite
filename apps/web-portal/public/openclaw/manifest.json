@@ -33,6 +33,14 @@
       "description": "Read one product fact pack with stable Ozon details, attributes, and image URLs."
     },
     {
+      "name": "poster.handoff",
+      "method": "POST",
+      "path": "/poster/handoff",
+      "risk": "read_only",
+      "approval_required": false,
+      "description": "Build a product-grounded poster prompt and image package for OpenClaw/Codex account-based generation."
+    },
+    {
       "name": "tasks.dry_run",
       "method": "POST",
       "path": "/tasks/dry-run",
@@ -56,6 +64,7 @@
   ],
   "safety_rules": [
     "Read tools use the Ozon credentials saved in the local node.",
+    "Poster handoff uses OpenClaw/Codex signed-in capabilities and does not require an OpenAI API key in the local node.",
     "Changes that could affect store data require local operator approval.",
     "The local skill API binds to 127.0.0.1 and requires x-openclaw-token for bridge calls.",
     "Operator-only configuration and approval actions require x-local-token.",

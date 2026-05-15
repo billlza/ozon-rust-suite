@@ -62,6 +62,41 @@ jobs:
           mkdir -p apps/local-node/src-tauri/binaries
           cp target/debug/ozon-local-node apps/local-node/src-tauri/binaries/ozon-local-node-x86_64-unknown-linux-gnu
 
+      - name: QA CLI local-node smoke and short stress
+        run: |
+          set -euo pipefail
+          export OZON_CONNECTOR_MODE=mock
+          export OZON_LOCAL_SKILL_BIND=127.0.0.1:18790
+          export OZON_LOCAL_AGENT_BIND=127.0.0.1:18791
+          export OZON_LOCAL_TOKEN=test-local-token-012345678901234567890123456789
+          export OZON_OPENCLAW_TOKEN=test-openclaw-token-01234567890123456789012345
+          target/debug/ozon-local-node > /tmp/ozon-local-node-qa.log 2>&1 &
+          node_pid=$!
+          trap 'kill "$node_pid" 2>/dev/null || true; cat /tmp/ozon-local-node-qa.log 2>/dev/null || true' EXIT
+          for _ in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:18790/health >/dev/null; then
+              break
+            fi
+            sleep 0.25
+          done
+          cargo run -p ozon-suite-qa -- \
+            --base-url http://127.0.0.1:18790 \
+            --local-token "$OZON_LOCAL_TOKEN" \
+            --openclaw-token "$OZON_OPENCLAW_TOKEN" \
+            smoke
+          cargo run -p ozon-suite-qa -- \
+            --base-url http://127.0.0.1:18790 \
+            --openclaw-token "$OZON_OPENCLAW_TOKEN" \
+            perf --scenario poster-handoff --offer-id SKU-MOCK-0 --requests 20 --concurrency 4
+          cargo run -p ozon-suite-qa -- \
+            --base-url http://127.0.0.1:18790 \
+            --openclaw-token "$OZON_OPENCLAW_TOKEN" \
+            stability --scenario health --duration-secs 3 --interval-ms 250
+          cargo run -p ozon-suite-qa -- \
+            --base-url http://127.0.0.1:18790 \
+            --openclaw-token "$OZON_OPENCLAW_TOKEN" \
+            memory --pid "$node_pid" --scenario health --duration-secs 3 --interval-ms 250 --growth-limit-mb 128
+
       - name: Test workspace
         run: cargo test --workspace
 

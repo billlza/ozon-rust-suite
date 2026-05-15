@@ -148,6 +148,27 @@ type PosterGenerateResult = {
   background_data_url: string;
 };
 
+type PosterHandoffResult = {
+  connector_mode: "mock" | "real";
+  generated_at: string;
+  mode: "openclaw_codex";
+  product: ProductDetail;
+  brief: PosterBrief;
+  source_images: Array<{
+    role: string;
+    url: string;
+    note: string;
+  }>;
+  openclaw: {
+    manifest_url: string;
+    auth_header: string;
+    token_policy: string;
+    recommended_tools: string[];
+  };
+  instructions: string[];
+  prompt: string;
+};
+
 type PosterCopyMismatch = {
   field: string;
   expected: string;
@@ -220,6 +241,16 @@ type ConfigStatus = {
     client_id: string | null;
     api_key_fingerprint: string | null;
     issue: string | null;
+  };
+  poster_generation: {
+    preferred: "openclaw_codex" | string;
+    openclaw_bridge_ready: boolean;
+    handoff_path: string;
+    manifest_url: string;
+    api_fallback_configured: boolean;
+    api_fallback_model: string | null;
+    api_fallback_issue: string | null;
+    message: string;
   };
   openai: {
     configured: boolean;
@@ -295,6 +326,7 @@ function App() {
   const [productDetail, setProductDetail] = useState<ProductDetailResult | null>(null);
   const [posterTheme, setPosterTheme] = useState("studio");
   const [posterBrief, setPosterBrief] = useState<PosterBriefResult | null>(null);
+  const [posterHandoff, setPosterHandoff] = useState<PosterHandoffResult | null>(null);
   const [posterBackground, setPosterBackground] = useState<PosterGenerateResult | null>(null);
   const [posterVerification, setPosterVerification] = useState<PosterVerifyResult | null>(null);
   const [imageGenerationIssue, setImageGenerationIssue] = useState<string | null>(null);
@@ -329,7 +361,7 @@ function App() {
   const posterGenerationGateMessage = !canUseOzonReadTools
     ? ozonReadGateMessage
     : !openAiConfigReady
-      ? "先保存图片生成 API 配置，再生成海报背景"
+      ? "未配置图片 API 时，先用“复制给龙虾/Codex”生成；API 只用于后台自动出图。"
       : imageGenerationIssue
         ? imageGenerationIssue
         : "";
@@ -384,10 +416,10 @@ function App() {
       raw.includes("没有开通这个图片模型") ||
       raw.includes("image model is not available")
     ) {
-      return "当前中转/API Key 没有图片生成通道。请换一个支持 gpt-image-1 或 gpt-image-2 的 Key，或让中转商开通图片模型后再试。";
+      return "当前图片 API 没有这个模型通道。可以先用“复制给龙虾/Codex”出图，或换一个支持 gpt-image-1 / gpt-image-2 的 API Key。";
     }
     if (raw.includes("OpenAI API key is required")) {
-      return "第一次保存 OpenAI 中转配置需要填写 API Key；保存过以后，只改地址或模型可以留空。";
+      return "第一次保存图片 API 配置需要填写 API Key；保存过以后，只改地址或模型可以留空。";
     }
     return raw;
   }
@@ -469,7 +501,7 @@ function App() {
       setMessage(
         configStatus?.openai.source === "env"
           ? "当前 Key 来自启动环境变量。要在界面里修改地址或模型，请重新填写一次 API Key 后保存。"
-          : "第一次保存 OpenAI 中转配置需要填写 API Key；以后只改地址或模型可以留空。"
+          : "第一次保存图片 API 配置需要填写 API Key；以后只改地址或模型可以留空。"
       );
       return;
     }
@@ -484,8 +516,8 @@ function App() {
     const data = await response.json();
     setMessage(
       response.ok
-        ? `OpenAI 中转已保存：${data.base_url} / ${data.image_model} / ${data.api_key_fingerprint}`
-        : `OpenAI 配置保存失败：${userFacingError(data.error)}`
+        ? `图片 API 已保存：${data.base_url} / ${data.image_model} / ${data.api_key_fingerprint}`
+        : `图片 API 保存失败：${userFacingError(data.error)}`
     );
     if (response.ok) {
       setOpenAiApiKey("");
@@ -568,6 +600,7 @@ function App() {
 
   function resetPosterWorkbench() {
     setPosterBrief(null);
+    setPosterHandoff(null);
     setPosterBackground(null);
     setPosterVerification(null);
     setPosterHeadline("");
@@ -629,9 +662,37 @@ function App() {
     setProductDetail({ connector_mode: data.connector_mode, product: data.product });
     setPosterBrief(data);
     setPosterBackground(null);
+    setPosterHandoff(null);
     setPosterVerification(null);
     applyPosterBrief(data.brief);
-    setMessage("海报简报已生成，接下来可以直接生成背景图");
+    setMessage("海报简报已生成。推荐先复制给龙虾/Codex 出图；配置图片 API 后也可以后台自动生成背景。");
+  }
+
+  async function copyPosterHandoff() {
+    if (!ensureOzonReadAccess("准备龙虾/Codex 海报任务")) return;
+    const lookup = currentLookupPayload();
+    if (!lookup) {
+      setMessage("先读取一个真实商品，再复制给龙虾/Codex");
+      return;
+    }
+    const response = await api("/poster/handoff", {
+      method: "POST",
+      body: JSON.stringify({ ...lookup, theme: posterTheme, locale: "zh-CN" })
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      setPosterHandoff(null);
+      setMessage(`龙虾/Codex 任务包生成失败：${userFacingError(data.error)}`);
+      return;
+    }
+    setProductDetail({ connector_mode: data.connector_mode, product: data.product });
+    setPosterBrief({ connector_mode: data.connector_mode, product: data.product, brief: data.brief });
+    setPosterHandoff(data);
+    setPosterBackground(null);
+    setPosterVerification(null);
+    applyPosterBrief(data.brief);
+    await navigator.clipboard.writeText(data.prompt);
+    setMessage(`已复制给龙虾/Codex 的海报任务：${data.product.offer_id}，包含 ${data.source_images.length} 张商品图。`);
   }
 
   async function generatePosterBackground() {
@@ -661,6 +722,7 @@ function App() {
     setImageGenerationIssue(null);
     setProductDetail({ connector_mode: data.connector_mode, product: data.product });
     setPosterBrief({ connector_mode: data.connector_mode, product: data.product, brief: data.brief });
+    setPosterHandoff(null);
     setPosterBackground(data);
     setPosterVerification(null);
     applyPosterBrief(data.brief);
@@ -954,8 +1016,8 @@ function App() {
           <div className="section-title">
             <Workflow />
             <div>
-              <h1>OpenClaw Bridge</h1>
-              <p>读取真实 Ozon 商品；写操作只能提交提案，审批留在操作台。</p>
+              <h1>龙虾 / Codex 连接</h1>
+              <p>推荐路径：龙虾用自己的登录账号出图，本机节点只提供真实商品和图片事实。</p>
             </div>
           </div>
           <div className="bridge-endpoint">
@@ -1024,8 +1086,8 @@ function App() {
           <div className="section-title">
             <Sparkles />
             <div>
-              <h2>OpenAI 出图中转</h2>
-              <p>保存海报背景生成用的 API Key 和中转地址；保存成功后再实际生成一张图确认通道可用。</p>
+              <h2>可选：图片 API 自动出图</h2>
+              <p>龙虾/Codex 能出图时不需要填这里。只有要让本机后台自动生成背景时，才配置官方或中转 API。</p>
             </div>
           </div>
           <div className="form-grid compact">
@@ -1058,7 +1120,7 @@ function App() {
               />
             </label>
           </div>
-          <button onClick={saveOpenAiConfig}>
+          <button className="secondary-button" onClick={saveOpenAiConfig}>
             <CheckCircle2 size={18} /> 保存出图配置
           </button>
           {imageGenerationIssue && <p className="notice warn-text">{imageGenerationIssue}</p>}
@@ -1109,14 +1171,14 @@ function App() {
               <strong>{configStatus?.ozon.api_key_fingerprint ?? "未保存"}</strong>
             </div>
             <div className="status-item">
-              <span>OpenAI relay</span>
+              <span>Image API</span>
               <strong>{configStatus?.openai.configured ? configStatus.openai.base_url : "not configured"}</strong>
               <em className={configStatus?.openai.configured ? "badge ok-badge" : "badge warn-badge"}>
                 {configStatus?.openai.source ?? "checking"}
               </em>
             </div>
             <div className="status-item">
-              <span>OpenAI model</span>
+              <span>Image model</span>
               <strong>{configStatus?.openai.image_model ?? "未保存"}</strong>
             </div>
             <div className="status-item">
@@ -1261,7 +1323,7 @@ function App() {
                 <Sparkles />
                 <div>
                   <h3>商品海报工作台</h3>
-                  <p>先用事实包生成文案，再让 AI 只做背景，把真实商品图合成进去。</p>
+                  <p>先从 Ozon 商品生成事实包，再交给龙虾/Codex 出图；本机 API 自动出图只是备用。</p>
                 </div>
               </div>
               <div className="task-command poster-toolbar">
@@ -1274,15 +1336,20 @@ function App() {
                 <button disabled={!canUseOzonReadTools} onClick={buildPosterBrief}>
                   <Sparkles size={18} /> 生成文案简报
                 </button>
+                <button disabled={!canUseOzonReadTools} onClick={copyPosterHandoff}>
+                  <Clipboard size={18} /> 复制给龙虾/Codex
+                </button>
                 <button disabled={!canGeneratePosterBackground} onClick={generatePosterBackground}>
-                  <ImageIcon size={18} /> 生成背景图
+                  <ImageIcon size={18} /> API 自动生成背景
                 </button>
                 <button className="secondary-button" disabled={!canUseOzonReadTools} onClick={verifyPosterCopy}>
                   <ShieldCheck size={16} /> 校验文案一致性
                 </button>
               </div>
               {!canGeneratePosterBackground && (
-                <p className="notice warn-text">{posterGenerationGateMessage || "海报背景生成暂不可用"}</p>
+                <p className={`notice ${imageGenerationIssue ? "warn-text" : ""}`}>
+                  {posterGenerationGateMessage || "API 自动出图暂不可用；可以先复制给龙虾/Codex。"}
+                </p>
               )}
               {posterBrief && (
                 <div className="poster-editor">
@@ -1352,8 +1419,10 @@ function App() {
                   <div className="poster-meta">
                     <div className="fact-grid">
                       <div>
-                        <span>背景模型</span>
-                        <strong>{posterBackground?.image_model ?? "未生成"}</strong>
+                        <span>出图路径</span>
+                        <strong>
+                          {posterBackground?.image_model ?? (posterHandoff ? "龙虾/Codex" : "未生成")}
+                        </strong>
                       </div>
                       <div>
                         <span>主题</span>
@@ -1364,6 +1433,19 @@ function App() {
                         <strong>{posterVerification ? (posterVerification.ok ? "通过" : "待修正") : "未校验"}</strong>
                       </div>
                     </div>
+                    {posterHandoff && (
+                      <div className="poster-handoff">
+                        <div>
+                          <span>已复制给龙虾/Codex</span>
+                          <p>
+                            任务包包含商品事实、{posterHandoff.source_images.length} 张图片 URL 和海报约束；使用龙虾自己的登录账号生成，不需要在本机填写 OpenAI API Key。
+                          </p>
+                        </div>
+                        <button className="secondary-button" onClick={() => navigator.clipboard.writeText(posterHandoff.prompt)}>
+                          <Clipboard size={16} /> 再复制一次
+                        </button>
+                      </div>
+                    )}
                     {posterBackground && (
                       <div className="poster-prompt">
                         <span>背景提示词</span>

@@ -4167,6 +4167,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ozon-suite-qa"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ozon-task-engine"
 version = "0.1.0"
 dependencies = [

@@ -704,6 +704,34 @@ article strong {
   text-transform: uppercase;
 }
 
+.poster-handoff {
+  align-items: center;
+  background: #edf8f1;
+  border: 1px solid #b8e4c6;
+  border-radius: 8px;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 12px;
+}
+
+.poster-handoff span {
+  color: #087a59;
+  display: block;
+  font-size: 12px;
+  font-weight: 900;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+}
+
+.poster-handoff p {
+  color: #334139;
+  font-size: 13px;
+  font-weight: 780;
+  line-height: 1.45;
+  margin: 0;
+}
+
 .poster-prompt p,
 .poster-verify p {
   margin: 0;
@@ -794,7 +822,8 @@ footer span {
   .workspace-grid,
   .status-list,
   .poster-preview-shell,
-  .poster-editor {
+  .poster-editor,
+  .poster-handoff {
     grid-template-columns: 1fr;
   }
 

@@ -9,6 +9,7 @@ members = [
   "crates/ozon-connector",
   "crates/secret-store",
   "crates/task-engine",
+  "tools/ozon-suite-qa",
 ]
 resolver = "3"
 
@@ -25,6 +26,7 @@ async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
 futures-core = "0.3"
 hmac = "0.12"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }

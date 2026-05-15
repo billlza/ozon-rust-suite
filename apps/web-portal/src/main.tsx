@@ -220,6 +220,16 @@ type LocalPortalStatus = {
     image_model: string;
     issue?: string | null;
   };
+  poster_generation?: {
+    preferred: string;
+    openclaw_bridge_ready: boolean;
+    handoff_path: string;
+    manifest_url: string;
+    api_fallback_configured: boolean;
+    api_fallback_model: string | null;
+    api_fallback_issue: string | null;
+    message: string;
+  };
   lease: {
     configured: boolean;
     valid: boolean;
@@ -436,7 +446,6 @@ function App() {
     localLeaseIssue: localLeaseStatus?.issue ?? null,
     localNode,
     order,
-    posterConfigReady,
     storeCredentialsReady
   });
   const canStartWorkspace = computerHelperOnline && computerAuthorized && canOpenLocalConsole;
@@ -1258,7 +1267,7 @@ function App() {
           <p className="eyebrow">Ozon Rust Suite</p>
           <h1>登录后，按步骤把店铺商品读出来。</h1>
           <p>
-            先开通服务，安装电脑助手，连接这台电脑，然后读取 Ozon 商品并生成海报。每一步都有按钮提示，不需要懂技术名词。
+            先开通服务，安装电脑助手，连接这台电脑，然后读取 Ozon 商品。海报出图优先交给龙虾/Codex，不强迫你另买 API。
           </p>
           <div className="hero-actions">
             {session ? (
@@ -1289,7 +1298,7 @@ function App() {
           <div className="hero-meta">
             <span>邮箱/手机号登录</span>
             <span>真实商品读取</span>
-            <span>海报生成</span>
+            <span>龙虾/Codex 出图</span>
           </div>
         </div>
         <div className="hero-visual" aria-label="Ozon Rust Suite workflow preview">
@@ -1315,7 +1324,7 @@ function App() {
           </div>
           <div className="diff-preview">
             <span>Step 4</span>
-            <strong>读取商品，再生成海报</strong>
+            <strong>读取商品，交给龙虾/Codex</strong>
             <em>商品图片和文案都来自真实商品信息。</em>
           </div>
         </div>
@@ -1632,7 +1641,7 @@ function App() {
                   <p>
                     {computerAuthorized
                       ? "这台电脑已经可以使用你的服务。"
-                      : "只允许已授权的电脑读取商品和生成海报。"}
+                      : "只允许已授权的电脑读取商品，并把任务交给龙虾/Codex。"}
                   </p>
                   {activeEntitlement && computerHelperOnline && !computerAuthorized && (
                     <div className="step-actions">
@@ -1658,7 +1667,7 @@ function App() {
                     {!readyForWorkspace
                       ? "前面几步完成后，这里会告诉你去哪里填写店铺授权。"
                       : storeCredentialsReady
-                        ? "店铺授权已经保存。切到 Ozon Rust Local，点“读取商品”，再选择商品生成海报。"
+                        ? "店铺授权已经保存。打开工作台读取商品，再把海报任务复制给龙虾/Codex。"
                         : "切到电脑上的 Ozon Rust Local，在“店铺授权”里填写 Ozon Client ID 和 API Key，保存后回这里刷新。"}
                   </p>
                   {readyForWorkspace && (
@@ -1688,9 +1697,7 @@ function App() {
                   <h3>{storeCredentialsReady ? "可以读取真实商品了" : "把 Ozon API 填到电脑助手里"}</h3>
                   <p>
                     {storeCredentialsReady
-                      ? posterConfigReady
-                        ? "下一步在 Ozon Rust Local 里读取商品，选择商品后生成海报。"
-                        : "商品读取已经可用；如果要生成海报，再到电脑助手里补充图片生成 API 配置。"
+                      ? "下一步在 Ozon Rust Local 里读取商品，点“复制给龙虾/Codex”。图片 API 只是自动后台出图的可选项。"
                       : "网页已经确认这台电脑能用。接下来不是在网页里填密钥，而是在电脑助手里保存店铺授权，这样密钥只留在你的电脑上。"}
                   </p>
                 </div>
@@ -1830,12 +1837,12 @@ function App() {
                   </p>
                 </div>
                 <div className={`local-node-card ${posterConfigReady ? "online" : "warn"}`}>
-                  <span>海报生成</span>
-                  <strong>{posterConfigReady ? "已配置" : "待配置"}</strong>
+                  <span>API 自动出图</span>
+                  <strong>{posterConfigReady ? "已配置" : "可选"}</strong>
                   <p>
                     {posterConfigReady
-                      ? `图片生成配置已保存：${localNode.portal?.openai?.image_model ?? "当前模型"}。`
-                      : "需要生成海报时，在电脑助手里保存图片生成 API 配置。"}
+                      ? `图片 API 已保存：${localNode.portal?.openai?.image_model ?? "当前模型"}。`
+                      : "默认用龙虾/Codex 出图；只有需要后台自动生成时才配置图片 API。"}
                   </p>
                 </div>
                 <div className="local-node-card">
@@ -2344,7 +2351,7 @@ function localNodePairingStatus(
     return {
       kind: "warn",
       title: "服务未开通",
-      message: "先开通服务或输入开通码，才能连接店铺和生成海报。"
+      message: "先开通服务或输入开通码，才能连接店铺并读取商品。"
     };
   }
   if (!device) {
@@ -2383,7 +2390,6 @@ function setupStatusModel(input: {
   localLeaseIssue: string | null;
   localNode: LocalNodeProbe;
   order: Order | null;
-  posterConfigReady: boolean;
   storeCredentialsReady: boolean;
 }) {
   const nodeOnline = input.localNode.phase === "online";
@@ -2411,17 +2417,10 @@ function setupStatusModel(input: {
         message: "这台电脑已经授权。现在切到 Ozon Rust Local，在店铺授权里保存 Ozon Client ID 和 API Key。"
       };
     }
-    if (!input.posterConfigReady) {
-      return {
-        kind: "warn",
-        title: "店铺已连上，补上海报配置",
-        message: "商品读取已经准备好。需要生成海报时，在电脑助手里保存图片生成 API 配置。"
-      };
-    }
     return {
       kind: "online",
       title: "可以开始了",
-      message: "服务、电脑和店铺授权都准备好了。切到 Ozon Rust Local 读取商品并生成海报。"
+      message: "服务、电脑和店铺授权都准备好了。打开工作台读取商品，再把海报任务交给龙虾/Codex。"
     };
   }
   if (!input.device) {
@@ -2436,13 +2435,13 @@ function setupStatusModel(input: {
     return {
       kind: "warn",
       title: issue ? "电脑授权没有完成" : "完成电脑授权",
-      message: issue ?? "再确认一次授权，电脑助手就可以读取商品和生成海报。"
+      message: issue ?? "再确认一次授权，电脑助手就可以读取商品并交给龙虾/Codex。"
     };
   }
   return {
     kind: "online",
     title: "可以开始了",
-    message: "服务、电脑和店铺授权都准备好了。切到 Ozon Rust Local 读取商品并生成海报。"
+    message: "服务、电脑和店铺授权都准备好了。打开工作台读取商品，再交给龙虾/Codex 出图。"
   };
 }
 

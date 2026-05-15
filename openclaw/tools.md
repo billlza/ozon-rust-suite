@@ -5,7 +5,9 @@ Auth header: `x-openclaw-token: <bridge proposal token>`
 
 OpenClaw reads product facts through the local node and can prepare store
 changes for operator review. Actions that affect store data stay behind local
-operator approval.
+operator approval. For poster generation, the preferred path is account-based:
+OpenClaw/Codex uses its signed-in image capability while the local node supplies
+only Ozon facts, image URLs, and safety instructions.
 
 ## Tools
 
@@ -15,6 +17,7 @@ operator approval.
 | `ozon.products.count` | `POST` | `/tools/ozon.products.count` | Count products through the configured connector; real mode uses saved Ozon Seller API credentials | No |
 | `ozon.products.list` | `POST` | `/tools/ozon.products.list` | List product summaries with a bounded limit; real mode returns official Ozon Seller API data | No |
 | `ozon.products.get` | `POST` | `/tools/ozon.products.get` | Read one product fact pack with stable details, attributes, and image URLs | No |
+| `poster.handoff` | `POST` | `/poster/handoff` | Build a product-grounded poster prompt and image package for OpenClaw/Codex generation | No |
 | `tasks.dry_run` | `POST` | `/tasks/dry-run` | Prepare a reviewed task with diff and risk summary | Local approval required |
 | `tasks.get` | `GET` | `/tasks/{task_id}` | Read task state | No |
 | `schedules.ecommerce_read.propose` | `POST` | `/schedules/ecommerce-read/propose` | Prepare official Ozon read-only polling | Operator must enable |
@@ -33,6 +36,21 @@ record and image order, then enriches attributes and backup image fields from
 `/v4/product/info/attributes` when available. The response keeps image URLs in a
 stable ordered `images` array with roles: `primary`, `gallery`, `color`, and
 `spin360`.
+
+## Poster Handoff Payload
+
+```json
+{
+  "offer_id": "SKU-123",
+  "theme": "studio",
+  "locale": "zh-CN"
+}
+```
+
+This returns the same product fact pack plus an operator-ready prompt. The
+prompt tells OpenClaw/Codex to use the current signed-in account for image
+generation, preserve the real product appearance, and avoid unsupported claims.
+It deliberately does not include the bridge token or any OpenAI/API secret.
 
 ## Dry-Run Payload
 

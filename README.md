@@ -97,9 +97,12 @@ VITE_LOCAL_TOKEN=<same-strong-local-operator-token> pnpm dev:local-ui
 Then open <http://127.0.0.1:5173>, save the user's Ozon Seller `Client ID` and
 `API Key`, run credential validation, and read products. In this mode the local
 node never falls back to mock products; missing or invalid credentials return an
-error. Save the poster image provider under "OpenAI 出图中转" when using a
-relay; the key is written to the OS keyring and is not stored in the repository.
-The OpenClaw token can call read tools and prepare reviewed tasks only.
+error. Poster generation is account-first: use `POST /poster/handoff` or the
+local UI's "复制给龙虾/Codex" action to hand a product-grounded prompt and image
+URLs to OpenClaw/Codex. The optional image API config is only for unattended
+background generation; the key is written to the OS keyring and is not stored in
+the repository. The OpenClaw token can call read tools and prepare reviewed
+tasks only.
 
 Release builds default to the real connector. Local sample data is available
 only in explicit development mode through `OZON_CONNECTOR_MODE=mock`.
@@ -233,11 +236,11 @@ Static package: [openclaw/manifest.json](openclaw/manifest.json) and
 [openclaw/tools.md](openclaw/tools.md). The running local node also exposes a
 machine-readable manifest at `GET /openclaw/manifest`.
 
-OpenClaw should call only read tools, `POST /tasks/dry-run`, and task status
-lookups with `x-openclaw-token`. In real Ozon mode those read tools use the
-operator-saved Ozon Seller API credentials. Approval, cancellation, execution,
-configuration, diagnostics, and event streaming require the operator-only
-`x-local-token`.
+OpenClaw should call only read tools, `POST /poster/handoff`,
+`POST /tasks/dry-run`, and task status lookups with `x-openclaw-token`. In real
+Ozon mode those read tools use the operator-saved Ozon Seller API credentials.
+Approval, cancellation, execution, configuration, diagnostics, and event
+streaming require the operator-only `x-local-token`.
 
 The public portal can issue a cloud lease and deliver it to
 `POST /portal/lease` on the local node after the browser has detected
@@ -251,6 +254,39 @@ backup image fields from `/v4/product/info/attributes` when available. The
 response is a product fact pack suitable for downstream poster generation: text
 facts and image URLs stay separate so generated artwork does not invent product
 specs.
+
+## Test CLI
+
+`ozon-suite-qa` is a read-only Rust harness for local-node smoke, performance,
+stability, and RSS growth checks. It emits JSON and is safe to run against a
+real node because it does not call Ozon write endpoints or image-generation
+endpoints.
+
+```bash
+cargo run -p ozon-suite-qa -- \
+  --base-url http://127.0.0.1:8790 \
+  --local-token "$OZON_LOCAL_TOKEN" \
+  --openclaw-token "$OZON_OPENCLAW_TOKEN" \
+  smoke
+
+cargo run -p ozon-suite-qa -- \
+  --base-url http://127.0.0.1:8790 \
+  --openclaw-token "$OZON_OPENCLAW_TOKEN" \
+  perf --scenario poster-handoff --offer-id SKU-123 --requests 100 --concurrency 8
+
+cargo run -p ozon-suite-qa -- \
+  --base-url http://127.0.0.1:8790 \
+  --openclaw-token "$OZON_OPENCLAW_TOKEN" \
+  stability --scenario health --duration-secs 300 --interval-ms 500
+
+cargo run -p ozon-suite-qa -- \
+  --base-url http://127.0.0.1:8790 \
+  memory --pid <local-node-pid> --scenario health --duration-secs 600
+```
+
+Use `all --pid <local-node-pid>` for a short combined run. Product-detail and
+poster-handoff scenarios require one lookup flag: `--offer-id`, `--product-id`,
+or `--sku`.
 
 ## API safety notes
 
