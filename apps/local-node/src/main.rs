@@ -1,6 +1,7 @@
 use std::{
     env, fs,
     net::SocketAddr,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -25,7 +26,10 @@ use ozon_domain::{
     DryRunDiff, EntitlementLease, ExecutionReceipt, Feature, FieldChange, OperationKind, RiskLevel,
     Task, TaskId, TaskSource, TenantId,
 };
-use ozon_secret_store::{SecretName, SecretStore, SystemSecretStore, fingerprint_secret, redact};
+use ozon_secret_store::{
+    FileSecretStore, LayeredSecretStore, SecretName, SecretStore, SystemSecretStore,
+    fingerprint_secret, redact,
+};
 use ozon_task_engine::{CreateTask, TaskEvent, TaskStore};
 use rsa::{
     RsaPublicKey,
@@ -278,10 +282,7 @@ struct LocalState {
 
 impl LocalState {
     fn new(config: LocalConfig) -> anyhow::Result<Self> {
-        Self::new_with_secret_store(
-            config,
-            Arc::new(SystemSecretStore::new("ozon-rust-suite-local", "default")?),
-        )
+        Self::new_with_secret_store(config, default_secret_store()?)
     }
 
     fn new_with_secret_store(
@@ -321,6 +322,63 @@ impl LocalState {
             schedules,
         })
     }
+}
+
+fn default_secret_store() -> anyhow::Result<Arc<dyn SecretStore>> {
+    let file_store: Arc<dyn SecretStore> =
+        Arc::new(FileSecretStore::new(default_secret_file_path()));
+    let system_store = match SystemSecretStore::new("ozon-rust-suite-local", "default") {
+        Ok(store) => store,
+        Err(_) => return Ok(file_store),
+    };
+    Ok(Arc::new(LayeredSecretStore::new(
+        Arc::new(system_store),
+        file_store,
+    )))
+}
+
+fn default_secret_file_path() -> PathBuf {
+    if let Ok(path) = env::var("OZON_LOCAL_SECRET_FILE") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = env::var("HOME") {
+            return PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("com.ozonrustsuite.local")
+                .join("local-node-private-secrets.json");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = env::var("APPDATA") {
+            return PathBuf::from(appdata)
+                .join("Ozon Rust Suite")
+                .join("local-node-private-secrets.json");
+        }
+    }
+
+    if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
+        return PathBuf::from(config_home)
+            .join("ozon-rust-suite")
+            .join("local-node-private-secrets.json");
+    }
+
+    if let Ok(home) = env::var("HOME") {
+        return PathBuf::from(home)
+            .join(".config")
+            .join("ozon-rust-suite")
+            .join("local-node-private-secrets.json");
+    }
+
+    PathBuf::from("local-node-private-secrets.json")
 }
 
 type ScheduleStore = Arc<RwLock<EcommerceReadSchedule>>;
@@ -387,7 +445,7 @@ async fn diagnostics(State(state): State<LocalState>) -> Json<DiagnosticsRespons
         connector_mode: connector_mode(&state),
         real_ozon_enabled: state.config.use_real_ozon,
         secret_store: SecretStoreStatus {
-            backend: "system",
+            backend: "system_keyring+local_file",
             available: ozon.secret_store_available,
         },
         ozon: OzonCredentialStatus {
@@ -560,9 +618,7 @@ async fn save_openai_config(
     let api_key_input = input.api_key.trim();
     let stored_config = if api_key_input.is_empty() {
         Some(load_persisted_openai_config(&state).await.map_err(|_| {
-            ApiError::bad_request(
-                "OpenAI API key is required the first time you save this config",
-            )
+            ApiError::bad_request("OpenAI API key is required the first time you save this config")
         })?)
     } else {
         None
@@ -644,7 +700,7 @@ async fn config_status(
         real_ozon_enabled: state.config.use_real_ozon,
         connector_mode: connector_mode(&state),
         secret_store: SecretStoreStatus {
-            backend: "system_keyring",
+            backend: "system_keyring+local_file",
             available: ozon.secret_store_available,
         },
         ozon: OzonCredentialStatus {
@@ -1710,7 +1766,9 @@ async fn load_persisted_openai_config(state: &LocalState) -> Result<StoredOpenAi
         .await
         .map_err(|_| ApiError::internal("secret store unavailable"))?
     else {
-        return Err(ApiError::bad_request("OpenAI API key is not stored in this app"));
+        return Err(ApiError::bad_request(
+            "OpenAI API key is not stored in this app",
+        ));
     };
 
     serde_json::from_str(bundle.expose_secret())

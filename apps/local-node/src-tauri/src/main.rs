@@ -42,6 +42,7 @@ struct RuntimeConfig {
     openclaw_token: String,
     connector_mode: String,
     sidecar_log_path: String,
+    secret_store_path: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -154,6 +155,7 @@ fn main() {
                 openclaw_token,
                 connector_mode,
                 sidecar_log_path: sidecar_log_path(app).display().to_string(),
+                secret_store_path: private_secrets_path(app)?.display().to_string(),
             };
 
             app.manage(SidecarState::new(runtime));
@@ -202,6 +204,7 @@ fn start_managed_sidecar(app: &AppHandle) {
                 .env("OZON_CONNECTOR_MODE", runtime.connector_mode)
                 .env("OZON_LOCAL_TOKEN", runtime.local_token)
                 .env("OZON_OPENCLAW_TOKEN", runtime.openclaw_token)
+                .env("OZON_LOCAL_SECRET_FILE", runtime.secret_store_path)
                 .env("OZON_LOCAL_SKILL_BIND", "127.0.0.1:8790")
                 .env("OZON_LOCAL_AGENT_BIND", "127.0.0.1:17870")
         })
@@ -402,6 +405,14 @@ fn load_or_create_secrets<R: Runtime>(
 fn secrets_path<R: Runtime>(app: &tauri::App<R>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let mut path = app.path().app_config_dir()?;
     path.push("local-node-secrets.json");
+    Ok(path)
+}
+
+fn private_secrets_path<R: Runtime>(
+    app: &tauri::App<R>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut path = app.path().app_config_dir()?;
+    path.push("local-node-private-secrets.json");
     Ok(path)
 }
 

@@ -1,11 +1,20 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use keyring_core::{Entry, Error as KeyringError};
 use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::{sync::RwLock, time::timeout};
+
+const PRIMARY_SECRET_STORE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SecretName(String);
@@ -45,6 +54,134 @@ impl SecretStore for MemorySecretStore {
 
     async fn delete(&self, name: &SecretName) -> Result<(), SecretStoreError> {
         self.inner.write().await.remove(name);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct FileSecretStore {
+    path: Arc<PathBuf>,
+    lock: Arc<RwLock<()>>,
+}
+
+impl FileSecretStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: Arc::new(path.into()),
+            lock: Arc::new(RwLock::new(())),
+        }
+    }
+
+    async fn read_map(&self) -> Result<HashMap<String, String>, SecretStoreError> {
+        match fs::read_to_string(self.path.as_ref()) {
+            Ok(contents) => {
+                serde_json::from_str(&contents).map_err(|_| SecretStoreError::InvalidEncoding)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(_) => Err(SecretStoreError::BackendUnavailable),
+        }
+    }
+
+    async fn write_map(&self, values: &HashMap<String, String>) -> Result<(), SecretStoreError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|_| SecretStoreError::BackendUnavailable)?;
+        }
+        let payload = serde_json::to_vec(values).map_err(|_| SecretStoreError::InvalidEncoding)?;
+        let temp_path = temp_path_for(self.path.as_ref());
+        write_private_file(&temp_path, &payload).await?;
+        fs::rename(&temp_path, self.path.as_ref())
+            .map_err(|_| SecretStoreError::BackendUnavailable)?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SecretStore for FileSecretStore {
+    async fn put(&self, name: SecretName, value: SecretString) -> Result<(), SecretStoreError> {
+        let _guard = self.lock.write().await;
+        let mut values = self.read_map().await?;
+        values.insert(name.as_str().to_string(), value.expose_secret().to_string());
+        self.write_map(&values).await
+    }
+
+    async fn get(&self, name: &SecretName) -> Result<Option<SecretString>, SecretStoreError> {
+        let _guard = self.lock.read().await;
+        let values = self.read_map().await?;
+        Ok(values
+            .get(name.as_str())
+            .map(|value| SecretString::from(value.clone())))
+    }
+
+    async fn delete(&self, name: &SecretName) -> Result<(), SecretStoreError> {
+        let _guard = self.lock.write().await;
+        let mut values = self.read_map().await?;
+        values.remove(name.as_str());
+        self.write_map(&values).await
+    }
+}
+
+#[derive(Clone)]
+pub struct LayeredSecretStore {
+    primary: Arc<dyn SecretStore>,
+    fallback: Arc<dyn SecretStore>,
+}
+
+impl LayeredSecretStore {
+    pub fn new(primary: Arc<dyn SecretStore>, fallback: Arc<dyn SecretStore>) -> Self {
+        Self { primary, fallback }
+    }
+}
+
+#[async_trait]
+impl SecretStore for LayeredSecretStore {
+    async fn put(&self, name: SecretName, value: SecretString) -> Result<(), SecretStoreError> {
+        let primary_name = name.clone();
+        let primary_value = value.clone();
+        let fallback = self.fallback.put(name, value).await;
+        let primary = timeout(
+            PRIMARY_SECRET_STORE_TIMEOUT,
+            self.primary.put(primary_name, primary_value),
+        )
+        .await;
+        let primary = match primary {
+            Ok(result) => result,
+            Err(_) => Err(SecretStoreError::BackendUnavailable),
+        };
+        if fallback.is_err() {
+            return fallback;
+        }
+        let _ = primary;
+        Ok(())
+    }
+
+    async fn get(&self, name: &SecretName) -> Result<Option<SecretString>, SecretStoreError> {
+        let fallback = self.fallback.get(name).await;
+        if let Ok(Some(value)) = fallback.as_ref() {
+            return Ok(Some(value.clone()));
+        }
+
+        let primary = timeout(PRIMARY_SECRET_STORE_TIMEOUT, self.primary.get(name)).await;
+        match primary {
+            Ok(Ok(Some(value))) => {
+                let _ = self.fallback.put(name.clone(), value.clone()).await;
+                Ok(Some(value))
+            }
+            Ok(Ok(None)) => fallback,
+            Ok(Err(_)) | Err(_) => fallback,
+        }
+    }
+
+    async fn delete(&self, name: &SecretName) -> Result<(), SecretStoreError> {
+        let fallback = self.fallback.delete(name).await;
+        let primary = timeout(PRIMARY_SECRET_STORE_TIMEOUT, self.primary.delete(name)).await;
+        let primary = match primary {
+            Ok(result) => result,
+            Err(_) => Err(SecretStoreError::BackendUnavailable),
+        };
+        if fallback.is_err() {
+            return fallback;
+        }
+        let _ = primary;
         Ok(())
     }
 }
@@ -131,6 +268,38 @@ impl SecretStore for SystemSecretStore {
     }
 }
 
+fn temp_path_for(path: &Path) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .map(|value| value.to_os_string())
+        .unwrap_or_else(|| "secrets.json".into());
+    file_name.push(".tmp");
+    path.with_file_name(file_name)
+}
+
+#[cfg(unix)]
+async fn write_private_file(path: &Path, payload: &[u8]) -> Result<(), SecretStoreError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|_| SecretStoreError::BackendUnavailable)?;
+    file.write_all(payload)
+        .map_err(|_| SecretStoreError::BackendUnavailable)?;
+    file.sync_all()
+        .map_err(|_| SecretStoreError::BackendUnavailable)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn write_private_file(path: &Path, payload: &[u8]) -> Result<(), SecretStoreError> {
+    fs::write(path, payload).map_err(|_| SecretStoreError::BackendUnavailable)
+}
+
 pub fn fingerprint_secret(secret: &SecretString) -> String {
     let digest = Sha256::digest(secret.expose_secret().as_bytes());
     let hex = format!("{digest:x}");
@@ -182,6 +351,8 @@ pub enum SecretStoreError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use secrecy::SecretString;
 
     use super::*;
@@ -198,9 +369,58 @@ mod tests {
         assert_eq!(value.expose_secret(), "super-secret");
     }
 
+    #[tokio::test]
+    async fn file_store_round_trips_secret() {
+        let path = unique_test_secret_path("round-trip");
+        let store = FileSecretStore::new(&path);
+        let name = SecretName::new("openai_config");
+
+        store
+            .put(name.clone(), SecretString::from("stored-value"))
+            .await
+            .expect("file secret write");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let value = store.get(&name).await.unwrap().unwrap();
+        assert_eq!(value.expose_secret(), "stored-value");
+        store.delete(&name).await.expect("delete secret");
+        assert!(store.get(&name).await.unwrap().is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn layered_store_reads_from_fallback_when_primary_misses() {
+        let primary = Arc::new(MemorySecretStore::default());
+        let fallback = Arc::new(MemorySecretStore::default());
+        let store = LayeredSecretStore::new(primary, fallback.clone());
+        let name = SecretName::new("cloud_lease");
+        fallback
+            .put(name.clone(), SecretString::from("lease"))
+            .await
+            .unwrap();
+
+        let value = store.get(&name).await.unwrap().unwrap();
+        assert_eq!(value.expose_secret(), "lease");
+    }
+
     #[test]
     fn redaction_keeps_shape_without_leaking_full_value() {
         assert_eq!(redact("abcdef123456"), "abcd…3456");
         assert_eq!(redact("short"), "********");
+    }
+
+    fn unique_test_secret_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ozon-secret-store-{label}-{nanos}.json"))
     }
 }
