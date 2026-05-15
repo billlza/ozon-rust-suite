@@ -1,6 +1,6 @@
 {
   "name": "ozon-rust-suite-local",
-  "version": "0.1.0",
+  "version": "0.1.11",
   "base_url": "http://127.0.0.1:8790",
   "auth": {
     "type": "header",
