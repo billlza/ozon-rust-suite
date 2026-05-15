@@ -68,6 +68,14 @@ type ProductListResult = {
   products: Product[];
   total: number;
   last_id: string | null;
+  visibility: string;
+  archived_fallback: boolean;
+};
+
+type ProductCountResult = {
+  count: number;
+  visibility: string;
+  archived_fallback: boolean;
 };
 
 type ProductImage = {
@@ -289,6 +297,7 @@ function App() {
   const [posterBrief, setPosterBrief] = useState<PosterBriefResult | null>(null);
   const [posterBackground, setPosterBackground] = useState<PosterGenerateResult | null>(null);
   const [posterVerification, setPosterVerification] = useState<PosterVerifyResult | null>(null);
+  const [imageGenerationIssue, setImageGenerationIssue] = useState<string | null>(null);
   const [posterHeadline, setPosterHeadline] = useState("");
   const [posterSubheadline, setPosterSubheadline] = useState("");
   const [posterSellingPoints, setPosterSellingPoints] = useState(["", "", ""]);
@@ -303,12 +312,27 @@ function App() {
   const [scheduleInterval, setScheduleInterval] = useState(900);
   const [scheduleLimit, setScheduleLimit] = useState(20);
   const realModeRequiresLease = configStatus?.real_ozon_enabled ?? true;
-  const canUseOzonReadTools = Boolean(configStatus && (!realModeRequiresLease || configStatus.lease.valid));
+  const ozonConfigReady = configStatus?.ozon.configured === true;
+  const openAiConfigReady = configStatus?.openai.configured === true;
+  const leaseReady = !realModeRequiresLease || configStatus?.lease.valid === true;
+  const canUseOzonReadTools = Boolean(configStatus && ozonConfigReady && leaseReady);
+  const canGeneratePosterBackground = canUseOzonReadTools && openAiConfigReady && !imageGenerationIssue;
   const ozonReadGateMessage = !configStatus
     ? "先连接本机节点并刷新状态"
-    : realModeRequiresLease && !configStatus.lease.valid
-      ? "真实 Ozon 读取需要从 ozon66.com 写入有效授权租约"
-      : "";
+    : !configStatus.secret_store.available
+      ? "电脑助手暂时不能保存密钥，请重启电脑助手后再试"
+      : !ozonConfigReady
+        ? userFacingError(configStatus.ozon.issue ?? "Ozon credentials are not configured")
+        : realModeRequiresLease && !configStatus.lease.valid
+          ? "真实 Ozon 读取需要从 ozon66.com 写入有效授权租约"
+          : "";
+  const posterGenerationGateMessage = !canUseOzonReadTools
+    ? ozonReadGateMessage
+    : !openAiConfigReady
+      ? "先保存图片生成 API 配置，再生成海报背景"
+      : imageGenerationIssue
+        ? imageGenerationIssue
+        : "";
 
   const queueStats = useMemo(() => {
     const pending = tasks.filter((task) => task.state === "pending_approval").length;
@@ -338,6 +362,23 @@ function App() {
 
   function userFacingError(error: string | undefined) {
     const raw = error?.trim() || "未知错误";
+    if (raw.includes("Ozon credentials are not configured")) {
+      return "先在“本地密钥”里保存 Ozon Client ID 和 API Key，并完成校验。";
+    }
+    if (raw.includes("OZON_CLIENT_ID/OZON_API_KEY environment credentials are incomplete")) {
+      return "Ozon 启动环境里的 Client ID / API Key 不完整，请改为在界面里保存完整凭据。";
+    }
+    if (raw.includes("ozon connector failed") || raw.includes("Ozon 凭据校验失败")) {
+      return raw
+        .replace(/^ozon connector failed:\s*/i, "")
+        .replace(/^Ozon 凭据校验失败：/i, "Ozon 凭据校验失败：");
+    }
+    if (raw.includes("cloud lease is not installed")) {
+      return "这台电脑还没完成授权。请先回 ozon66.com 授权这台电脑。";
+    }
+    if (raw.includes("lease public key") || raw.includes("stored cloud lease is invalid")) {
+      return "电脑授权记录无效。请安装最新版电脑助手，然后回 ozon66.com 重新完成电脑授权。";
+    }
     if (
       raw.includes("No available channel for model") ||
       raw.includes("没有开通这个图片模型") ||
@@ -402,10 +443,22 @@ function App() {
       body: JSON.stringify({ client_id: clientId.trim(), api_key: apiKey.trim() })
     });
     const data = await response.json();
-    setMessage(response.ok ? `Ozon 凭据已保存：${data.client_id} / ${data.api_key}` : `保存失败：${data.error}`);
-    if (response.ok) {
-      await checkHealth();
+    if (!response.ok) {
+      setMessage(`保存失败：${userFacingError(data.error)}`);
+      return;
     }
+    setApiKey("");
+    await checkHealth();
+
+    const validationResponse = await api("/config/ozon/validate", { method: "POST" });
+    const validationData = await validationResponse.json();
+    if (!validationResponse.ok) {
+      setValidation(null);
+      setMessage(`Ozon 凭据已保存，但校验没通过：${userFacingError(validationData.error)}`);
+      return;
+    }
+    setValidation(validationData);
+    setMessage(`Ozon 凭据已保存并校验通过：${data.client_id} / ${data.api_key}`);
   }
 
   async function saveOpenAiConfig() {
@@ -436,6 +489,7 @@ function App() {
     );
     if (response.ok) {
       setOpenAiApiKey("");
+      setImageGenerationIssue(null);
       await checkHealth();
     }
   }
@@ -445,7 +499,7 @@ function App() {
     const data = await response.json();
     if (!response.ok) {
       setValidation(null);
-      setMessage(`Ozon 凭据校验失败：${data.error}`);
+      setMessage(`Ozon 凭据校验失败：${userFacingError(data.error)}`);
       return;
     }
     setValidation(data);
@@ -465,15 +519,21 @@ function App() {
     const countData = await countResponse.json();
     const listData = await listResponse.json();
     if (!countResponse.ok || !listResponse.ok) {
-      setMessage(`Ozon 读取失败：${countData.error ?? listData.error}`);
+      setMessage(`Ozon 读取失败：${userFacingError(countData.error ?? listData.error)}`);
       return;
     }
-    setProductCount(countData.count);
-    setProducts(listData.products);
-    setProductListMeta(listData);
+    const count = countData as ProductCountResult;
+    const list = listData as ProductListResult;
+    setProductCount(count.count);
+    setProducts(list.products);
+    setProductListMeta(list);
+    if (list.archived_fallback || count.archived_fallback) {
+      setMessage(`当前店铺没有读取到在售商品，已显示 ${count.count} 个归档商品。生成海报前请确认商品仍可销售。`);
+      return;
+    }
     setMessage(
-      listData.connector_mode === "real"
-        ? `真实 Ozon 商品读取完成：总数 ${countData.count}，当前样本 ${listData.products.length}`
+      list.connector_mode === "real"
+        ? `真实 Ozon 商品读取完成：总数 ${count.count}，当前样本 ${list.products.length}`
         : "开发模式 mock 商品读取完成；上线请使用 OZON_CONNECTOR_MODE=real"
     );
   }
@@ -494,7 +554,7 @@ function App() {
     const data = await response.json();
     if (!response.ok) {
       setProductDetail(null);
-      setMessage(`Ozon 商品详情读取失败：${data.error}`);
+      setMessage(`Ozon 商品详情读取失败：${userFacingError(data.error)}`);
       return;
     }
     setProductDetail(data);
@@ -563,7 +623,7 @@ function App() {
     const data = await response.json();
     if (!response.ok) {
       setPosterBrief(null);
-      setMessage(`海报简报生成失败：${data.error}`);
+      setMessage(`海报简报生成失败：${userFacingError(data.error)}`);
       return;
     }
     setProductDetail({ connector_mode: data.connector_mode, product: data.product });
@@ -575,7 +635,10 @@ function App() {
   }
 
   async function generatePosterBackground() {
-    if (!ensureOzonReadAccess("生成海报背景")) return;
+    if (!canGeneratePosterBackground) {
+      setMessage(`生成海报背景被拦截：${posterGenerationGateMessage}`);
+      return;
+    }
     const lookup = currentLookupPayload();
     if (!lookup) {
       setMessage("先读取一个真实商品，再生成海报背景");
@@ -588,9 +651,14 @@ function App() {
     const data = await response.json();
     if (!response.ok) {
       setPosterBackground(null);
-      setMessage(`海报背景生成失败：${userFacingError(data.error)}`);
+      const issue = userFacingError(data.error);
+      if (issue.includes("图片生成通道")) {
+        setImageGenerationIssue(issue);
+      }
+      setMessage(`海报背景生成失败：${issue}`);
       return;
     }
+    setImageGenerationIssue(null);
     setProductDetail({ connector_mode: data.connector_mode, product: data.product });
     setPosterBrief({ connector_mode: data.connector_mode, product: data.product, brief: data.brief });
     setPosterBackground(data);
@@ -622,7 +690,7 @@ function App() {
     const data = await response.json();
     if (!response.ok) {
       setPosterVerification(null);
-      setMessage(`海报校验失败：${data.error}`);
+      setMessage(`海报校验失败：${userFacingError(data.error)}`);
       return;
     }
     setPosterVerification(data);
@@ -698,7 +766,7 @@ function App() {
     });
     const data = await response.json();
     if (!response.ok) {
-      setMessage(`定时读取配置失败：${data.error}`);
+      setMessage(`定时读取配置失败：${userFacingError(data.error)}`);
       return;
     }
     setSchedule(data);
@@ -710,7 +778,7 @@ function App() {
     const response = await api("/schedules/ecommerce-read/run-now", { method: "POST" });
     const data = await response.json();
     if (!response.ok) {
-      setMessage(`手动采集失败：${data.error}`);
+      setMessage(`手动采集失败：${userFacingError(data.error)}`);
       return;
     }
     setProducts(data.run.products);
@@ -918,7 +986,7 @@ function App() {
             <KeyRound />
             <div>
               <h2>本地密钥</h2>
-              <p>保存用户自己的 Ozon Seller API 凭据；写入 OS keyring。</p>
+              <p>保存用户自己的 Ozon Seller API 凭据；优先写入系统钥匙串，并保留本机受限文件备份。</p>
             </div>
           </div>
           <p className="notice mode-notice">
@@ -957,7 +1025,7 @@ function App() {
             <Sparkles />
             <div>
               <h2>OpenAI 出图中转</h2>
-              <p>保存海报背景生成用的 API Key 和中转地址；写入 OS keyring。</p>
+              <p>保存海报背景生成用的 API Key 和中转地址；保存成功后再实际生成一张图确认通道可用。</p>
             </div>
           </div>
           <div className="form-grid compact">
@@ -993,6 +1061,7 @@ function App() {
           <button onClick={saveOpenAiConfig}>
             <CheckCircle2 size={18} /> 保存出图配置
           </button>
+          {imageGenerationIssue && <p className="notice warn-text">{imageGenerationIssue}</p>}
         </div>
 
         <div className="panel diagnostics-panel">
@@ -1058,9 +1127,9 @@ function App() {
               </em>
             </div>
           </div>
-          {configStatus?.ozon.issue && <p className="notice warn-text">{configStatus.ozon.issue}</p>}
-          {configStatus?.openai.issue && <p className="notice warn-text">{configStatus.openai.issue}</p>}
-          {configStatus?.lease.issue && <p className="notice warn-text">{configStatus.lease.issue}</p>}
+          {configStatus?.ozon.issue && <p className="notice warn-text">{userFacingError(configStatus.ozon.issue)}</p>}
+          {configStatus?.openai.issue && <p className="notice warn-text">{userFacingError(configStatus.openai.issue)}</p>}
+          {configStatus?.lease.issue && <p className="notice warn-text">{userFacingError(configStatus.lease.issue)}</p>}
           {validation && (
             <p className="notice">
               {validation.checked_at} · {validation.message}
@@ -1078,7 +1147,9 @@ function App() {
               <p>真实模式直接调用 Ozon Seller API；未配置凭据或授权租约时失败关闭。</p>
             </div>
           </div>
-          <button disabled={!canUseOzonReadTools} onClick={loadProducts}>读取 Ozon 商品</button>
+          <button disabled={!canUseOzonReadTools} onClick={loadProducts}>
+            读取 Ozon 商品
+          </button>
           {!canUseOzonReadTools && <p className="notice warn-text">{ozonReadGateMessage}</p>}
           <div className="task-command product-lookup-command">
             <input
@@ -1103,8 +1174,15 @@ function App() {
             <span className={productListMeta?.connector_mode === "real" ? "badge ok-badge" : "badge neutral-badge"}>
               {productListMeta?.connector_mode === "real" ? "real seller data" : "not loaded"}
             </span>
+            {productListMeta?.archived_fallback && <span className="badge warn-badge">归档商品</span>}
+            {productListMeta?.visibility && <code>{productListMeta.visibility}</code>}
             {productListMeta?.last_id && <code>next: {productListMeta.last_id}</code>}
           </div>
+          {productListMeta?.archived_fallback && (
+            <p className="notice warn-text">
+              当前没有读取到在售商品，已显示归档商品。归档商品可以用于历史查看和素材参考，生成海报或发布前请确认商品仍可销售。
+            </p>
+          )}
           <div className="product-list">
             {products.map((product) => (
               <div key={product.product_id}>
@@ -1196,13 +1274,16 @@ function App() {
                 <button disabled={!canUseOzonReadTools} onClick={buildPosterBrief}>
                   <Sparkles size={18} /> 生成文案简报
                 </button>
-                <button disabled={!canUseOzonReadTools} onClick={generatePosterBackground}>
+                <button disabled={!canGeneratePosterBackground} onClick={generatePosterBackground}>
                   <ImageIcon size={18} /> 生成背景图
                 </button>
                 <button className="secondary-button" disabled={!canUseOzonReadTools} onClick={verifyPosterCopy}>
                   <ShieldCheck size={16} /> 校验文案一致性
                 </button>
               </div>
+              {!canGeneratePosterBackground && (
+                <p className="notice warn-text">{posterGenerationGateMessage || "海报背景生成暂不可用"}</p>
+              )}
               {posterBrief && (
                 <div className="poster-editor">
                   <label>
