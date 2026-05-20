@@ -1227,6 +1227,7 @@ function App() {
           {session ? (
             <>
               <a href="#console">接入向导</a>
+              <a href="/customer-guide.html">操作说明</a>
               <a href="#advanced">排查</a>
             </>
           ) : (
@@ -1234,6 +1235,7 @@ function App() {
               <a href="#capabilities">功能</a>
               <a href="#workflow">流程</a>
               <a href="#pricing">方案</a>
+              <a href="/customer-guide.html">操作说明</a>
             </>
           )}
         </nav>
