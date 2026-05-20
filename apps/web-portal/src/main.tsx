@@ -24,6 +24,7 @@ import {
   X
 } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
+import { CustomerGuide } from "./CustomerGuide";
 import "./styles.css";
 
 const API_BASE = normalizeBaseUrl(import.meta.env.VITE_CLOUD_API ?? defaultCloudApiBase());
@@ -3103,4 +3104,7 @@ if (!rootElement) {
 const portalWindow = window as PortalWindow;
 const root = portalWindow.__OZON_PORTAL_ROOT__ ?? createRoot(rootElement);
 portalWindow.__OZON_PORTAL_ROOT__ = root;
-root.render(<App />);
+const customerGuidePath = ["/customer-guide", "/customer-guide.html"].includes(
+  window.location.pathname
+);
+root.render(customerGuidePath ? <CustomerGuide /> : <App />);
