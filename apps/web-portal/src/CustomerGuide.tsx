@@ -12,7 +12,7 @@ export function CustomerGuide() {
           <span>Ozon Rust Suite</span>
         </a>
         <a className="guide-return" href="/">
-          返回登录页
+          返回门户继续操作
         </a>
       </header>
 
@@ -20,7 +20,7 @@ export function CustomerGuide() {
         <p className="guide-eyebrow">客户操作说明</p>
         <h1>从登录到读取商品，再到生成海报</h1>
         <p>
-          按下面步骤操作即可。第一次使用需要安装电脑助手，并把 Ozon 店铺授权给这台电脑；以后只要打开网站和电脑助手，就可以继续读取商品。
+          按下面步骤操作即可。第一次使用需要安装电脑助手、授权当前电脑，并在电脑助手里填写 Ozon 店铺接口信息；以后只要打开网站和电脑助手，就可以继续读取商品。
         </p>
       </section>
 
@@ -71,8 +71,8 @@ export function CustomerGuide() {
               <GuideStep index={3} title="下载安装电脑助手">
                 <p>在“安装并打开电脑助手”步骤里，按你的电脑系统下载。</p>
                 <ul>
-                  <li>Windows 用户：优先下载 EXE 安装包；企业电脑也可以使用 MSI 安装包。</li>
-                  <li>Mac 用户：下载 DMG，打开后把 Ozon Rust Local 拖到“应用程序”。</li>
+                  <li>Windows 用户：点击页面推荐的 Windows 安装包；如果安装受限，再尝试备用安装包。</li>
+                  <li>Mac 用户：按页面提供的 Mac 安装包操作；无法打开时联系服务人员确认电脑型号。</li>
                 </ul>
               </GuideStep>
               <GuideStep index={4} title="打开电脑助手">
@@ -82,7 +82,7 @@ export function CustomerGuide() {
                 <p>网站检测到电脑助手后，会出现“授权这台电脑”或“完成授权”。点击后等待页面显示“可以开始了”。这一步完成后，这台电脑就可以读取店铺商品。</p>
               </GuideStep>
               <GuideStep index={6} title="填写店铺授权信息">
-                <p>在电脑助手里打开“店铺授权”，填写 Ozon Seller 的 Client ID 和 API Key，点击保存。保存后回到网站，点击刷新或重新检测。</p>
+                <p>切到 Ozon Rust Local 电脑助手，在“本地密钥”或“店铺授权”里填写 Ozon Seller 的 Client ID 和 API Key，点击保存。保存后回到网站，点击刷新或重新检测。</p>
               </GuideStep>
             </div>
           </section>
@@ -95,15 +95,16 @@ export function CustomerGuide() {
               </GuideStep>
               <GuideStep index={2} title="读取商品列表">
                 <p>点击“读取商品”。如果店铺授权正确，页面会显示商品数量和商品列表。商品较多时，第一次读取可能需要等几秒。</p>
+                <p>如果列表里没有目标商品，可以输入 offer ID、商品 ID 或 sku 再读取详情。看到“归档商品”时，请先确认商品仍在销售，再用于海报或投放。</p>
               </GuideStep>
               <GuideStep index={3} title="查看商品详情和图片">
-                <p>选择一个商品，或输入商品的 offer ID，点击读取详情。页面会展示商品名称、图片和可用于海报的基础信息。</p>
+                <p>选择一个商品点击“详情/图片”，或输入商品的 offer ID 后点击“读取详情/图片”。页面会展示商品名称、商品图和可用于海报的基础信息。</p>
               </GuideStep>
               <GuideStep index={4} title="生成海报简报">
                 <p>点击“生成海报简报”。系统会根据真实商品信息整理标题、卖点、图片参考和生成要求。生成前请确认商品图片和商品本身一致。</p>
               </GuideStep>
               <GuideStep index={5} title="选择图片生成方式">
-                <p>建议优先使用已登录的龙虾、OpenClaw 或 Codex 继续生成图片。把海报简报复制过去后，按提示生成即可。</p>
+                <p>建议优先使用已登录的龙虾、OpenClaw 或 Codex 继续生成图片。点击“复制给龙虾/Codex”后，切到已登录的工具里粘贴任务包，再按提示生成。</p>
                 <p>如果你的账号已经开通后台图片生成服务，也可以选择后台自动生成。若页面提示“图片通道未开通”，请改用龙虾、OpenClaw 或 Codex 方式生成。</p>
               </GuideStep>
               <GuideStep index={6} title="检查成图">
