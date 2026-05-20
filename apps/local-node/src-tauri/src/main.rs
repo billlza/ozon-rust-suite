@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
     fs::OpenOptions,
-    io::Write,
+    io::{Read, Write},
+    net::TcpStream,
     path::PathBuf,
     sync::Mutex,
     thread,
@@ -54,6 +55,18 @@ struct SidecarSnapshot {
     last_exit: Option<String>,
     last_error: Option<String>,
     desired_running: bool,
+}
+
+#[derive(Deserialize)]
+struct HealthProbe {
+    service: Option<String>,
+    status: Option<String>,
+}
+
+enum ExistingLocalNode {
+    Ready,
+    Blocked(String),
+    Missing,
 }
 
 struct SidecarState {
@@ -189,6 +202,28 @@ fn start_managed_sidecar(app: &AppHandle) {
             .expect("sidecar snapshot lock poisoned");
         if !snapshot.desired_running {
             return;
+        }
+        match probe_existing_local_node(&state.runtime.local_token) {
+            ExistingLocalNode::Ready => {
+                snapshot.pid = None;
+                snapshot.status = "external".to_string();
+                snapshot.last_error = None;
+                snapshot.last_exit = None;
+                append_sidecar_log(
+                    &PathBuf::from(&state.runtime.sidecar_log_path),
+                    "attached to existing ozon-local-node on 127.0.0.1:8790 / 17870",
+                );
+                return;
+            }
+            ExistingLocalNode::Blocked(reason) => {
+                snapshot.pid = None;
+                snapshot.status = "blocked".to_string();
+                snapshot.last_error = Some(reason.clone());
+                snapshot.last_exit = None;
+                append_sidecar_log(&PathBuf::from(&state.runtime.sidecar_log_path), &reason);
+                return;
+            }
+            ExistingLocalNode::Missing => {}
         }
         snapshot.status = "starting".to_string();
         snapshot.last_error = None;
@@ -337,6 +372,88 @@ fn schedule_sidecar_restart(app: AppHandle) {
     });
 }
 
+fn probe_existing_local_node(local_token: &str) -> ExistingLocalNode {
+    if !probe_health_endpoint("127.0.0.1:8790") {
+        return ExistingLocalNode::Missing;
+    }
+    if !probe_health_endpoint("127.0.0.1:17870") {
+        return ExistingLocalNode::Blocked(
+            "127.0.0.1:8790 已有 Ozon 本地节点，但 17870 agent 端口未就绪".to_string(),
+        );
+    }
+    if !probe_config_status_endpoint(local_token) {
+        return ExistingLocalNode::Blocked(
+            "检测到已有 Ozon 本地节点，但当前桌面端 token 无法访问 /config/status".to_string(),
+        );
+    }
+    ExistingLocalNode::Ready
+}
+
+fn probe_health_endpoint(addr: &str) -> bool {
+    let Some(response) = probe_http_endpoint(addr, "/health", None) else {
+        return false;
+    };
+    if response.status_code != 200 {
+        return false;
+    }
+    let Ok(health) = serde_json::from_str::<HealthProbe>(response.body.trim()) else {
+        return false;
+    };
+    health.service.as_deref() == Some("ozon-local-node") && health.status.as_deref() == Some("ok")
+}
+
+fn probe_config_status_endpoint(local_token: &str) -> bool {
+    probe_http_endpoint("127.0.0.1:8790", "/config/status", Some(local_token))
+        .is_some_and(|response| response.status_code == 200)
+}
+
+struct HttpProbeResponse {
+    status_code: u16,
+    body: String,
+}
+
+fn probe_http_endpoint(
+    addr: &str,
+    path: &str,
+    local_token: Option<&str>,
+) -> Option<HttpProbeResponse> {
+    let Ok(mut stream) = TcpStream::connect(addr) else {
+        return None;
+    };
+    let timeout = Some(Duration::from_millis(500));
+    let _ = stream.set_read_timeout(timeout);
+    let _ = stream.set_write_timeout(timeout);
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+    if let Some(token) = local_token {
+        request.push_str("x-local-token: ");
+        request.push_str(token);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
+
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).ok()?;
+    let Some((headers, body)) = raw.split_once("\r\n\r\n") else {
+        return None;
+    };
+    let status_code = parse_http_status(headers)?;
+    Some(HttpProbeResponse {
+        status_code,
+        body: body.to_string(),
+    })
+}
+
+fn parse_http_status(headers: &str) -> Option<u16> {
+    headers
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -426,4 +543,19 @@ fn generate_secret() -> String {
 
 fn valid_secret(value: &str) -> bool {
     value.len() >= 32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_http_status;
+
+    #[test]
+    fn parse_http_status_extracts_status_code() {
+        assert_eq!(
+            parse_http_status("HTTP/1.1 200 OK\r\ncontent-type: application/json"),
+            Some(200)
+        );
+        assert_eq!(parse_http_status("HTTP/1.0 401 Unauthorized"), Some(401));
+        assert_eq!(parse_http_status("not-http"), None);
+    }
 }

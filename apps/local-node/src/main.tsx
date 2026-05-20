@@ -989,7 +989,7 @@ function App() {
         </div>
       </section>
 
-      <section className={`runtime-strip ${runtime.sidecar_status === "running" ? "runtime-ok" : "runtime-warn"}`}>
+      <section className={`runtime-strip ${isConnectedRuntime(runtime) ? "runtime-ok" : "runtime-warn"}`}>
         <div>
           <strong>{sidecarStatusLabel(runtime)}</strong>
           <span>{sidecarDiagnostic(runtime)}</span>
@@ -1619,7 +1619,17 @@ function sidecarSummary(runtime: RuntimeConfig) {
   if (runtime.sidecar_status === "running" && runtime.sidecar_pid) {
     return `pid ${runtime.sidecar_pid}`;
   }
+  if (runtime.sidecar_status === "external") {
+    return "已连接";
+  }
+  if (runtime.sidecar_status === "blocked") {
+    return "需处理";
+  }
   return runtime.sidecar_status || "external";
+}
+
+function isConnectedRuntime(runtime: RuntimeConfig) {
+  return runtime.sidecar_status === "running" || runtime.sidecar_status === "external";
 }
 
 function sidecarStatusLabel(runtime: RuntimeConfig) {
@@ -1633,6 +1643,12 @@ function sidecarStatusLabel(runtime: RuntimeConfig) {
   }
   if (runtime.sidecar_status === "restarting") {
     return "本地节点正在重启";
+  }
+  if (runtime.sidecar_status === "external") {
+    return "本地节点已连接";
+  }
+  if (runtime.sidecar_status === "blocked") {
+    return "本地节点端口被占用";
   }
   return "本地节点未确认运行";
 }
@@ -1649,6 +1665,9 @@ function sidecarDiagnostic(runtime: RuntimeConfig) {
       ? new Date(runtime.sidecar_last_started_at_ms).toLocaleString()
       : "刚刚";
     return `监听 127.0.0.1:8790 / 17870，启动时间 ${started}，日志 ${runtime.sidecar_log_path}`;
+  }
+  if (runtime.sidecar_status === "external") {
+    return `检测到已有 Ozon Rust Local 节点正在监听 127.0.0.1:8790 / 17870，桌面端已直接连接。日志 ${runtime.sidecar_log_path}`;
   }
   return "桌面端会托管 local-node；若端口被占用或 sidecar 缺失，这里会显示具体错误。";
 }
