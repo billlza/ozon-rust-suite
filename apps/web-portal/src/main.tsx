@@ -61,6 +61,7 @@ const NEBULA_OAUTH_CONFIGURED = Boolean(NEBULA_OAUTH_BASE && NEBULA_CLIENT_ID);
 const SKYBRIDGE_TURNSTILE_SITE_KEY = (import.meta.env.VITE_TURNSTILE_SITE_KEY ?? "").trim();
 const SKYBRIDGE_TURNSTILE_CONFIGURED = Boolean(SKYBRIDGE_TURNSTILE_SITE_KEY);
 const REQUEST_TIMEOUT_MS = 15_000;
+const TURNSTILE_LOAD_TIMEOUT_MS = 6_000;
 
 type User = {
   id: string;
@@ -392,7 +393,7 @@ function App() {
   const statusMessage = authBusy ? authState.message : operationStatus ?? authState.message;
   const canUseProtectedActions = Boolean(session) && !authBusy;
   const captchaBlocked = isCaptchaProtectionMessage(authState.message);
-  const directAuthNeedsTurnstile = SKYBRIDGE_TURNSTILE_CONFIGURED && !turnstileToken;
+  const turnstilePending = SKYBRIDGE_TURNSTILE_CONFIGURED && !turnstileToken;
   const authDialogOpen = authDialogMode !== null;
   const localLeaseStatus = localNode.portal?.lease ?? null;
   const localPairingStatus = localNodePairingStatus(localNode, activeEntitlement, device, localLeaseStatus, Boolean(lease));
@@ -527,7 +528,7 @@ function App() {
       window.turnstile.reset(turnstileWidgetId.current);
     }
     turnstileTokenRef.current = "";
-    setTurnstileStatus(SKYBRIDGE_TURNSTILE_CONFIGURED ? "等待安全验证" : "无需验证");
+    setTurnstileStatus(SKYBRIDGE_TURNSTILE_CONFIGURED ? "安全验证可用时会自动完成" : "无需验证");
   }
 
   async function startNebulaOAuth(flow: NebulaOAuthFlow) {
@@ -731,11 +732,6 @@ function App() {
       setSkybridgeOtpStatus("手机号注册需要先填写昵称和联系邮箱");
       return;
     }
-    if (directAuthNeedsTurnstile) {
-      setSkybridgeOtpStatus("请先完成安全验证，再获取短信验证码");
-      return;
-    }
-
     setSkybridgeOtpBusy(true);
     setSkybridgeOtpStatus("正在请求短信验证码");
     try {
@@ -1174,13 +1170,13 @@ function App() {
         setTurnstileStatus("安全验证组件已加载；完成验证后可提交");
         window.setTimeout(() => {
           if (!cancelled && !turnstileTokenRef.current) {
-            setTurnstileStatus("如果没有看到安全验证，请刷新页面或改用网页登录入口");
+            setTurnstileStatus("安全验证未完成，也可以先提交；如被要求验证，请使用网页登录入口");
           }
         }, 4_000);
       })
       .catch((error) => {
         if (!cancelled) {
-          setTurnstileStatus(`安全验证组件加载失败：${errorMessage(error)}`);
+          setTurnstileStatus(`安全验证加载失败：${errorMessage(error)}；可先提交，失败再用网页登录入口`);
         }
       });
 
@@ -2060,14 +2056,14 @@ function App() {
               {authMethod === "phone" && (
                 <button
                   className="secondary"
-                  disabled={authBusy || skybridgeOtpBusy || directAuthNeedsTurnstile || !SKYBRIDGE_AUTH_CONFIGURED}
+                  disabled={authBusy || skybridgeOtpBusy || !SKYBRIDGE_AUTH_CONFIGURED}
                   type="button"
                   onClick={sendSkybridgePhoneCode}
                 >
                   <Smartphone size={18} /> 获取验证码
                 </button>
               )}
-              <button disabled={authBusy || directAuthNeedsTurnstile || !SKYBRIDGE_AUTH_CONFIGURED} type="submit">
+              <button disabled={authBusy || !SKYBRIDGE_AUTH_CONFIGURED} type="submit">
                 {authMode === "register" ? <UserPlus size={18} /> : <LogIn size={18} />}
                 {authSubmitText}
               </button>
@@ -2082,8 +2078,8 @@ function App() {
               </div>
             )}
 
-            {directAuthNeedsTurnstile && (
-              <p className="identity-note">当前登录需要先完成安全验证，验证通过后再提交。</p>
+            {turnstilePending && (
+              <p className="identity-note">如果安全验证转不出来，可以先提交；若账号服务要求验证，再使用下方“网页登录入口”。</p>
             )}
 
             {NEBULA_OAUTH_ENTRY_ENABLED && (
@@ -2925,23 +2921,60 @@ function loadTurnstileScript() {
 
   const existing = document.querySelector<HTMLScriptElement>('script[data-ozon-turnstile="true"]');
   if (existing) {
-    return new Promise<void>((resolve, reject) => {
-      existing.addEventListener("load", () => resolve(), { once: true });
-      existing.addEventListener("error", () => reject(new Error("Cloudflare Turnstile 脚本加载失败")), {
-        once: true
-      });
-    });
+    return waitForTurnstileScript(existing);
   }
 
   return new Promise<void>((resolve, reject) => {
     const script = document.createElement("script");
+    let settled = false;
+    const timeoutId = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      script.remove();
+      reject(new Error("Cloudflare Turnstile 脚本加载超时"));
+    }, TURNSTILE_LOAD_TIMEOUT_MS);
+    const settle = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeoutId);
+      callback();
+    };
     script.dataset.ozonTurnstile = "true";
     script.async = true;
     script.defer = true;
     script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
-    script.onload = () => resolve();
-    script.onerror = () => reject(new Error("Cloudflare Turnstile 脚本加载失败"));
+    script.onload = () => settle(resolve);
+    script.onerror = () => {
+      script.remove();
+      settle(() => reject(new Error("Cloudflare Turnstile 脚本加载失败")));
+    };
     document.head.appendChild(script);
+  });
+}
+
+function waitForTurnstileScript(script: HTMLScriptElement) {
+  return new Promise<void>((resolve, reject) => {
+    if (window.turnstile) {
+      resolve();
+      return;
+    }
+
+    let settled = false;
+    const timeoutId = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error("Cloudflare Turnstile 脚本加载超时"));
+    }, TURNSTILE_LOAD_TIMEOUT_MS);
+    const settle = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeoutId);
+      callback();
+    };
+    script.addEventListener("load", () => settle(resolve), { once: true });
+    script.addEventListener("error", () => settle(() => reject(new Error("Cloudflare Turnstile 脚本加载失败"))), {
+      once: true
+    });
   });
 }
 
