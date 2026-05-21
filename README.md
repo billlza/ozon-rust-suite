@@ -116,21 +116,31 @@ the canonical Nebula ID stable. Demo credentials are `demo` / `demo-pass`.
 Production Nebula identity configuration for the portal/cloud bridge:
 
 ```bash
+VITE_CLOUD_API=https://api.ozon66.com
 OZON_SUITE_SKYBRIDGE_API_BASE_URL=https://<skybridge-project>.supabase.co/functions/v1
-VITE_SKYBRIDGE_SUPABASE_URL=https://<skybridge-project>.supabase.co
-VITE_SKYBRIDGE_SUPABASE_ANON_KEY=<skybridge-anon-key>
 VITE_NEBULA_BASE_URL=https://nebula.skybridge.com
 VITE_NEBULA_CLIENT_ID=ozon_rust_suite_portal
 VITE_NEBULA_SCOPE="openid profile email offline_access"
-VITE_TURNSTILE_SITE_KEY=<skybridge-turnstile-site-key>
+VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH=0
 ```
 
 The preferred production path is Nebula OAuth/PKCE. Register the portal client in
 Nebula with an exact redirect URI matching the running portal, for example
-`http://127.0.0.1:5171/auth/callback` in local development. Direct
-SkyBridge/Supabase password exchange is kept only as a compatibility path; if
-Nebula/Supabase requires Turnstile, configure `VITE_TURNSTILE_SITE_KEY` so the
-user completes the same Cloudflare Turnstile challenge Nebula uses.
+`http://127.0.0.1:5171/auth/callback` in local development. The portal enables
+this entry by default when `VITE_NEBULA_BASE_URL` and `VITE_NEBULA_CLIENT_ID` are
+set; use `VITE_ENABLE_NEBULA_OAUTH_ENTRY=0` only for emergency rollback.
+
+Human verification, SMS verification, MFA, and risk checks belong inside
+Nebula/SkyBridge and must be verified server-side before the authorization code
+is issued. For China-facing traffic, use a mainland-accessible verification
+provider in that identity service instead of placing Cloudflare Turnstile on the
+portal's primary login path.
+
+Direct SkyBridge/Supabase password exchange is not available in production
+portal builds. It remains a local development compatibility path only; if that
+development path requires Turnstile, set `VITE_TURNSTILE_SITE_KEY` locally. Do
+not treat direct password exchange as the production login path for mainland
+users.
 
 If `https://nebula.skybridge.com` presents a self-signed or otherwise untrusted
 certificate on a developer machine, do not disable browser certificate checks.
@@ -320,6 +330,14 @@ VITE_NEBULA_CLIENT_ID=ozon_rust_suite_portal \
 pnpm --dir apps/web-portal build
 ```
 
+Vercel is suitable as the overseas deployment and backup line, but it is not a
+mainland availability guarantee. A China-facing line should deploy the same
+`apps/web-portal/dist` static output to mainland or mainland-optimized hosting,
+serve the same assets without blocked third-party login scripts, and rewrite SPA
+routes such as `/auth/callback` to `/index.html`. Register every public callback
+domain separately in Nebula, for example `https://ozon66.com/auth/callback` and
+the mainland mirror callback if one is used.
+
 For the Rust cloud API on a VPS, copy `deploy/.env.ozon66.example` to
 `deploy/.env.ozon66`, replace every secret, point DNS for `api.ozon66.com` at
 the VPS, then run:
@@ -328,6 +346,5 @@ the VPS, then run:
 docker compose -f deploy/docker-compose.ozon66.yml --env-file deploy/.env.ozon66 up -d --build
 ```
 
-Register `https://ozon66.com/auth/callback` in Nebula before opening production
-OAuth to users. Keep the admin console behind private access controls; it still
-uses an operator token and should not be exposed as a public static site.
+Keep the admin console behind private access controls; it still uses an operator
+token and should not be exposed as a public static site.

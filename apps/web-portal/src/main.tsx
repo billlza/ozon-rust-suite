@@ -36,10 +36,11 @@ const SESSION_KEY = "ozon-rust-suite.portal.session";
 const NEBULA_OAUTH_STORAGE_KEY = "ozon-rust-suite.nebula.oauth";
 const DEFAULT_NEBULA_SCOPE = "openid profile email offline_access";
 const DEFAULT_SKYBRIDGE_SUPABASE_URL = "https://hloqytmhjludmuhwyyzb.supabase.co";
-const NEBULA_OAUTH_ENTRY_ENABLED =
-  import.meta.env.DEV || ["1", "true", "yes"].includes((import.meta.env.VITE_ENABLE_NEBULA_OAUTH_ENTRY ?? "").toLowerCase());
 const LOCAL_DEV_AUTH_ENABLED =
   import.meta.env.DEV || ["1", "true", "yes"].includes((import.meta.env.VITE_ENABLE_LOCAL_DEV_AUTH ?? "").toLowerCase());
+const DIRECT_SKYBRIDGE_AUTH_ENABLED =
+  import.meta.env.DEV &&
+  !["0", "false", "no"].includes((import.meta.env.VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH ?? "").toLowerCase());
 const SKYBRIDGE_AUTH_BASE = normalizeBaseUrl(
   import.meta.env.VITE_SKYBRIDGE_SUPABASE_URL ??
     import.meta.env.VITE_SUPABASE_URL ??
@@ -58,6 +59,9 @@ const NEBULA_OAUTH_BASE = normalizeBaseUrl(
 const NEBULA_CLIENT_ID = (import.meta.env.VITE_NEBULA_CLIENT_ID ?? DEV_NEBULA_CLIENT_ID).trim();
 const NEBULA_SCOPE = (import.meta.env.VITE_NEBULA_SCOPE ?? DEFAULT_NEBULA_SCOPE).trim();
 const NEBULA_OAUTH_CONFIGURED = Boolean(NEBULA_OAUTH_BASE && NEBULA_CLIENT_ID);
+const NEBULA_OAUTH_ENTRY_ENABLED =
+  NEBULA_OAUTH_CONFIGURED &&
+  !["0", "false", "no"].includes((import.meta.env.VITE_ENABLE_NEBULA_OAUTH_ENTRY ?? "").toLowerCase());
 const SKYBRIDGE_TURNSTILE_SITE_KEY = (import.meta.env.VITE_TURNSTILE_SITE_KEY ?? "").trim();
 const SKYBRIDGE_TURNSTILE_CONFIGURED = Boolean(SKYBRIDGE_TURNSTILE_SITE_KEY);
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -360,7 +364,7 @@ function App() {
   const [session, setSession] = useState<Session | null>(() => loadSession());
   const [authState, dispatchAuth] = useReducer(authReducer, {
     phase: loadSession() ? "authenticated" : "idle",
-    message: loadSession() ? "已恢复本地会话，正在等待刷新" : "请选择邮箱或手机号登录",
+    message: loadSession() ? "已恢复本地会话，正在等待刷新" : "请选择统一身份登录",
     requestId: 0
   });
   const [operationStatus, setOperationStatus] = useState<string | null>(null);
@@ -1134,7 +1138,7 @@ function App() {
   }, [authMode, authMethod]);
 
   useEffect(() => {
-    if (!SKYBRIDGE_TURNSTILE_CONFIGURED || !authDialogOpen) {
+    if (!DIRECT_SKYBRIDGE_AUTH_ENABLED || !SKYBRIDGE_TURNSTILE_CONFIGURED || !authDialogOpen) {
       return;
     }
 
@@ -1174,7 +1178,7 @@ function App() {
         setTurnstileStatus("安全验证组件已加载；完成验证后可提交");
         window.setTimeout(() => {
           if (!cancelled && !turnstileTokenRef.current) {
-            setTurnstileStatus("如果没有看到安全验证，请刷新页面或改用网页登录入口");
+            setTurnstileStatus("如果没有看到安全验证，请刷新页面或改用统一身份入口");
           }
         }, 4_000);
       })
@@ -1299,7 +1303,7 @@ function App() {
             )}
           </div>
           <div className="hero-meta">
-            <span>邮箱/手机号登录</span>
+            <span>统一身份登录</span>
             <span>真实商品读取</span>
             <span>龙虾/Codex 出图</span>
           </div>
@@ -1369,7 +1373,7 @@ function App() {
           <div>
             <span>01</span>
             <strong>登录账号</strong>
-            <p>用邮箱或手机号进入工作台，后续状态会自动保存。</p>
+            <p>打开统一身份页进入工作台，后续状态会自动保存。</p>
           </div>
           <div>
             <span>02</span>
@@ -1987,126 +1991,149 @@ function App() {
 
             <div className="auth-context-line">
               <ShieldCheck size={17} />
-              <span>{SKYBRIDGE_AUTH_CONFIGURED ? "安全登录后就能继续下一步。" : "账号服务正在维护，请联系运营支持。"}</span>
+              <span>
+                {NEBULA_OAUTH_CONFIGURED
+                  ? "安全验证在统一身份页完成，通过后会自动回到这里。"
+                  : "统一身份服务正在维护，请联系运营支持。"}
+              </span>
             </div>
 
-            <form className="form-grid skybridge-auth-grid auth-card-form" onSubmit={handleSkybridgePasswordSubmit}>
-              <div className="method-switch auth-methods" aria-label="账号登录方式">
-                <button className={authMethod === "email" ? "active" : ""} type="button" onClick={() => setAuthMethod("email")}>
-                  <Mail size={18} /> 邮箱
-                </button>
-                <button className={authMethod === "phone" ? "active" : ""} type="button" onClick={() => setAuthMethod("phone")}>
-                  <Smartphone size={18} /> 手机号
-                </button>
-              </div>
-
-              {!SKYBRIDGE_AUTH_CONFIGURED && (
-                <p className="identity-note">{directAuthUnavailableMessage}</p>
-              )}
-
-              <label>
-                {identifierLabel(authMode, authMethod)}
-                <input
-                  autoComplete={identifierAutocomplete(authMethod)}
-                  placeholder={identifierPlaceholder(authMode, authMethod)}
-                  value={skybridgeIdentifier}
-                  onChange={(event) => setSkybridgeIdentifier(event.target.value)}
-                />
-              </label>
-              {authMode === "register" && (
-                <label>
-                  昵称
-                  <input
-                    autoComplete="name"
-                    placeholder="姓名或团队昵称"
-                    value={skybridgeName}
-                    onChange={(event) => setSkybridgeName(event.target.value)}
-                  />
-                </label>
-              )}
-              {authMode === "register" && authMethod === "phone" && (
-                <label>
-                  备用邮箱
-                  <input
-                    autoComplete="email"
-                    placeholder="用于接收账号通知"
-                    value={skybridgePhoneEmail}
-                    onChange={(event) => setSkybridgePhoneEmail(event.target.value)}
-                  />
-                </label>
-              )}
-              {authMethod === "phone" ? (
-                <label>
-                  短信验证码
-                  <input
-                    autoComplete="one-time-code"
-                    placeholder="请输入验证码"
-                    value={skybridgePhoneCode}
-                    onChange={(event) => setSkybridgePhoneCode(event.target.value)}
-                  />
-                </label>
-              ) : (
-                <label>
-                  密码
-                  <input
-                    autoComplete={authMode === "register" ? "new-password" : "current-password"}
-                    placeholder="请输入密码"
-                    value={skybridgePassword}
-                    onChange={(event) => setSkybridgePassword(event.target.value)}
-                    type="password"
-                  />
-                </label>
-              )}
-              {authMethod === "phone" && (
-                <button
-                  className="secondary"
-                  disabled={authBusy || skybridgeOtpBusy || directAuthNeedsTurnstile || !SKYBRIDGE_AUTH_CONFIGURED}
-                  type="button"
-                  onClick={sendSkybridgePhoneCode}
-                >
-                  <Smartphone size={18} /> 获取验证码
-                </button>
-              )}
-              <button disabled={authBusy || directAuthNeedsTurnstile || !SKYBRIDGE_AUTH_CONFIGURED} type="submit">
-                {authMode === "register" ? <UserPlus size={18} /> : <LogIn size={18} />}
-                {authSubmitText}
-              </button>
-            </form>
-
-            {skybridgeOtpStatus && <p className="identity-note">{skybridgeOtpStatus}</p>}
-
-            {SKYBRIDGE_TURNSTILE_CONFIGURED && (
-              <div className="turnstile-row">
-                <div ref={turnstileContainerRef} />
-                <span>{turnstileStatus}</span>
-              </div>
-            )}
-
-            {directAuthNeedsTurnstile && (
-              <p className="identity-note">当前登录需要先完成安全验证，验证通过后再提交。</p>
-            )}
-
             {NEBULA_OAUTH_ENTRY_ENABLED && (
-              <details className="compat-panel">
-                <summary>网页登录入口</summary>
-                <section className="nebula-oauth-panel">
-                  <div className="section-title compact-title">
-                    <ShieldCheck />
-                    <div>
-                      <h2>网页登录入口</h2>
-                      <p>如果上方登录不可用，可以打开独立登录页完成验证后返回这里。</p>
-                    </div>
+              <section className="nebula-oauth-panel nebula-oauth-primary">
+                <div className="section-title compact-title">
+                  <ShieldCheck />
+                  <div>
+                    <h2>统一身份{authMode === "register" ? "注册" : "登录"}</h2>
+                    <p>账号验证、短信或人机校验都在身份服务里完成；通过后自动回到当前门户。</p>
                   </div>
-                  <div className="oauth-actions">
-                    <button disabled={authBusy || !NEBULA_OAUTH_CONFIGURED} onClick={() => startNebulaOAuth(authMode)}>
-                      <ExternalLink size={18} /> {authMode === "register" ? "打开注册" : "打开登录"}
+                </div>
+                <div className="oauth-actions">
+                  <button disabled={authBusy || !NEBULA_OAUTH_CONFIGURED} onClick={() => startNebulaOAuth(authMode)}>
+                    <ExternalLink size={18} /> {authMode === "register" ? "打开注册页" : "打开登录页"}
+                  </button>
+                </div>
+              </section>
+            )}
+
+            {!NEBULA_OAUTH_ENTRY_ENABLED && (
+              <p className="identity-note">统一身份入口暂不可用，请联系运营支持确认 Nebula 登录配置。</p>
+            )}
+
+            {DIRECT_SKYBRIDGE_AUTH_ENABLED && (
+              <details className="compat-panel">
+                <summary>兼容邮箱/手机号登录</summary>
+                <form className="form-grid skybridge-auth-grid auth-card-form" onSubmit={handleSkybridgePasswordSubmit}>
+                  <div className="method-switch auth-methods" aria-label="账号登录方式">
+                    <button className={authMethod === "email" ? "active" : ""} type="button" onClick={() => setAuthMethod("email")}>
+                      <Mail size={18} /> 邮箱
+                    </button>
+                    <button className={authMethod === "phone" ? "active" : ""} type="button" onClick={() => setAuthMethod("phone")}>
+                      <Smartphone size={18} /> 手机号
                     </button>
                   </div>
-                  {!NEBULA_OAUTH_CONFIGURED && (
-                    <p className="identity-note">网页登录入口暂不可用，请使用上方账号入口。</p>
+
+                  {!SKYBRIDGE_AUTH_CONFIGURED && (
+                    <p className="identity-note">{directAuthUnavailableMessage}</p>
                   )}
-                </section>
+
+                  <label>
+                    {identifierLabel(authMode, authMethod)}
+                    <input
+                      autoComplete={identifierAutocomplete(authMethod)}
+                      placeholder={identifierPlaceholder(authMode, authMethod)}
+                      value={skybridgeIdentifier}
+                      onChange={(event) => setSkybridgeIdentifier(event.target.value)}
+                    />
+                  </label>
+                  {authMode === "register" && (
+                    <label>
+                      昵称
+                      <input
+                        autoComplete="name"
+                        placeholder="姓名或团队昵称"
+                        value={skybridgeName}
+                        onChange={(event) => setSkybridgeName(event.target.value)}
+                      />
+                    </label>
+                  )}
+                  {authMode === "register" && authMethod === "phone" && (
+                    <label>
+                      备用邮箱
+                      <input
+                        autoComplete="email"
+                        placeholder="用于接收账号通知"
+                        value={skybridgePhoneEmail}
+                        onChange={(event) => setSkybridgePhoneEmail(event.target.value)}
+                      />
+                    </label>
+                  )}
+                  {authMethod === "phone" ? (
+                    <label>
+                      短信验证码
+                      <input
+                        autoComplete="one-time-code"
+                        placeholder="请输入验证码"
+                        value={skybridgePhoneCode}
+                        onChange={(event) => setSkybridgePhoneCode(event.target.value)}
+                      />
+                    </label>
+                  ) : (
+                    <label>
+                      密码
+                      <input
+                        autoComplete={authMode === "register" ? "new-password" : "current-password"}
+                        placeholder="请输入密码"
+                        value={skybridgePassword}
+                        onChange={(event) => setSkybridgePassword(event.target.value)}
+                        type="password"
+                      />
+                    </label>
+                  )}
+                  {authMethod === "phone" && (
+                    <button
+                      className="secondary"
+                      disabled={authBusy || skybridgeOtpBusy || directAuthNeedsTurnstile || !SKYBRIDGE_AUTH_CONFIGURED}
+                      type="button"
+                      onClick={sendSkybridgePhoneCode}
+                    >
+                      <Smartphone size={18} /> 获取验证码
+                    </button>
+                  )}
+                  <button disabled={authBusy || directAuthNeedsTurnstile || !SKYBRIDGE_AUTH_CONFIGURED} type="submit">
+                    {authMode === "register" ? <UserPlus size={18} /> : <LogIn size={18} />}
+                    {authSubmitText}
+                  </button>
+                </form>
+
+                {skybridgeOtpStatus && <p className="identity-note">{skybridgeOtpStatus}</p>}
+
+                {SKYBRIDGE_TURNSTILE_CONFIGURED && (
+                  <div className="turnstile-row">
+                    <div ref={turnstileContainerRef} />
+                    <span>{turnstileStatus}</span>
+                  </div>
+                )}
+
+                {directAuthNeedsTurnstile && (
+                  <p className="identity-note">当前兼容登录需要先完成安全验证，验证通过后再提交。</p>
+                )}
+                <div className="compat-title">
+                  <strong>生产建议</strong>
+                  <span>大陆用户优先使用上方统一身份入口。</span>
+                </div>
               </details>
+            )}
+
+            {captchaBlocked && (
+              <div className="captcha-callout">
+                <AlertCircle />
+                <div>
+                  <strong>这次登录还差安全验证</strong>
+                  <p>
+                    账号服务要求先完成验证码或二次确认。请使用上方统一身份入口，完成验证后会回到当前工作台。
+                  </p>
+                </div>
+              </div>
             )}
 
             {shouldShowAuthDialogStatus && (
@@ -2122,18 +2149,6 @@ function App() {
                 {authMode === "login" ? "创建账号" : "登录"}
               </button>
             </p>
-
-            {captchaBlocked && (
-              <div className="captcha-callout">
-                <AlertCircle />
-                <div>
-                  <strong>这次登录还差安全验证</strong>
-                  <p>
-                    账号服务要求先完成验证码或二次确认。请使用“网页登录入口”，完成验证后会回到当前工作台。
-                  </p>
-                </div>
-              </div>
-            )}
           </section>
         </div>
       )}
@@ -2578,7 +2593,7 @@ async function skybridgePasswordAuth(input: {
   captchaToken?: string;
 }): Promise<SkybridgeAuthSession> {
   if (!SKYBRIDGE_AUTH_CONFIGURED) {
-    throw new Error("邮箱/手机号登录未配置");
+    throw new Error("兼容邮箱/手机号登录未配置");
   }
   if (input.mode === "register" && input.method === "nebula") {
     throw new Error("账号编号由系统分配，注册请使用邮箱或手机号");
@@ -2623,7 +2638,7 @@ async function skybridgeSendPhoneOtp(input: {
   captchaToken?: string;
 }) {
   if (!SKYBRIDGE_AUTH_CONFIGURED) {
-    throw new Error("邮箱/手机号登录未配置");
+    throw new Error("兼容邮箱/手机号登录未配置");
   }
 
   const body: Record<string, unknown> = {
@@ -3082,7 +3097,7 @@ function isInvalidSessionError(error: unknown) {
 function skybridgeDirectAuthFailureMessage(error: unknown) {
   const message = errorMessage(error);
   if (isCaptchaProtectionMessage(message)) {
-    return "这次登录需要先完成安全验证。请刷新页面重试，或改用网页登录入口。";
+    return "这次登录需要先完成安全验证。请刷新页面重试，或改用统一身份入口。";
   }
   return message;
 }
