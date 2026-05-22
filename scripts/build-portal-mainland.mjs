@@ -10,12 +10,12 @@ const envFile = resolveEnvFile(process.argv);
 const envValues = loadEnvFile(envFile);
 
 const buildEnv = {
-  ...process.env,
   ...envValues,
-  VITE_ENABLE_NEBULA_OAUTH_ENTRY: envValues.VITE_ENABLE_NEBULA_OAUTH_ENTRY || "1",
-  VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH: "0",
-  VITE_TURNSTILE_SITE_KEY: ""
+  ...process.env
 };
+buildEnv.VITE_ENABLE_NEBULA_OAUTH_ENTRY = buildEnv.VITE_ENABLE_NEBULA_OAUTH_ENTRY || "1";
+buildEnv.VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH = "0";
+buildEnv.VITE_TURNSTILE_SITE_KEY = "";
 
 requireNonEmpty(buildEnv, "VITE_CLOUD_API");
 requireNonEmpty(buildEnv, "VITE_NEBULA_BASE_URL");

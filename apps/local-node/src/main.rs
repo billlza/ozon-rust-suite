@@ -174,6 +174,7 @@ fn local_cors() -> CorsLayer {
                         || origin == "http://127.0.0.1:5171"
                         || origin == "https://ozon66.com"
                         || origin == "https://www.ozon66.com"
+                        || origin == "https://cn.ozon66.com"
                         || origin.starts_with("tauri://")
                 })
                 .unwrap_or(false)
@@ -3428,26 +3429,30 @@ mod tests {
                 .expect("serve test local node");
         });
 
-        let response = reqwest::Client::new()
-            .request(reqwest::Method::OPTIONS, format!("http://{addr}/health"))
-            .header("Origin", "https://ozon66.com")
-            .header("Access-Control-Request-Method", "GET")
-            .header("Access-Control-Request-Private-Network", "true")
-            .send()
-            .await
-            .expect("preflight response");
+        let client = reqwest::Client::new();
+        for origin in ["https://ozon66.com", "https://cn.ozon66.com"] {
+            let response = client
+                .request(reqwest::Method::OPTIONS, format!("http://{addr}/health"))
+                .header("Origin", origin)
+                .header("Access-Control-Request-Method", "GET")
+                .header("Access-Control-Request-Private-Network", "true")
+                .send()
+                .await
+                .expect("preflight response");
+            let expected_origin = ReqwestHeaderValue::from_str(origin).expect("test origin header");
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get("access-control-allow-origin"),
-            Some(&ReqwestHeaderValue::from_static("https://ozon66.com"))
-        );
-        assert_eq!(
-            response
-                .headers()
-                .get("access-control-allow-private-network"),
-            Some(&ReqwestHeaderValue::from_static("true"))
-        );
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get("access-control-allow-origin"),
+                Some(&expected_origin)
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("access-control-allow-private-network"),
+                Some(&ReqwestHeaderValue::from_static("true"))
+            );
+        }
 
         server.abort();
     }

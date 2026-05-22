@@ -1,0 +1,12 @@
+{
+  email {$ACME_EMAIL}
+}
+
+api-cn.ozon66.com {
+  encode zstd gzip
+
+  @health path /health
+  header @health Cache-Control "no-store"
+
+  reverse_proxy cloud-api:8080
+}

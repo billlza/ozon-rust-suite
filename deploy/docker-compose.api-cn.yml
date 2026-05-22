@@ -1,0 +1,61 @@
+services:
+  caddy:
+    image: caddy:2-alpine
+    env_file:
+      - .env.api-cn
+    depends_on:
+      cloud-api:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "443:443"
+    restart: unless-stopped
+    volumes:
+      - ./Caddyfile.api-cn:/etc/caddy/Caddyfile:ro
+      - caddy-api-cn-data:/data
+      - caddy-api-cn-config:/config
+
+  cloud-api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    env_file:
+      - .env.api-cn
+    environment:
+      OZON_SUITE_BIND: 0.0.0.0:8080
+      OZON_SUITE_ENV: production
+      DATABASE_URL: postgres://ozon:${POSTGRES_PASSWORD:?set-postgres-password}@postgres:5432/ozon_rust_suite
+      OZON_SUITE_CORS_ALLOWED_ORIGINS: ${OZON_SUITE_CORS_ALLOWED_ORIGINS:?set-cors-origins}
+      OZON_SUITE_JWT_SECRET: ${OZON_SUITE_JWT_SECRET:?set-a-long-jwt-secret}
+      OZON_SUITE_ADMIN_TOKEN: ${OZON_SUITE_ADMIN_TOKEN:?set-admin-token}
+      OZON_SUITE_SKYBRIDGE_API_BASE_URL: ${OZON_SUITE_SKYBRIDGE_API_BASE_URL:?set-skybridge-api-base-url}
+      OZON_SUITE_LOCAL_NODE_RELEASE_MANIFEST_URL: ${OZON_SUITE_LOCAL_NODE_RELEASE_MANIFEST_URL:?set-local-node-release-manifest-url}
+      OZON_SUITE_OPENCLAW_PLUGIN_URL: ${OZON_SUITE_OPENCLAW_PLUGIN_URL:?set-openclaw-plugin-url}
+      OZON_SUITE_OPENCLAW_MANIFEST_URL: ${OZON_SUITE_OPENCLAW_MANIFEST_URL:?set-openclaw-manifest-url}
+      OZON_SUITE_ALLOW_LOCAL_NEBULA_REGISTRATION: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "8080"
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: ozon_rust_suite
+      POSTGRES_USER: ozon
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set-postgres-password}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ozon -d ozon_rust_suite"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    volumes:
+      - postgres-api-cn-data:/var/lib/postgresql
+
+volumes:
+  caddy-api-cn-data:
+  caddy-api-cn-config:
+  postgres-api-cn-data:

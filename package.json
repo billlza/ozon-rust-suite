@@ -12,6 +12,7 @@
     "dev:local-node:real": "OZON_CONNECTOR_MODE=real cargo run -p ozon-local-node",
     "dev:local-demo": "pnpm dev:local-node & pnpm dev:local-ui",
     "build:portal:mainland": "node scripts/build-portal-mainland.mjs",
+    "deploy:portal:edgeone": "pnpm build:portal:mainland && pnpm dlx edgeone pages deploy apps/web-portal/dist -n ozon66-mainland-portal -t \"$EDGEONE_API_TOKEN\"",
     "build:web": "pnpm --dir apps/web-portal build && pnpm --dir apps/web-admin build && pnpm --dir apps/local-node build",
     "test:rust": "cargo test --workspace",
     "fmt": "cargo fmt --all"

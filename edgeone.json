@@ -1,0 +1,27 @@
+{
+  "name": "ozon66-mainland-portal",
+  "installCommand": "pnpm install --frozen-lockfile",
+  "buildCommand": "pnpm build:portal:mainland",
+  "outputDirectory": "apps/web-portal/dist",
+  "nodeVersion": "22.11.0",
+  "headers": [
+    {
+      "source": "/assets/*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=31536000, immutable"
+        }
+      ]
+    },
+    {
+      "source": "/index.html",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-store"
+        }
+      ]
+    }
+  ]
+}
