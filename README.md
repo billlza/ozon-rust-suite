@@ -338,6 +338,12 @@ routes such as `/auth/callback` to `/index.html`. Register every public callback
 domain separately in Nebula, for example `https://ozon66.com/auth/callback` and
 the mainland mirror callback if one is used.
 
+Use `pnpm build:portal:mainland -- --env-file deploy/.env.portal-mainland` to
+build the China-facing portal bundle. The build fails if the bundle contains the
+Cloudflare Turnstile script or the direct SkyBridge/Supabase browser-login path.
+See `docs/mainland-production-line.md` and `deploy/nginx.portal-mainland.conf`
+for the static hosting requirements.
+
 For the Rust cloud API on a VPS, copy `deploy/.env.ozon66.example` to
 `deploy/.env.ozon66`, replace every secret, point DNS for `api.ozon66.com` at
 the VPS, then run:

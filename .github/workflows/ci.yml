@@ -121,3 +121,6 @@ jobs:
 
       - name: Build portal, admin, and local UI
         run: pnpm build:web
+
+      - name: Build mainland portal bundle
+        run: pnpm build:portal:mainland -- --env-file deploy/.env.portal-mainland.example

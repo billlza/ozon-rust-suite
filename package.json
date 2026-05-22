@@ -11,6 +11,7 @@
     "dev:local-node": "OZON_CONNECTOR_MODE=${OZON_CONNECTOR_MODE:-mock} OZON_LOCAL_TOKEN=${OZON_LOCAL_TOKEN:-dev-local-token} OZON_OPENCLAW_TOKEN=${OZON_OPENCLAW_TOKEN:-dev-openclaw-token} cargo run -p ozon-local-node",
     "dev:local-node:real": "OZON_CONNECTOR_MODE=real cargo run -p ozon-local-node",
     "dev:local-demo": "pnpm dev:local-node & pnpm dev:local-ui",
+    "build:portal:mainland": "node scripts/build-portal-mainland.mjs",
     "build:web": "pnpm --dir apps/web-portal build && pnpm --dir apps/web-admin build && pnpm --dir apps/local-node build",
     "test:rust": "cargo test --workspace",
     "fmt": "cargo fmt --all"
