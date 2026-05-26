@@ -146,12 +146,16 @@ the SkyBridge Auth URL and anon key are configured explicitly.
 `apps/web-portal/vercel.json` runs
 `apps/web-portal/scripts/validate-production-env.mjs` before the production
 build; if direct auth is enabled, both
-`VITE_TURNSTILE_SITE_KEY` and `VITE_TURNSTILE_SCRIPT_URL` must be present so the
-browser can submit a real CAPTCHA token when Supabase Auth requires one.
-Mainland builds disable direct Supabase auth and leave both Turnstile variables
-empty so no Cloudflare dependency is shipped. Do not treat SSO as an automatic
-fallback for mainland users; either configure the primary account path
-explicitly or fail with an actionable message.
+`VITE_DIRECT_AUTH_VERIFICATION_MODE` must be set to `none` or `turnstile`.
+Use `turnstile` only for regions where Cloudflare verification is reliable; in
+that mode, `VITE_TURNSTILE_SITE_KEY` and `VITE_TURNSTILE_SCRIPT_URL` are also
+required so the browser can submit a real CAPTCHA token. Mainland-friendly
+deployments use `none`, keep both Turnstile variables empty, and must keep
+account risk controls in the identity service itself rather than relying on a
+Cloudflare widget in the portal. Mainland builds disable direct Supabase auth
+and leave both Turnstile variables empty so no Cloudflare dependency is shipped.
+Do not treat SSO as an automatic fallback for mainland users; either configure
+the primary account path explicitly or fail with an actionable message.
 
 If `https://nebula.skybridge.com` presents a self-signed or otherwise untrusted
 certificate on a developer machine, do not disable browser certificate checks.

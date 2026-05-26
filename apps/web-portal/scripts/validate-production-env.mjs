@@ -8,10 +8,20 @@ const directAuthEnabled = skybridgeAuthConfigured && !directAuthDisabled;
 const isVercelProduction = env.VERCEL_ENV === "production";
 
 if (isVercelProduction && directAuthEnabled) {
-  requireNonEmpty("VITE_TURNSTILE_SITE_KEY");
-  requireHttpsUrl("VITE_TURNSTILE_SCRIPT_URL");
-  if (!env.VITE_TURNSTILE_SCRIPT_URL.includes("turnstile/v0/api.js")) {
-    throw new Error("VITE_TURNSTILE_SCRIPT_URL must point to the Turnstile API script");
+  const verificationMode = (env.VITE_DIRECT_AUTH_VERIFICATION_MODE ?? "").trim().toLowerCase();
+  if (!["none", "turnstile"].includes(verificationMode)) {
+    throw new Error("VITE_DIRECT_AUTH_VERIFICATION_MODE must be either 'none' or 'turnstile'");
+  }
+
+  if (verificationMode === "turnstile") {
+    requireNonEmpty("VITE_TURNSTILE_SITE_KEY");
+    requireHttpsUrl("VITE_TURNSTILE_SCRIPT_URL");
+    if (!env.VITE_TURNSTILE_SCRIPT_URL.includes("turnstile/v0/api.js")) {
+      throw new Error("VITE_TURNSTILE_SCRIPT_URL must point to the Turnstile API script");
+    }
+  } else {
+    rejectNonEmpty("VITE_TURNSTILE_SITE_KEY");
+    rejectNonEmpty("VITE_TURNSTILE_SCRIPT_URL");
   }
 }
 
@@ -36,5 +46,11 @@ function requireHttpsUrl(key) {
   }
   if (url.protocol !== "https:") {
     throw new Error(`${key} must use https`);
+  }
+}
+
+function rejectNonEmpty(key) {
+  if (env[key]?.trim()) {
+    throw new Error(`${key} must be empty when VITE_DIRECT_AUTH_VERIFICATION_MODE=none`);
   }
 }
