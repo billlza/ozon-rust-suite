@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,6 +16,7 @@ const buildEnv = {
 buildEnv.VITE_ENABLE_NEBULA_OAUTH_ENTRY = buildEnv.VITE_ENABLE_NEBULA_OAUTH_ENTRY || "1";
 buildEnv.VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH = "0";
 buildEnv.VITE_TURNSTILE_SITE_KEY = "";
+buildEnv.VITE_TURNSTILE_SCRIPT_URL = "";
 
 requireNonEmpty(buildEnv, "VITE_CLOUD_API");
 requireNonEmpty(buildEnv, "VITE_NEBULA_BASE_URL");
@@ -25,7 +26,9 @@ requireUrl(buildEnv, "VITE_NEBULA_BASE_URL");
 rejectNonEmpty(buildEnv, "VITE_SKYBRIDGE_SUPABASE_URL");
 rejectNonEmpty(buildEnv, "VITE_SKYBRIDGE_SUPABASE_ANON_KEY");
 rejectNonEmpty(buildEnv, "VITE_TURNSTILE_SITE_KEY");
+rejectNonEmpty(buildEnv, "VITE_TURNSTILE_SCRIPT_URL");
 
+rmSync(path.join(repoRoot, "apps", "web-portal", "dist"), { force: true, recursive: true });
 run("pnpm", ["--dir", "apps/web-portal", "build"], buildEnv);
 verifyBundle(path.join(repoRoot, "apps", "web-portal", "dist"));
 console.log(`Mainland portal bundle is ready: ${path.join(repoRoot, "apps", "web-portal", "dist")}`);

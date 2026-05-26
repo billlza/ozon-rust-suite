@@ -38,9 +38,6 @@ const DEFAULT_NEBULA_SCOPE = "openid profile email offline_access";
 const DEFAULT_SKYBRIDGE_SUPABASE_URL = "https://hloqytmhjludmuhwyyzb.supabase.co";
 const LOCAL_DEV_AUTH_ENABLED =
   import.meta.env.DEV || ["1", "true", "yes"].includes((import.meta.env.VITE_ENABLE_LOCAL_DEV_AUTH ?? "").toLowerCase());
-const DIRECT_SKYBRIDGE_AUTH_ENABLED =
-  import.meta.env.DEV &&
-  !["0", "false", "no"].includes((import.meta.env.VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH ?? "").toLowerCase());
 const SKYBRIDGE_AUTH_BASE = normalizeBaseUrl(
   import.meta.env.VITE_SKYBRIDGE_SUPABASE_URL ??
     import.meta.env.VITE_SUPABASE_URL ??
@@ -51,6 +48,9 @@ const SKYBRIDGE_ANON_KEY =
   import.meta.env.VITE_SUPABASE_ANON_KEY ??
   "";
 const SKYBRIDGE_AUTH_CONFIGURED = Boolean(SKYBRIDGE_AUTH_BASE && SKYBRIDGE_ANON_KEY);
+const DIRECT_SKYBRIDGE_AUTH_ENABLED =
+  SKYBRIDGE_AUTH_CONFIGURED &&
+  !["0", "false", "no"].includes((import.meta.env.VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH ?? "").toLowerCase());
 const DEV_NEBULA_OAUTH_BASE = import.meta.env.DEV ? "http://127.0.0.1:8788" : "";
 const DEV_NEBULA_CLIENT_ID = import.meta.env.DEV ? "ozon_rust_suite_portal" : "";
 const NEBULA_OAUTH_BASE = normalizeBaseUrl(
@@ -64,6 +64,10 @@ const NEBULA_OAUTH_ENTRY_ENABLED =
   !["0", "false", "no"].includes((import.meta.env.VITE_ENABLE_NEBULA_OAUTH_ENTRY ?? "").toLowerCase());
 const SKYBRIDGE_TURNSTILE_SITE_KEY = (import.meta.env.VITE_TURNSTILE_SITE_KEY ?? "").trim();
 const SKYBRIDGE_TURNSTILE_CONFIGURED = Boolean(SKYBRIDGE_TURNSTILE_SITE_KEY);
+const SKYBRIDGE_TURNSTILE_SCRIPT_URL = (SKYBRIDGE_TURNSTILE_CONFIGURED
+  ? import.meta.env.VITE_TURNSTILE_SCRIPT_URL ?? ""
+  : ""
+).trim();
 const REQUEST_TIMEOUT_MS = 15_000;
 
 type User = {
@@ -364,7 +368,7 @@ function App() {
   const [session, setSession] = useState<Session | null>(() => loadSession());
   const [authState, dispatchAuth] = useReducer(authReducer, {
     phase: loadSession() ? "authenticated" : "idle",
-    message: loadSession() ? "已恢复本地会话，正在等待刷新" : "请选择统一身份登录",
+    message: loadSession() ? "已恢复本地会话，正在等待刷新" : "请选择邮箱或手机号登录",
     requestId: 0
   });
   const [operationStatus, setOperationStatus] = useState<string | null>(null);
@@ -426,7 +430,7 @@ function App() {
   const computerAuthorized = localLeaseStatus?.valid === true;
   const storeCredentialsReady = localNode.portal?.ozon?.configured === true;
   const posterConfigReady = localNode.portal?.openai?.configured === true;
-  const directAuthUnavailableMessage = "账号服务正在维护，请稍后再试或联系运营支持。";
+  const directAuthUnavailableMessage = "邮箱/手机号入口尚未开通，请联系运营支持。";
   const authSubmitText =
     authMethod === "phone"
       ? authMode === "register"
@@ -1219,7 +1223,7 @@ function App() {
         setTurnstileStatus("安全验证组件已加载；完成验证后可提交");
         window.setTimeout(() => {
           if (!cancelled && !turnstileTokenRef.current) {
-            setTurnstileStatus("如果没有看到安全验证，请刷新页面或改用统一身份入口");
+            setTurnstileStatus("如果没有看到安全验证，请刷新页面或联系运营支持");
           }
         }, 4_000);
       })
@@ -1313,9 +1317,12 @@ function App() {
       <section className="hero-section motion-hero motion-stage-entry" id="top">
         <div className="hero-copy">
           <p className="eyebrow">Ozon Rust Suite</p>
-          <h1>登录后，按步骤把店铺商品读出来。</h1>
+          <h1>
+            <span>商品图进来，</span>
+            <span>海报成稿出去。</span>
+          </h1>
           <p>
-            先开通服务，安装电脑助手，连接这台电脑，然后读取 Ozon 商品。海报出图优先交给龙虾/Codex，不强迫你另买 API。
+            读取真实商品图、标题和卖点，本机助手负责店铺授权，龙虾/Codex 负责成图。少填表，多看成稿。
           </p>
           <div className="hero-actions">
             {session ? (
@@ -1334,46 +1341,70 @@ function App() {
               </>
             ) : (
               <>
-                <button onClick={() => openAuthDialog("register")}>
-                  <UserPlus size={18} /> 立即注册
+                <button onClick={() => openAuthDialog("login")}>
+                  <LogIn size={18} /> 登录工作台
                 </button>
-                <a className="download secondary" href="#workflow">
-                  <ArrowRight size={18} /> 看看接入步骤
-                </a>
+                <button className="secondary" onClick={() => openAuthDialog("register")}>
+                  <UserPlus size={18} /> 创建账号
+                </button>
               </>
             )}
           </div>
           <div className="hero-meta">
-            <span>统一身份登录</span>
+            <span>邮箱/手机号登录</span>
             <span>真实商品读取</span>
             <span>龙虾/Codex 出图</span>
           </div>
         </div>
-        <div className="hero-visual motion-card-flow" aria-label="Ozon Rust Suite workflow preview">
-          <div className="visual-topbar">
-            <span />
-            <span />
-            <span />
-            <strong>接入步骤</strong>
+        <div className="hero-visual motion-card-flow" aria-label="商品海报生成预览">
+          <div className="showcase-toolbar">
+            <span>Live product brief</span>
+            <strong>Ozon item #3169219</strong>
           </div>
-          <div className="visual-grid">
-            <div>
-              <span>Step 1</span>
-              <strong>登录账号</strong>
-            </div>
-            <div>
-              <span>Step 2</span>
-              <strong>安装助手</strong>
-            </div>
-            <div>
-              <span>Step 3</span>
-              <strong>连接电脑</strong>
-            </div>
+          <div className="poster-stage">
+            <article className="poster-card product-card">
+              <span className="poster-label">商品原图</span>
+              <div className="product-photo">
+                <span className="lighter-shape" />
+              </div>
+              <strong>车系打火机</strong>
+              <p>紫色车贴 · 金属喷嘴 · 随身款</p>
+            </article>
+            <article className="poster-card output-card">
+              <span className="poster-label">海报成稿</span>
+              <div className="poster-art">
+                <span className="poster-product" />
+                <span className="poster-road" />
+              </div>
+              <strong>时尚车系打火机</strong>
+              <p>点亮风格，随身有行</p>
+            </article>
+            <article className="poster-card brief-card">
+              <span className="poster-label">生成 brief</span>
+              <ul>
+                <li>保留商品颜色和车系元素</li>
+                <li>突出便携、防风和礼品感</li>
+                <li>禁止改品牌、改外观、乱写参数</li>
+              </ul>
+            </article>
           </div>
-          <div className="diff-preview">
-            <span>Step 4</span>
-            <strong>读取商品，交给龙虾/Codex</strong>
-            <em>商品图片和文案都来自真实商品信息。</em>
+          <div className="template-marquee" aria-hidden="true">
+            <div>
+              <span>新品首图</span>
+              <span>节日促销</span>
+              <span>车品风格</span>
+              <span>黑金质感</span>
+              <span>俄语卖点</span>
+              <span>竖版社媒</span>
+              <span>商品对比</span>
+              <span>新品首图</span>
+              <span>节日促销</span>
+              <span>车品风格</span>
+              <span>黑金质感</span>
+              <span>俄语卖点</span>
+              <span>竖版社媒</span>
+              <span>商品对比</span>
+            </div>
           </div>
         </div>
       </section>
@@ -1381,23 +1412,23 @@ function App() {
       <section className="capability-band motion-reveal" data-reveal id="capabilities">
         <div className="band-title">
           <p className="eyebrow">能做什么</p>
-          <h2>把复杂的接入过程，变成一步一步的操作。</h2>
+          <h2>先把商品拿准，再谈生成效果。</h2>
         </div>
         <div className="capability-grid">
           <article>
             <PackageCheck />
-            <h3>不用到处找入口</h3>
-            <p>登录、开通、下载、连接电脑都在同一个页面完成。</p>
+            <h3>店铺商品是真实来源</h3>
+            <p>读取 Ozon 商品详情和图片，海报从真实资料开始，不让模型凭空编。</p>
           </article>
           <article>
             <Boxes />
-            <h3>读取真实商品</h3>
-            <p>用你的 Ozon 店铺授权读取商品信息，没连上就明确告诉你哪里没好。</p>
+            <h3>电脑助手保管授权</h3>
+            <p>店铺密钥留在本机，网页只看连接状态，断在哪一步就显示哪一步。</p>
           </article>
           <article>
             <Bot />
-            <h3>生成不跑偏的海报</h3>
-            <p>先拿商品图片和属性，再生成宣传图，减少错图、错词和错卖点。</p>
+            <h3>成稿要能复核</h3>
+            <p>生成后检查商品外观、卖点和文字，明显跑偏就不当成成功。</p>
           </article>
         </div>
       </section>
@@ -1405,16 +1436,16 @@ function App() {
       <section className="workflow-band motion-reveal" data-reveal id="workflow">
         <div className="workflow-copy">
           <p className="eyebrow">上手路径</p>
-          <h2>登录、开通、安装、连接、开始用。</h2>
+          <h2>用户只需要顺着下一步走。</h2>
           <p>
-            普通用户只需要照着按钮往下走。需要排查时，再打开排查信息查看连接状态和版本。
+            默认路径保留给新手，排查信息收起来。客服需要定位问题时，再看版本、节点和授权状态。
           </p>
         </div>
         <div className="workflow-steps">
           <div>
             <span>01</span>
             <strong>登录账号</strong>
-            <p>打开统一身份页进入工作台，后续状态会自动保存。</p>
+            <p>优先使用邮箱或手机号，不把普通用户送去额外安全页。</p>
           </div>
           <div>
             <span>02</span>
@@ -2051,36 +2082,23 @@ function App() {
             <div className="auth-context-line">
               <ShieldCheck size={17} />
               <span>
-                {NEBULA_OAUTH_CONFIGURED
-                  ? "安全验证在统一身份页完成，通过后会自动回到这里。"
-                  : "统一身份服务正在维护，请联系运营支持。"}
+                {DIRECT_SKYBRIDGE_AUTH_ENABLED
+                  ? "默认使用邮箱或手机号登录；统一身份入口只作为企业账号备用。"
+                  : NEBULA_OAUTH_CONFIGURED
+                    ? "当前只配置了企业统一身份入口；如果安全验证失败，请联系运营开通邮箱/手机号入口。"
+                    : "账号服务正在维护，请联系运营支持。"}
               </span>
             </div>
 
-            {NEBULA_OAUTH_ENTRY_ENABLED && (
-              <section className="nebula-oauth-panel nebula-oauth-primary">
+            {DIRECT_SKYBRIDGE_AUTH_ENABLED && (
+              <section className="direct-auth-panel">
                 <div className="section-title compact-title">
-                  <ShieldCheck />
+                  {authMethod === "phone" ? <Smartphone /> : <Mail />}
                   <div>
-                    <h2>统一身份{authMode === "register" ? "注册" : "登录"}</h2>
-                    <p>账号验证、短信或人机校验都在身份服务里完成；通过后自动回到当前门户。</p>
+                    <h2>{authMode === "register" ? "创建账号" : "邮箱/手机号登录"}</h2>
+                    <p>不跳出当前门户。登录后继续开通服务、安装电脑助手并读取商品。</p>
                   </div>
                 </div>
-                <div className="oauth-actions">
-                  <button disabled={authBusy || !NEBULA_OAUTH_CONFIGURED} onClick={() => startNebulaOAuth(authMode)}>
-                    <ExternalLink size={18} /> {authMode === "register" ? "打开注册页" : "打开登录页"}
-                  </button>
-                </div>
-              </section>
-            )}
-
-            {!NEBULA_OAUTH_ENTRY_ENABLED && (
-              <p className="identity-note">统一身份入口暂不可用，请联系运营支持确认 Nebula 登录配置。</p>
-            )}
-
-            {DIRECT_SKYBRIDGE_AUTH_ENABLED && (
-              <details className="compat-panel">
-                <summary>兼容邮箱/手机号登录</summary>
                 <form className="form-grid skybridge-auth-grid auth-card-form" onSubmit={handleSkybridgePasswordSubmit}>
                   <div className="method-switch auth-methods" aria-label="账号登录方式">
                     <button className={authMethod === "email" ? "active" : ""} type="button" onClick={() => setAuthMethod("email")}>
@@ -2089,11 +2107,12 @@ function App() {
                     <button className={authMethod === "phone" ? "active" : ""} type="button" onClick={() => setAuthMethod("phone")}>
                       <Smartphone size={18} /> 手机号
                     </button>
+                    {authMode === "login" && (
+                      <button className={authMethod === "nebula" ? "active" : ""} type="button" onClick={() => setAuthMethod("nebula")}>
+                        <KeyRound size={18} /> 账号编号
+                      </button>
+                    )}
                   </div>
-
-                  {!SKYBRIDGE_AUTH_CONFIGURED && (
-                    <p className="identity-note">{directAuthUnavailableMessage}</p>
-                  )}
 
                   <label>
                     {identifierLabel(authMode, authMethod)}
@@ -2151,14 +2170,14 @@ function App() {
                   {authMethod === "phone" && (
                     <button
                       className="secondary"
-                      disabled={authBusy || skybridgeOtpBusy || directAuthNeedsTurnstile || !SKYBRIDGE_AUTH_CONFIGURED}
+                      disabled={authBusy || skybridgeOtpBusy || directAuthNeedsTurnstile}
                       type="button"
                       onClick={sendSkybridgePhoneCode}
                     >
                       <Smartphone size={18} /> 获取验证码
                     </button>
                   )}
-                  <button disabled={authBusy || directAuthNeedsTurnstile || !SKYBRIDGE_AUTH_CONFIGURED} type="submit">
+                  <button disabled={authBusy || directAuthNeedsTurnstile} type="submit">
                     {authMode === "register" ? <UserPlus size={18} /> : <LogIn size={18} />}
                     {authSubmitText}
                   </button>
@@ -2174,12 +2193,32 @@ function App() {
                 )}
 
                 {directAuthNeedsTurnstile && (
-                  <p className="identity-note">当前兼容登录需要先完成安全验证，验证通过后再提交。</p>
+                  <p className="identity-note">当前登录需要先完成安全验证，验证通过后再提交。</p>
                 )}
-                <div className="compat-title">
-                  <strong>生产建议</strong>
-                  <span>大陆用户优先使用上方统一身份入口。</span>
-                </div>
+              </section>
+            )}
+
+            {!DIRECT_SKYBRIDGE_AUTH_ENABLED && (
+              <p className="identity-note">{directAuthUnavailableMessage}</p>
+            )}
+
+            {NEBULA_OAUTH_ENTRY_ENABLED && (
+              <details className="compat-panel sso-panel">
+                <summary>企业统一身份入口</summary>
+                <section className="nebula-oauth-panel">
+                  <div className="section-title compact-title">
+                    <ShieldCheck />
+                    <div>
+                      <h2>统一身份{authMode === "register" ? "注册" : "登录"}</h2>
+                      <p>仅在企业账号或客服要求时使用；打开后会离开当前页面完成验证。</p>
+                    </div>
+                  </div>
+                  <div className="oauth-actions">
+                    <button disabled={authBusy || !NEBULA_OAUTH_CONFIGURED} onClick={() => startNebulaOAuth(authMode)}>
+                      <ExternalLink size={18} /> {authMode === "register" ? "打开统一注册页" : "打开统一登录页"}
+                    </button>
+                  </div>
+                </section>
               </details>
             )}
 
@@ -2189,7 +2228,7 @@ function App() {
                 <div>
                   <strong>这次登录还差安全验证</strong>
                   <p>
-                    账号服务要求先完成验证码或二次确认。请使用上方统一身份入口，完成验证后会回到当前工作台。
+                    账号服务要求先完成验证码或二次确认。请刷新后重试；如果仍失败，请联系运营处理账号风控。
                   </p>
                 </div>
               </div>
@@ -2671,7 +2710,7 @@ async function skybridgePasswordAuth(input: {
   captchaToken?: string;
 }): Promise<SkybridgeAuthSession> {
   if (!SKYBRIDGE_AUTH_CONFIGURED) {
-    throw new Error("兼容邮箱/手机号登录未配置");
+    throw new Error("邮箱/手机号登录未配置");
   }
   if (input.mode === "register" && input.method === "nebula") {
     throw new Error("账号编号由系统分配，注册请使用邮箱或手机号");
@@ -2716,7 +2755,7 @@ async function skybridgeSendPhoneOtp(input: {
   captchaToken?: string;
 }) {
   if (!SKYBRIDGE_AUTH_CONFIGURED) {
-    throw new Error("兼容邮箱/手机号登录未配置");
+    throw new Error("邮箱/手机号登录未配置");
   }
 
   const body: Record<string, unknown> = {
@@ -3012,6 +3051,9 @@ function isPlaceholderDisplayName(value: string | undefined) {
 }
 
 function loadTurnstileScript() {
+  if (!SKYBRIDGE_TURNSTILE_SCRIPT_URL) {
+    return Promise.reject(new Error("安全验证脚本未配置"));
+  }
   if (window.turnstile) {
     return Promise.resolve();
   }
@@ -3031,7 +3073,7 @@ function loadTurnstileScript() {
     script.dataset.ozonTurnstile = "true";
     script.async = true;
     script.defer = true;
-    script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+    script.src = SKYBRIDGE_TURNSTILE_SCRIPT_URL;
     script.onload = () => resolve();
     script.onerror = () => reject(new Error("Cloudflare Turnstile 脚本加载失败"));
     document.head.appendChild(script);
@@ -3175,7 +3217,7 @@ function isInvalidSessionError(error: unknown) {
 function skybridgeDirectAuthFailureMessage(error: unknown) {
   const message = errorMessage(error);
   if (isCaptchaProtectionMessage(message)) {
-    return "这次登录需要先完成安全验证。请刷新页面重试，或改用统一身份入口。";
+    return "这次登录需要先完成安全验证。请刷新页面重试；如果仍失败，请联系运营处理账号风控。";
   }
   return message;
 }

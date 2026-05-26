@@ -118,17 +118,22 @@ Production Nebula identity configuration for the portal/cloud bridge:
 ```bash
 VITE_CLOUD_API=https://api.ozon66.com
 OZON_SUITE_SKYBRIDGE_API_BASE_URL=https://<skybridge-project>.supabase.co/functions/v1
+VITE_SKYBRIDGE_SUPABASE_URL=https://<skybridge-project>.supabase.co
+VITE_SKYBRIDGE_SUPABASE_ANON_KEY=<supabase-anon-key>
 VITE_NEBULA_BASE_URL=https://nebula.skybridge.com
 VITE_NEBULA_CLIENT_ID=ozon_rust_suite_portal
 VITE_NEBULA_SCOPE="openid profile email offline_access"
-VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH=0
+VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH=1
 ```
 
-The preferred production path is Nebula OAuth/PKCE. Register the portal client in
-Nebula with an exact redirect URI matching the running portal, for example
-`http://127.0.0.1:5171/auth/callback` in local development. The portal enables
-this entry by default when `VITE_NEBULA_BASE_URL` and `VITE_NEBULA_CLIENT_ID` are
-set; use `VITE_ENABLE_NEBULA_OAUTH_ENTRY=0` only for emergency rollback.
+The primary portal login is email/phone through SkyBridge Auth when
+`VITE_SKYBRIDGE_SUPABASE_URL` and `VITE_SKYBRIDGE_SUPABASE_ANON_KEY` are set.
+Nebula OAuth/PKCE remains available as an explicit enterprise/SSO entry; register
+the portal client in Nebula with an exact redirect URI matching the running
+portal, for example `http://127.0.0.1:5171/auth/callback` in local development.
+The portal enables the SSO entry by default when `VITE_NEBULA_BASE_URL` and
+`VITE_NEBULA_CLIENT_ID` are set; use `VITE_ENABLE_NEBULA_OAUTH_ENTRY=0` only for
+emergency rollback.
 
 Human verification, SMS verification, MFA, and risk checks belong inside
 Nebula/SkyBridge and must be verified server-side before the authorization code
@@ -136,11 +141,13 @@ is issued. For China-facing traffic, use a mainland-accessible verification
 provider in that identity service instead of placing Cloudflare Turnstile on the
 portal's primary login path.
 
-Direct SkyBridge/Supabase password exchange is not available in production
-portal builds. It remains a local development compatibility path only; if that
-development path requires Turnstile, set `VITE_TURNSTILE_SITE_KEY` locally. Do
-not treat direct password exchange as the production login path for mainland
-users.
+Direct SkyBridge/Supabase password exchange is allowed in production only when
+the SkyBridge Auth URL and anon key are configured explicitly. If that path
+requires Turnstile, set both `VITE_TURNSTILE_SITE_KEY` and
+`VITE_TURNSTILE_SCRIPT_URL`; mainland builds leave both empty so no Cloudflare
+dependency is shipped. Do not treat SSO as an automatic fallback for mainland
+users; either configure the primary account path explicitly or fail with an
+actionable message.
 
 If `https://nebula.skybridge.com` presents a self-signed or otherwise untrusted
 certificate on a developer machine, do not disable browser certificate checks.
