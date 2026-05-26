@@ -1261,7 +1261,7 @@ function App() {
   }, [authDialogOpen]);
 
   return (
-    <main>
+    <main className={session ? "motion-stage motion-stage-console" : "motion-stage"}>
       <header className="site-nav">
         <a className="brand-mark" href="#top" aria-label="Ozon Rust Suite">
           <span className="brand-icon">
@@ -1310,7 +1310,7 @@ function App() {
 
       {!session && (
         <>
-      <section className="hero-section motion-hero" id="top">
+      <section className="hero-section motion-hero motion-stage-entry" id="top">
         <div className="hero-copy">
           <p className="eyebrow">Ozon Rust Suite</p>
           <h1>登录后，按步骤把店铺商品读出来。</h1>
@@ -1349,7 +1349,7 @@ function App() {
             <span>龙虾/Codex 出图</span>
           </div>
         </div>
-        <div className="hero-visual" aria-label="Ozon Rust Suite workflow preview">
+        <div className="hero-visual motion-card-flow" aria-label="Ozon Rust Suite workflow preview">
           <div className="visual-topbar">
             <span />
             <span />
@@ -1363,11 +1363,11 @@ function App() {
             </div>
             <div>
               <span>Step 2</span>
-              <strong>安装电脑助手</strong>
+              <strong>安装助手</strong>
             </div>
             <div>
               <span>Step 3</span>
-              <strong>连接这台电脑</strong>
+              <strong>连接电脑</strong>
             </div>
           </div>
           <div className="diff-preview">
@@ -1569,8 +1569,8 @@ function App() {
             <StatusLineIcon size={18} /> {statusMessage}
           </div>
 
-          <section className="operations setup-wizard" data-current-step={currentSetupStep}>
-            <div className={`setup-panel ${setupStatus.kind}`}>
+          <section className="operations setup-wizard motion-card-flow" data-current-step={currentSetupStep}>
+            <div className={`setup-panel ${setupStatus.kind} motion-current-step`}>
               <div>
                 <span>下一步</span>
                 <h2>{setupStatus.title}</h2>
@@ -2390,8 +2390,8 @@ function confirmedOrderMessage(order: Order) {
 }
 
 function wizardStepClass(done: boolean, current: boolean) {
-  if (done) return "wizard-step done";
-  if (current) return "wizard-step current";
+  if (done) return "wizard-step done motion-complete-flash";
+  if (current) return "wizard-step current motion-current-step";
   return "wizard-step";
 }
 
