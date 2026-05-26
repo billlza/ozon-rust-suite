@@ -37,20 +37,35 @@ button,
   min-height: 40px;
   padding: 0 14px;
   text-decoration: none;
+  transform: translateY(0);
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    color 180ms ease,
+    opacity 180ms ease,
+    transform 180ms ease;
 }
 
 button:hover,
 .download:hover {
   background: #19bd8a;
+  transform: translateY(-1px);
 }
 
 .download.secondary:hover {
   background: #eef3ee;
 }
 
+button:active,
+.download:active {
+  transform: translateY(0);
+}
+
 button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
+  transform: none;
 }
 
 button.secondary,
@@ -393,6 +408,35 @@ main {
   padding: clamp(52px, 8vw, 96px) clamp(20px, 5vw, 72px);
 }
 
+.motion-hero .hero-copy .eyebrow,
+.motion-hero .hero-copy h1,
+.motion-hero .hero-copy > p:not(.eyebrow),
+.motion-hero .hero-actions,
+.motion-hero .hero-meta,
+.motion-hero .hero-visual {
+  animation: portal-rise 540ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.motion-hero .hero-copy h1 {
+  animation-delay: 60ms;
+}
+
+.motion-hero .hero-copy > p:not(.eyebrow) {
+  animation-delay: 120ms;
+}
+
+.motion-hero .hero-actions {
+  animation-delay: 180ms;
+}
+
+.motion-hero .hero-meta {
+  animation-delay: 240ms;
+}
+
+.motion-hero .hero-visual {
+  animation-delay: 160ms;
+}
+
 .hero-copy {
   max-width: 760px;
 }
@@ -443,7 +487,35 @@ main {
   display: grid;
   gap: 18px;
   min-height: 390px;
+  overflow: hidden;
   padding: 18px;
+  position: relative;
+  transition:
+    border-color 240ms ease,
+    box-shadow 240ms ease,
+    transform 240ms ease;
+}
+
+.hero-visual::before {
+  background:
+    linear-gradient(90deg, transparent, rgba(143, 232, 201, 0.12), transparent),
+    repeating-linear-gradient(90deg, transparent 0 42px, rgba(255, 255, 255, 0.035) 42px 43px);
+  content: "";
+  inset: 0;
+  opacity: 0.55;
+  pointer-events: none;
+  position: absolute;
+  transform: translateX(-28%);
+}
+
+.hero-visual > * {
+  position: relative;
+}
+
+.hero-visual:hover {
+  border-color: rgba(143, 232, 201, 0.38);
+  box-shadow: 0 28px 82px rgba(10, 28, 20, 0.3);
+  transform: translateY(-2px);
 }
 
 .visual-topbar {
@@ -477,14 +549,38 @@ main {
   background: rgba(255, 255, 255, 0.07);
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 8px;
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    transform 180ms ease;
 }
 
 .visual-grid div {
+  animation: portal-rise 460ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
   display: grid;
   flex: 1;
   gap: 8px;
   min-height: 104px;
   padding: 14px;
+}
+
+.visual-grid div:nth-child(1) {
+  animation-delay: 280ms;
+}
+
+.visual-grid div:nth-child(2) {
+  animation-delay: 340ms;
+}
+
+.visual-grid div:nth-child(3) {
+  animation-delay: 400ms;
+}
+
+.visual-grid div:hover,
+.diff-preview:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(143, 232, 201, 0.22);
+  transform: translateY(-2px);
 }
 
 .visual-grid span,
@@ -503,6 +599,7 @@ main {
 
 .diff-preview {
   align-content: end;
+  animation: portal-rise 500ms cubic-bezier(0.2, 0.8, 0.2, 1) 460ms both;
   display: grid;
   gap: 9px;
   min-height: 190px;
@@ -525,6 +622,19 @@ main {
 .capability-band,
 .workflow-band {
   padding: 72px 0;
+}
+
+.motion-reveal {
+  opacity: 0.001;
+  transform: translateY(18px);
+  transition:
+    opacity 520ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    transform 520ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.motion-reveal.is-visible {
+  opacity: 1;
+  transform: none;
 }
 
 .band-title,
@@ -558,6 +668,38 @@ main {
   display: grid;
   gap: 12px;
   padding: 22px;
+  transform: translateY(0);
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    transform 180ms ease;
+}
+
+.capability-grid article:hover,
+.workflow-steps div:hover {
+  border-color: #b9d9cb;
+  box-shadow: 0 14px 34px rgba(16, 35, 27, 0.08);
+  transform: translateY(-2px);
+}
+
+.motion-reveal.is-visible .capability-grid article,
+.motion-reveal.is-visible .workflow-steps div {
+  animation: portal-rise 420ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.motion-reveal.is-visible .capability-grid article:nth-child(2),
+.motion-reveal.is-visible .workflow-steps div:nth-child(2) {
+  animation-delay: 70ms;
+}
+
+.motion-reveal.is-visible .capability-grid article:nth-child(3),
+.motion-reveal.is-visible .workflow-steps div:nth-child(3) {
+  animation-delay: 140ms;
+}
+
+.motion-reveal.is-visible .workflow-steps div:nth-child(4) {
+  animation-delay: 210ms;
 }
 
 .capability-grid svg {
@@ -647,6 +789,10 @@ h3 {
   z-index: 50;
 }
 
+.auth-backdrop.motion-enter {
+  animation: modal-fade 160ms ease-out both;
+}
+
 .auth-dialog {
   background: #fffffc;
   border: 1px solid #d2dad2;
@@ -660,6 +806,10 @@ h3 {
   padding: 30px;
   position: relative;
   width: min(100%, 460px);
+}
+
+.auth-dialog.motion-enter {
+  animation: dialog-enter 220ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }
 
 .dialog-heading {
@@ -1183,11 +1333,21 @@ input[readonly] {
   gap: 9px;
   min-height: 44px;
   padding: 10px 12px;
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    color 180ms ease,
+    transform 180ms ease;
 }
 
 .status-line[aria-busy="true"] {
   border-color: #92d8c0;
   color: #087a59;
+}
+
+.status-line.is-updated {
+  animation: status-update 460ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }
 
 .ok-line {
@@ -1230,6 +1390,11 @@ input[readonly] {
   gap: 14px;
   grid-template-columns: minmax(0, 1fr) auto;
   padding: 18px;
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    transform 180ms ease;
 }
 
 .setup-panel span {
@@ -1264,6 +1429,11 @@ input[readonly] {
   border-color: #8ed9bd;
 }
 
+.setup-panel:hover {
+  box-shadow: 0 14px 34px rgba(16, 35, 27, 0.06);
+  transform: translateY(-1px);
+}
+
 .setup-actions {
   display: flex;
   flex-wrap: wrap;
@@ -1288,7 +1458,34 @@ input[readonly] {
   display: grid;
   gap: 14px;
   grid-template-columns: 40px minmax(0, 1fr);
+  overflow: hidden;
   padding: 18px;
+  position: relative;
+  transform: translateY(0);
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    transform 180ms ease;
+}
+
+.wizard-step::before {
+  background: #0ca678;
+  bottom: 0;
+  content: "";
+  left: 0;
+  opacity: 0;
+  position: absolute;
+  top: 0;
+  transform: scaleY(0.25);
+  transform-origin: top;
+  width: 4px;
+}
+
+.wizard-step:hover {
+  border-color: #b9d9cb;
+  box-shadow: 0 12px 30px rgba(16, 35, 27, 0.06);
+  transform: translateY(-1px);
 }
 
 .wizard-step.current {
@@ -1296,9 +1493,19 @@ input[readonly] {
   box-shadow: 0 12px 34px rgba(8, 122, 89, 0.08);
 }
 
+.wizard-step.current::before {
+  animation: step-marker 1600ms ease-in-out infinite;
+  opacity: 1;
+}
+
 .wizard-step.done {
   background: #f2fbf6;
   border-color: #b9e4ce;
+}
+
+.wizard-step.done::before {
+  opacity: 1;
+  transform: scaleY(1);
 }
 
 .step-number {
@@ -1318,6 +1525,10 @@ input[readonly] {
 .wizard-step.done .step-number {
   background: #0ca678;
   color: #06241a;
+}
+
+.wizard-step.current .step-number {
+  animation: step-current 1800ms ease-in-out infinite;
 }
 
 .wizard-step h3 {
@@ -1367,6 +1578,16 @@ input[readonly] {
   gap: 14px;
   grid-template-columns: minmax(0, 1fr) auto;
   padding: 18px;
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    transform 180ms ease;
+}
+
+.handoff-card:hover {
+  box-shadow: 0 14px 34px rgba(16, 35, 27, 0.07);
+  transform: translateY(-1px);
 }
 
 .handoff-card.warn {
@@ -1420,6 +1641,21 @@ input[readonly] {
   display: flex;
   gap: 12px;
   list-style: none;
+}
+
+.support-section summary svg {
+  transition:
+    color 180ms ease,
+    transform 180ms ease;
+}
+
+.support-section[open] summary svg {
+  color: #087a59;
+  transform: rotate(4deg) scale(1.05);
+}
+
+.support-section[open] > :not(summary) {
+  animation: portal-rise 180ms ease-out both;
 }
 
 .support-section summary::-webkit-details-marker {
@@ -1624,6 +1860,72 @@ input[readonly] {
   white-space: nowrap;
 }
 
+@keyframes portal-rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes modal-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes dialog-enter {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes status-update {
+  0% {
+    box-shadow: 0 0 0 rgba(12, 166, 120, 0);
+    transform: translateY(0);
+  }
+  35% {
+    box-shadow: 0 12px 28px rgba(12, 166, 120, 0.14);
+    transform: translateY(-1px);
+  }
+  100% {
+    box-shadow: 0 0 0 rgba(12, 166, 120, 0);
+    transform: translateY(0);
+  }
+}
+
+@keyframes step-marker {
+  0%,
+  100% {
+    transform: scaleY(0.45);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+@keyframes step-current {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(12, 166, 120, 0.2);
+  }
+  50% {
+    box-shadow: 0 0 0 7px rgba(12, 166, 120, 0.08);
+  }
+}
+
 @media (max-width: 980px) {
   .site-nav,
   .hero-section,
@@ -1660,6 +1962,7 @@ input[readonly] {
 
   .hero-visual {
     min-height: 320px;
+    transform: none;
   }
 
   .capability-grid {
@@ -1743,5 +2046,36 @@ input[readonly] {
 
   .auth-dialog .auth-methods button svg {
     display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0ms !important;
+  }
+
+  .motion-reveal,
+  .motion-reveal.is-visible,
+  .motion-hero .hero-copy .eyebrow,
+  .motion-hero .hero-copy h1,
+  .motion-hero .hero-copy > p:not(.eyebrow),
+  .motion-hero .hero-actions,
+  .motion-hero .hero-meta,
+  .motion-hero .hero-visual,
+  .visual-grid div,
+  .diff-preview {
+    opacity: 1 !important;
+    transform: none !important;
+  }
+
+  .busy-line svg,
+  .wizard-step.current .step-number,
+  .wizard-step.current::before {
+    animation: none !important;
   }
 }

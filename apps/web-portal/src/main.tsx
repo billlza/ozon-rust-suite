@@ -368,8 +368,10 @@ function App() {
     requestId: 0
   });
   const [operationStatus, setOperationStatus] = useState<string | null>(null);
+  const [statusUpdated, setStatusUpdated] = useState(false);
   const authRequestId = useRef(0);
   const checkoutNoticeHandled = useRef(false);
+  const previousStatusMessage = useRef("");
 
   const [order, setOrder] = useState<Order | null>(null);
   const [paymentSession, setPaymentSession] = useState<PaymentSession | null>(null);
@@ -455,6 +457,45 @@ function App() {
   });
   const canStartWorkspace = computerHelperOnline && computerAuthorized && canOpenLocalConsole;
   const readyForWorkspace = computerHelperOnline && computerAuthorized;
+  const currentSetupStep = setupStepNumber({
+    activeEntitlement,
+    computerAuthorized,
+    computerHelperOnline,
+    storeCredentialsReady
+  });
+
+  useEffect(() => {
+    if (previousStatusMessage.current === statusMessage) return;
+    previousStatusMessage.current = statusMessage;
+    setStatusUpdated(false);
+    const frameId = window.requestAnimationFrame(() => setStatusUpdated(true));
+    const timeoutId = window.setTimeout(() => setStatusUpdated(false), 520);
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      window.clearTimeout(timeoutId);
+    };
+  }, [statusMessage]);
+
+  useEffect(() => {
+    const revealElements = Array.from(document.querySelectorAll<HTMLElement>("[data-reveal]"));
+    if (revealElements.length === 0) return;
+    if (!("IntersectionObserver" in window)) {
+      revealElements.forEach((element) => element.classList.add("is-visible"));
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (!entry.isIntersecting) return;
+          entry.target.classList.add("is-visible");
+          observer.unobserve(entry.target);
+        });
+      },
+      { rootMargin: "0px 0px -12% 0px", threshold: 0.14 }
+    );
+    revealElements.forEach((element) => observer.observe(element));
+    return () => observer.disconnect();
+  }, [session]);
 
   async function api<T>(path: string, init: RequestInit = {}, token = session?.token): Promise<T> {
     const response = await fetchWithTimeout(`${API_BASE}${path}`, {
@@ -1269,7 +1310,7 @@ function App() {
 
       {!session && (
         <>
-      <section className="hero-section" id="top">
+      <section className="hero-section motion-hero" id="top">
         <div className="hero-copy">
           <p className="eyebrow">Ozon Rust Suite</p>
           <h1>登录后，按步骤把店铺商品读出来。</h1>
@@ -1337,7 +1378,7 @@ function App() {
         </div>
       </section>
 
-      <section className="capability-band" id="capabilities">
+      <section className="capability-band motion-reveal" data-reveal id="capabilities">
         <div className="band-title">
           <p className="eyebrow">能做什么</p>
           <h2>把复杂的接入过程，变成一步一步的操作。</h2>
@@ -1361,7 +1402,7 @@ function App() {
         </div>
       </section>
 
-      <section className="workflow-band" id="workflow">
+      <section className="workflow-band motion-reveal" data-reveal id="workflow">
         <div className="workflow-copy">
           <p className="eyebrow">上手路径</p>
           <h2>登录、开通、安装、连接、开始用。</h2>
@@ -1518,11 +1559,17 @@ function App() {
             </details>
             )}
 
-          <div className={`status-line ${statusTone}-line ${authBusy ? "busy-line" : ""}`} aria-busy={authBusy}>
+          <div
+            className={`status-line ${statusTone}-line ${authBusy ? "busy-line" : ""} ${statusUpdated ? "is-updated" : ""}`}
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            aria-busy={authBusy}
+          >
             <StatusLineIcon size={18} /> {statusMessage}
           </div>
 
-          <section className="operations setup-wizard">
+          <section className="operations setup-wizard" data-current-step={currentSetupStep}>
             <div className={`setup-panel ${setupStatus.kind}`}>
               <div>
                 <span>下一步</span>
@@ -1579,7 +1626,10 @@ function App() {
             </div>
 
             <div className="wizard-steps" aria-label="接入步骤">
-              <article className={wizardStepClass(Boolean(activeEntitlement), !activeEntitlement)}>
+              <article
+                className={wizardStepClass(Boolean(activeEntitlement), currentSetupStep === 1)}
+                aria-current={currentSetupStep === 1 ? "step" : undefined}
+              >
                 <span className="step-number">1</span>
                 <div>
                   <h3>开通服务</h3>
@@ -1611,7 +1661,10 @@ function App() {
                 </div>
               </article>
 
-              <article className={wizardStepClass(computerHelperOnline, Boolean(activeEntitlement) && !computerHelperOnline)}>
+              <article
+                className={wizardStepClass(computerHelperOnline, currentSetupStep === 2)}
+                aria-current={currentSetupStep === 2 ? "step" : undefined}
+              >
                 <span className="step-number">2</span>
                 <div>
                   <h3>安装并打开电脑助手</h3>
@@ -1641,7 +1694,10 @@ function App() {
                 </div>
               </article>
 
-              <article className={wizardStepClass(computerAuthorized, Boolean(activeEntitlement) && computerHelperOnline && !computerAuthorized)}>
+              <article
+                className={wizardStepClass(computerAuthorized, currentSetupStep === 3)}
+                aria-current={currentSetupStep === 3 ? "step" : undefined}
+              >
                 <span className="step-number">3</span>
                 <div>
                   <h3>授权这台电脑</h3>
@@ -1666,7 +1722,10 @@ function App() {
                 </div>
               </article>
 
-              <article className={wizardStepClass(readyForWorkspace, readyForWorkspace)}>
+              <article
+                className={wizardStepClass(storeCredentialsReady, currentSetupStep === 4)}
+                aria-current={currentSetupStep === 4 ? "step" : undefined}
+              >
                 <span className="step-number">4</span>
                 <div>
                   <h3>{storeCredentialsReady ? "开始读取商品" : "连接 Ozon 店铺"}</h3>
@@ -1953,7 +2012,7 @@ function App() {
       )}
 
       {!session && (
-      <section className="pricing-band" id="pricing">
+      <section className="pricing-band motion-reveal" data-reveal id="pricing">
         <div>
           <p className="eyebrow">开始接入</p>
           <h2>进入工作台，按步骤完成 Ozon 商品读取。</h2>
@@ -1972,11 +2031,11 @@ function App() {
       )}
 
       {authDialogOpen && (
-        <div className="auth-backdrop" role="presentation" onMouseDown={() => setAuthDialogMode(null)}>
+        <div className="auth-backdrop motion-enter" role="presentation" onMouseDown={() => setAuthDialogMode(null)}>
           <section
             aria-labelledby="auth-dialog-title"
             aria-modal="true"
-            className="auth-dialog"
+            className="auth-dialog motion-enter"
             role="dialog"
             onMouseDown={(event) => event.stopPropagation()}
           >
@@ -2137,7 +2196,13 @@ function App() {
             )}
 
             {shouldShowAuthDialogStatus && (
-              <div className={`status-line ${authState.phase === "failed" ? "danger-line" : authBusy ? "busy-line" : ""}`} aria-busy={authBusy}>
+              <div
+                className={`status-line ${authState.phase === "failed" ? "danger-line" : authBusy ? "busy-line" : ""} ${statusUpdated ? "is-updated" : ""}`}
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+                aria-busy={authBusy}
+              >
                 {authState.phase === "failed" ? <AlertCircle size={18} /> : authBusy ? <RefreshCcw size={18} /> : <CheckCircle2 size={18} />}
                 {statusMessage}
               </div>
@@ -2328,6 +2393,19 @@ function wizardStepClass(done: boolean, current: boolean) {
   if (done) return "wizard-step done";
   if (current) return "wizard-step current";
   return "wizard-step";
+}
+
+function setupStepNumber(input: {
+  activeEntitlement: Entitlement | null;
+  computerHelperOnline: boolean;
+  computerAuthorized: boolean;
+  storeCredentialsReady: boolean;
+}) {
+  if (!input.activeEntitlement) return 1;
+  if (!input.computerHelperOnline) return 2;
+  if (!input.computerAuthorized) return 3;
+  if (!input.storeCredentialsReady) return 4;
+  return 0;
 }
 
 function orderStatusLabel(status: string) {
