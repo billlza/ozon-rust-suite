@@ -1,6 +1,6 @@
 {
   "framework": "vite",
-  "buildCommand": "pnpm build",
+  "buildCommand": "node scripts/validate-production-env.mjs && pnpm build",
   "outputDirectory": "dist",
   "rewrites": [
     {

@@ -1213,7 +1213,8 @@ function App() {
             "error-callback": (error) => {
               turnstileTokenRef.current = "";
               setTurnstileToken("");
-              setTurnstileStatus(error ? `安全验证失败：${error}` : "安全验证失败，请重试");
+              setTurnstileStatus(turnstileFailureMessage(error));
+              return true;
             }
           });
         } catch (error) {
@@ -3078,6 +3079,17 @@ function loadTurnstileScript() {
     script.onerror = () => reject(new Error("Cloudflare Turnstile 脚本加载失败"));
     document.head.appendChild(script);
   });
+}
+
+function turnstileFailureMessage(error: unknown) {
+  const code = String(error ?? "").trim();
+  if (code.startsWith("200500")) {
+    return "安全验证没有加载成功。请确认浏览器没有拦截验证服务。";
+  }
+  if (code.startsWith("300") || code.startsWith("600")) {
+    return "安全验证没有通过。请关闭代理或脚本拦截，换浏览器/网络后重试。";
+  }
+  return code ? `安全验证失败：${code}` : "安全验证失败，请刷新页面后重试";
 }
 
 function extractSkybridgeSession(value: unknown): SkybridgeAuthSession | null {
