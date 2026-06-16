@@ -17,9 +17,13 @@ services:
       - key: OZON_SUITE_ENV
         value: production
       - key: DATABASE_URL
-        fromDatabase:
-          name: ozon66-postgres
-          property: connectionString
+        # Managed in the Render dashboard. The original free `ozon66-postgres` database
+        # expired (free Postgres lasts 30 days); cloud-api now points at its replacement
+        # `ozon66-postgres-2`, set directly in the dashboard. `sync: false` keeps this
+        # value dashboard-authoritative so a Blueprint re-sync can't revert it to the
+        # deleted database. cloud-api runs `sqlx::migrate!` on startup, so a fresh empty
+        # database is provisioned automatically.
+        sync: false
       - key: OZON_SUITE_CORS_ALLOWED_ORIGINS
         value: https://ozon66.com,https://www.ozon66.com
       - key: OZON_SUITE_JWT_SECRET
