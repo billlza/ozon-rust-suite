@@ -32,7 +32,7 @@ services:
       OZON_SUITE_LOCAL_NODE_RELEASE_MANIFEST_URL: ${OZON_SUITE_LOCAL_NODE_RELEASE_MANIFEST_URL:?set-local-node-release-manifest-url}
       OZON_SUITE_OPENCLAW_PLUGIN_URL: ${OZON_SUITE_OPENCLAW_PLUGIN_URL:?set-openclaw-plugin-url}
       OZON_SUITE_OPENCLAW_MANIFEST_URL: ${OZON_SUITE_OPENCLAW_MANIFEST_URL:?set-openclaw-manifest-url}
-      OZON_SUITE_ALLOW_LOCAL_NEBULA_REGISTRATION: "false"
+      OZON_SUITE_ALLOW_LOCAL_NEBULA_REGISTRATION: "true"
     depends_on:
       postgres:
         condition: service_healthy

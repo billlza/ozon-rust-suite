@@ -35,7 +35,9 @@ services:
       - key: OZON_SUITE_OPENCLAW_MANIFEST_URL
         value: https://ozon66.com/openclaw/manifest.json
       - key: OZON_SUITE_ALLOW_LOCAL_NEBULA_REGISTRATION
-        value: "false"
+        # Enables customer self-registration via cloud-api email + password (/auth/register),
+        # the self-contained login that does not depend on the enterprise SSO identity provider.
+        value: "true"
       - key: OZON_SUITE_PAYMENT_PROVIDER
         value: manual
       - key: OZON_SUITE_STRIPE_SECRET_KEY

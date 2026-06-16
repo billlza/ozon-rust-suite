@@ -14,6 +14,10 @@ const buildEnv = {
   ...process.env
 };
 buildEnv.VITE_ENABLE_NEBULA_OAUTH_ENTRY = buildEnv.VITE_ENABLE_NEBULA_OAUTH_ENTRY || "1";
+// Email + password login backed by cloud-api (/auth/login, /auth/register). Self-contained,
+// so customers can sign in even when the enterprise SSO identity provider is down. Requires
+// OZON_SUITE_ALLOW_LOCAL_NEBULA_REGISTRATION=true on cloud-api for new-account registration.
+buildEnv.VITE_ENABLE_LOCAL_PASSWORD_AUTH = buildEnv.VITE_ENABLE_LOCAL_PASSWORD_AUTH || "1";
 buildEnv.VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH = "0";
 buildEnv.VITE_ENABLE_SKYBRIDGE_PHONE_AUTH = "0";
 buildEnv.VITE_SKYBRIDGE_PHONE_SMS_PROVIDER_READY = "0";

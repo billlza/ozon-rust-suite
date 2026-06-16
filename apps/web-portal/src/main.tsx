@@ -46,6 +46,12 @@ const DEFAULT_NEBULA_SCOPE = "openid profile email offline_access";
 const DEFAULT_SKYBRIDGE_SUPABASE_URL = "https://hloqytmhjludmuhwyyzb.supabase.co";
 const LOCAL_DEV_AUTH_ENABLED =
   import.meta.env.DEV || ["1", "true", "yes"].includes((import.meta.env.VITE_ENABLE_LOCAL_DEV_AUTH ?? "").toLowerCase());
+// Customer-facing email + password login backed directly by cloud-api (/auth/login,
+// /auth/register). Works without Supabase or the enterprise SSO identity provider, so it
+// stays available even when those are unconfigured or down.
+const LOCAL_PASSWORD_AUTH_ENABLED =
+  LOCAL_DEV_AUTH_ENABLED ||
+  ["1", "true", "yes"].includes((import.meta.env.VITE_ENABLE_LOCAL_PASSWORD_AUTH ?? "").toLowerCase());
 const SKYBRIDGE_AUTH_BASE = normalizeBaseUrl(
   import.meta.env.VITE_SKYBRIDGE_SUPABASE_URL ??
     import.meta.env.VITE_SUPABASE_URL ??
@@ -893,10 +899,10 @@ function App() {
     await refreshAccount(nextSession.token, requestId);
   }
 
-  async function authenticateLocalDev() {
+  async function authenticateLocalDev(methodOverride?: LoginMethod) {
     const requestId = beginAuth("authenticating_local_dev", portalCopy.messages.authenticatingLocalDev);
     const path = localMode === "register" ? "/auth/register" : "/auth/login";
-    const body = buildLocalAuthBody(localMode, localMethod, localIdentifier, localPassword, localName);
+    const body = buildLocalAuthBody(localMode, methodOverride ?? localMethod, localIdentifier, localPassword, localName);
     try {
       const data = await api<{ token: string; user: User }>(path, {
         method: "POST",
@@ -920,6 +926,11 @@ function App() {
         });
       }
     }
+  }
+
+  function handlePasswordAuthSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    void authenticateLocalDev("email");
   }
 
   async function refreshAccount(token = session?.token, requestId?: number) {
@@ -1616,7 +1627,7 @@ function App() {
                     type="password"
                   />
                 </label>
-                <button disabled={authBusy} onClick={authenticateLocalDev}>
+                <button disabled={authBusy} onClick={() => authenticateLocalDev()}>
                   {localMode === "register" ? <UserPlus size={18} /> : <LogIn size={18} />}
                   {localMode === "register" ? portalCopy.console.localDev.createLocalDev : portalCopy.console.localDev.loginLocalDev}
                 </button>
@@ -2127,9 +2138,11 @@ function App() {
               <span>
                 {DIRECT_SKYBRIDGE_AUTH_ENABLED
                   ? directAuthContext
-                  : NEBULA_OAUTH_CONFIGURED
-                    ? portalCopy.auth.contextSsoOnly
-                    : portalCopy.auth.contextMaintenance}
+                  : LOCAL_PASSWORD_AUTH_ENABLED
+                    ? portalCopy.auth.contextPasswordOrSso
+                    : NEBULA_OAUTH_CONFIGURED
+                      ? portalCopy.auth.contextSsoOnly
+                      : portalCopy.auth.contextMaintenance}
               </span>
             </div>
 
@@ -2244,7 +2257,63 @@ function App() {
               </section>
             )}
 
-            {!DIRECT_SKYBRIDGE_AUTH_ENABLED && (
+            {!DIRECT_SKYBRIDGE_AUTH_ENABLED && LOCAL_PASSWORD_AUTH_ENABLED && (
+              <section className="direct-auth-panel">
+                <div className="section-title compact-title">
+                  <Mail />
+                  <div>
+                    <h2>{portalCopy.auth.passwordTitle}</h2>
+                    <p>{portalCopy.auth.passwordText}</p>
+                  </div>
+                </div>
+                <form className="form-grid auth-card-form" onSubmit={handlePasswordAuthSubmit}>
+                  <div className="method-switch auth-methods" aria-label={portalCopy.auth.methodsAria}>
+                    <button className={localMode === "login" ? "active" : ""} type="button" onClick={() => setLocalMode("login")}>
+                      <LogIn size={18} /> {portalCopy.auth.passwordLogin}
+                    </button>
+                    <button className={localMode === "register" ? "active" : ""} type="button" onClick={() => setLocalMode("register")}>
+                      <UserPlus size={18} /> {portalCopy.auth.passwordRegister}
+                    </button>
+                  </div>
+                  <label>
+                    {portalCopy.auth.email}
+                    <input
+                      autoComplete="email"
+                      placeholder={portalCopy.auth.emailPlaceholder}
+                      value={localIdentifier}
+                      onChange={(event) => setLocalIdentifier(event.target.value)}
+                    />
+                  </label>
+                  {localMode === "register" && (
+                    <label>
+                      {portalCopy.auth.name}
+                      <input
+                        autoComplete="name"
+                        placeholder={portalCopy.auth.namePlaceholder}
+                        value={localName}
+                        onChange={(event) => setLocalName(event.target.value)}
+                      />
+                    </label>
+                  )}
+                  <label>
+                    {portalCopy.auth.password}
+                    <input
+                      autoComplete={localMode === "register" ? "new-password" : "current-password"}
+                      placeholder={portalCopy.auth.passwordPlaceholder}
+                      value={localPassword}
+                      onChange={(event) => setLocalPassword(event.target.value)}
+                      type="password"
+                    />
+                  </label>
+                  <button disabled={authBusy} type="submit">
+                    {localMode === "register" ? <UserPlus size={18} /> : <LogIn size={18} />}
+                    {localMode === "register" ? portalCopy.auth.passwordSubmitRegister : portalCopy.auth.passwordSubmitLogin}
+                  </button>
+                </form>
+              </section>
+            )}
+
+            {!DIRECT_SKYBRIDGE_AUTH_ENABLED && !LOCAL_PASSWORD_AUTH_ENABLED && (
               <p className="identity-note">{directAuthUnavailableMessage}</p>
             )}
 
