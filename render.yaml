@@ -73,7 +73,9 @@ services:
       - key: OZON_SUITE_WECHAT_STANDARD_30D_AMOUNT_MINOR
         value: "4000"
       - key: OZON_SUITE_TEST_FULL_ACCESS_IDENTITIES
-        value: 2403871950@qq.com,nebula-2026-16drj8pqaqhs
+        # Managed in the Render dashboard, never committed. Leave unset to disable the
+        # test-full-access grant entirely. (H1: removed hardcoded identity from VCS.)
+        sync: false
       - key: OZON_SUITE_TEST_FULL_ACCESS_DURATION_DAYS
         value: "365"
       - key: OZON_SUITE_TEST_FULL_ACCESS_MAX_DEVICES

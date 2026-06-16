@@ -9,6 +9,44 @@ operator approval. For poster generation, the preferred path is account-based:
 OpenClaw/Codex uses its signed-in image capability while the local node supplies
 only Ozon facts, image URLs, and safety instructions.
 
+## Automatic Pairing
+
+The desktop UI should use automatic pairing instead of asking the user to copy
+the bridge token by hand.
+
+1. The local UI calls `POST /openclaw/pairing/start` with `x-local-token`.
+2. The local node creates a five-minute one-time pairing code and opens the
+   configured Longxia/OpenClaw bind URL with the code in the URL fragment.
+3. Longxia/OpenClaw reads the fragment and calls `POST /openclaw/pairing/claim`
+   from an allowed origin, for example `https://ozonclaw.jl696.cn`.
+4. The claim response returns the manifest URL and limited
+   `x-openclaw-token`. The code is consumed immediately and cannot be replayed.
+
+Example claim request:
+
+```json
+{
+  "code": "one-time-code-from-url-fragment"
+}
+```
+
+Example claim response:
+
+```json
+{
+  "status": "paired",
+  "manifest_url": "http://127.0.0.1:8790/openclaw/manifest",
+  "base_url": "http://127.0.0.1:8790",
+  "auth_header": "x-openclaw-token",
+  "auth_token": "limited-bridge-token",
+  "auth_token_fingerprint": "12-char-fingerprint"
+}
+```
+
+The long-lived bridge token must never be placed in query parameters, URL
+fragments, chat prompts, logs, or public documents. Only the short-lived pairing
+code is allowed in the bind URL.
+
 ## Tools
 
 | Tool | Method | Path | Purpose | Approval |

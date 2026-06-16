@@ -3,6 +3,9 @@
   color: #17201b;
   font-family:
     Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --details-collapse-label: "";
+  --details-expand-label: "";
+  --poster-art-title: "";
 }
 
 * {
@@ -102,6 +105,14 @@ button.quiet {
   position: sticky;
   top: 0;
   z-index: 20;
+}
+
+.guide-top-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
 }
 
 .guide-return {
@@ -446,6 +457,37 @@ main.motion-stage > *:not(.auth-backdrop) {
 .nav-actions {
   gap: 10px;
   justify-content: flex-end;
+}
+
+.language-switch {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.62);
+  border: 1px solid rgba(201, 216, 209, 0.86);
+  border-radius: 8px;
+  display: inline-flex;
+  gap: 2px;
+  min-height: 38px;
+  padding: 3px;
+}
+
+.language-switch button {
+  background: transparent;
+  border-radius: 6px;
+  color: #53645b;
+  font-size: 12px;
+  font-weight: 950;
+  min-height: 30px;
+  padding: 0 9px;
+}
+
+.language-switch button:hover {
+  background: rgba(12, 166, 120, 0.1);
+  transform: none;
+}
+
+.language-switch button.active {
+  background: #10231b;
+  color: #8fe8c9;
 }
 
 .hero-section {
@@ -808,6 +850,27 @@ main.motion-stage:not(.motion-stage-console) .download.secondary:hover {
   background: rgba(255, 255, 255, 0.14);
 }
 
+main.motion-stage:not(.motion-stage-console) .language-switch {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+main.motion-stage:not(.motion-stage-console) .language-switch button {
+  color: #f7fff9;
+  opacity: 0.72;
+}
+
+main.motion-stage:not(.motion-stage-console) .language-switch button:hover {
+  background: rgba(255, 255, 255, 0.14);
+  opacity: 1;
+}
+
+main.motion-stage:not(.motion-stage-console) .language-switch button.active {
+  background: #8fe8c9;
+  color: #10231b;
+  opacity: 1;
+}
+
 main.motion-stage:not(.motion-stage-console) .hero-section {
   align-items: center;
   gap: clamp(32px, 6vw, 88px);
@@ -1089,7 +1152,7 @@ main.motion-stage:not(.motion-stage-console) .hero-visual::after {
 
 .poster-art::before {
   color: #f7cf73;
-  content: "时尚车系打火机";
+  content: var(--poster-art-title);
   font-size: 26px;
   font-weight: 950;
   left: 18px;
@@ -1681,6 +1744,13 @@ h2 {
   color: #10231b;
 }
 
+.method-switch button:disabled,
+.method-switch button:disabled:hover {
+  background: transparent;
+  color: #7c857f;
+  transform: none;
+}
+
 .form-grid {
   display: grid;
   gap: 14px;
@@ -1926,13 +1996,13 @@ h2 {
 .compat-panel summary::after,
 .local-dev-panel summary::after {
   color: #64726b;
-  content: "展开";
+  content: var(--details-expand-label);
   float: right;
 }
 
 .compat-panel[open] summary::after,
 .local-dev-panel[open] summary::after {
-  content: "收起";
+  content: var(--details-collapse-label);
 }
 
 .compat-panel .compat-title,

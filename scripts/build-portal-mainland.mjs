@@ -15,6 +15,9 @@ const buildEnv = {
 };
 buildEnv.VITE_ENABLE_NEBULA_OAUTH_ENTRY = buildEnv.VITE_ENABLE_NEBULA_OAUTH_ENTRY || "1";
 buildEnv.VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH = "0";
+buildEnv.VITE_ENABLE_SKYBRIDGE_PHONE_AUTH = "0";
+buildEnv.VITE_SKYBRIDGE_PHONE_SMS_PROVIDER_READY = "0";
+buildEnv.VITE_ALLOW_LEGACY_SKYBRIDGE_ANON_KEY = "";
 buildEnv.VITE_TURNSTILE_SITE_KEY = "";
 buildEnv.VITE_TURNSTILE_SCRIPT_URL = "";
 
@@ -24,7 +27,9 @@ requireNonEmpty(buildEnv, "VITE_NEBULA_CLIENT_ID");
 requireUrl(buildEnv, "VITE_CLOUD_API");
 requireUrl(buildEnv, "VITE_NEBULA_BASE_URL");
 rejectNonEmpty(buildEnv, "VITE_SKYBRIDGE_SUPABASE_URL");
+rejectNonEmpty(buildEnv, "VITE_SKYBRIDGE_SUPABASE_PUBLISHABLE_KEY");
 rejectNonEmpty(buildEnv, "VITE_SKYBRIDGE_SUPABASE_ANON_KEY");
+rejectNonEmpty(buildEnv, "VITE_ALLOW_LEGACY_SKYBRIDGE_ANON_KEY");
 rejectNonEmpty(buildEnv, "VITE_TURNSTILE_SITE_KEY");
 rejectNonEmpty(buildEnv, "VITE_TURNSTILE_SCRIPT_URL");
 
@@ -116,6 +121,10 @@ function verifyBundle(distDir) {
     "images.unsplash.com",
     "unsplash.com",
     "VITE_SKYBRIDGE_SUPABASE",
+    "VITE_ALLOW_LEGACY_SKYBRIDGE_ANON_KEY",
+    "VITE_ENABLE_SKYBRIDGE_PHONE_AUTH",
+    "VITE_SKYBRIDGE_PHONE_SMS_PROVIDER_READY",
+    "auth/v1/otp",
     "VITE_TURNSTILE_SITE_KEY",
     "兼容邮箱/手机号登录"
   ];

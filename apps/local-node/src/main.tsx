@@ -20,18 +20,17 @@ import {
   Workflow,
   XCircle
 } from "lucide-react";
+import { copyFor, initialLocale, localeOptions, type Locale } from "./i18n";
 import "./styles.css";
 
 const DEFAULT_LOCAL_API = import.meta.env.VITE_LOCAL_SKILL_API ?? "http://127.0.0.1:8790";
 const DEFAULT_AGENT_API = import.meta.env.VITE_LOCAL_AGENT_API ?? "http://127.0.0.1:17870";
 const DEFAULT_LOCAL_TOKEN = import.meta.env.VITE_LOCAL_TOKEN ?? "dev-local-token";
-const DEFAULT_OPENCLAW_TOKEN = import.meta.env.VITE_OPENCLAW_TOKEN ?? "dev-openclaw-token";
 
 type RuntimeConfig = {
   skill_api: string;
   agent_api: string;
   local_token: string;
-  openclaw_token: string;
   connector_mode: "mock" | "real" | string;
   sidecar_pid: number | null;
   sidecar_status: "starting" | "running" | "restarting" | "stopped" | "failed" | string;
@@ -226,6 +225,17 @@ type Manifest = {
   safety_rules: string[];
 };
 
+type OpenClawPairingStart = {
+  status: string;
+  bind_url: string;
+  pairing_code: string;
+  claim_url: string;
+  manifest_url: string;
+  auth_header: string;
+  expires_at: string;
+  instructions: string[];
+};
+
 type ConfigStatus = {
   service: string;
   checked_at: string;
@@ -309,6 +319,8 @@ type ScheduleStatus = {
 };
 
 function App() {
+  const [locale, setLocale] = useState<Locale>(() => initialLocale());
+  const c = copyFor(locale);
   const [runtime, setRuntime] = useState<RuntimeConfig>(() => defaultRuntimeConfig());
   const [runtimeReady, setRuntimeReady] = useState(false);
   const [health, setHealth] = useState<Health | null>(null);
@@ -338,7 +350,7 @@ function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [selectedOperation, setSelectedOperation] = useState("ozon_update_price_mock");
   const [eventState, setEventState] = useState("connecting");
-  const [message, setMessage] = useState("本地节点尚未连接");
+  const [message, setMessage] = useState(() => copyFor(initialLocale()).messages.initial);
   const [validation, setValidation] = useState<ValidationResult | null>(null);
   const [schedule, setSchedule] = useState<ScheduleStatus | null>(null);
   const [scheduleInterval, setScheduleInterval] = useState(900);
@@ -349,19 +361,44 @@ function App() {
   const leaseReady = !realModeRequiresLease || configStatus?.lease.valid === true;
   const canUseOzonReadTools = Boolean(configStatus && ozonConfigReady && leaseReady);
   const canGeneratePosterBackground = canUseOzonReadTools && openAiConfigReady && !imageGenerationIssue;
+  const localServiceReady = Boolean(health && isConnectedRuntime(runtime));
+  const openClawBridgeReady = localServiceReady && Boolean(manifest?.tools?.length);
+  const setupSteps = [
+    {
+      number: "1",
+      title: c.setup.steps.saveOzon.title,
+      status: canUseOzonReadTools ? c.setup.steps.saveOzon.done : ozonConfigReady ? c.setup.steps.saveOzon.needLease : c.setup.steps.saveOzon.pending,
+      detail: c.setup.steps.saveOzon.detail,
+      state: canUseOzonReadTools ? "done" : "active"
+    },
+    {
+      number: "2",
+      title: c.setup.steps.connectOpenClaw.title,
+      status: openClawBridgeReady ? c.setup.steps.connectOpenClaw.ready : c.setup.steps.connectOpenClaw.waiting,
+      detail: c.setup.steps.connectOpenClaw.detail,
+      state: canUseOzonReadTools && openClawBridgeReady ? "active" : openClawBridgeReady ? "ready" : "wait"
+    },
+    {
+      number: "3",
+      title: c.setup.steps.readProducts.title,
+      status: productDetail ? c.setup.steps.readProducts.selected : canUseOzonReadTools ? c.setup.steps.readProducts.ready : c.setup.steps.readProducts.waiting,
+      detail: c.setup.steps.readProducts.detail,
+      state: productDetail ? "done" : canUseOzonReadTools ? "ready" : "wait"
+    }
+  ];
   const ozonReadGateMessage = !configStatus
-    ? "先连接本机节点并刷新状态"
+    ? c.gates.connectLocalFirst
     : !configStatus.secret_store.available
-      ? "电脑助手暂时不能保存密钥，请重启电脑助手后再试"
+      ? c.gates.secretStoreUnavailable
       : !ozonConfigReady
         ? userFacingError(configStatus.ozon.issue ?? "Ozon credentials are not configured")
         : realModeRequiresLease && !configStatus.lease.valid
-          ? "真实 Ozon 读取需要从 ozon66.com 写入有效授权租约"
+          ? c.gates.needsLease
           : "";
   const posterGenerationGateMessage = !canUseOzonReadTools
     ? ozonReadGateMessage
     : !openAiConfigReady
-      ? "未配置图片 API 时，先用“复制给龙虾/Codex”生成；API 只用于后台自动出图。"
+      ? c.gates.useOpenClawWithoutImageApi
       : imageGenerationIssue
         ? imageGenerationIssue
         : "";
@@ -372,6 +409,11 @@ function App() {
     const done = tasks.filter((task) => task.state === "succeeded").length;
     return { pending, queued, done };
   }, [tasks]);
+
+  useEffect(() => {
+    window.localStorage.setItem("ozon-local-locale", locale);
+    document.documentElement.lang = locale;
+  }, [locale]);
 
   async function api(path: string, init: RequestInit = {}) {
     return fetch(`${runtime.skill_api}${path}`, {
@@ -388,38 +430,35 @@ function App() {
     if (canUseOzonReadTools) {
       return true;
     }
-    setMessage(`${action}被拦截：${ozonReadGateMessage}`);
+    setMessage(c.gates.blocked(action, ozonReadGateMessage));
     return false;
   }
 
   function userFacingError(error: string | undefined) {
-    const raw = error?.trim() || "未知错误";
+    const raw = error?.trim() || c.messages.unknownError;
     if (raw.includes("Ozon credentials are not configured")) {
-      return "先在“本地密钥”里保存 Ozon Client ID 和 API Key，并完成校验。";
+      return c.errors.credentialsMissing;
     }
     if (raw.includes("OZON_CLIENT_ID/OZON_API_KEY environment credentials are incomplete")) {
-      return "Ozon 启动环境里的 Client ID / API Key 不完整，请改为在界面里保存完整凭据。";
+      return c.errors.envCredentialsIncomplete;
     }
-    if (raw.includes("ozon connector failed") || raw.includes("Ozon 凭据校验失败")) {
-      return raw
-        .replace(/^ozon connector failed:\s*/i, "")
-        .replace(/^Ozon 凭据校验失败：/i, "Ozon 凭据校验失败：");
+    if (raw.includes("ozon connector failed")) {
+      return raw.replace(/^ozon connector failed:\s*/i, "");
     }
     if (raw.includes("cloud lease is not installed")) {
-      return "这台电脑还没完成授权。请先回 ozon66.com 授权这台电脑。";
+      return c.errors.cloudLeaseMissing;
     }
     if (raw.includes("lease public key") || raw.includes("stored cloud lease is invalid")) {
-      return "电脑授权记录无效。请安装最新版电脑助手，然后回 ozon66.com 重新完成电脑授权。";
+      return c.errors.cloudLeaseInvalid;
     }
     if (
       raw.includes("No available channel for model") ||
-      raw.includes("没有开通这个图片模型") ||
       raw.includes("image model is not available")
     ) {
-      return "当前图片 API 没有这个模型通道。可以先用“复制给龙虾/Codex”出图，或换一个支持 gpt-image-1 / gpt-image-2 的 API Key。";
+      return c.errors.imageModelUnavailable;
     }
     if (raw.includes("OpenAI API key is required")) {
-      return "第一次保存图片 API 配置需要填写 API Key；保存过以后，只改地址或模型可以留空。";
+      return c.errors.openAiKeyRequired;
     }
     return raw;
   }
@@ -440,7 +479,7 @@ function App() {
     }
   }
 
-  async function checkHealth() {
+  async function checkHealth(): Promise<ConfigStatus | null> {
     try {
       const [healthResponse, manifestResponse, configResponse] = await Promise.all([
         fetch(`${runtime.skill_api}/health`),
@@ -449,48 +488,55 @@ function App() {
       ]);
       setHealth(healthResponse.ok ? await healthResponse.json() : null);
       setManifest(manifestResponse.ok ? await manifestResponse.json() : null);
+      let nextConfig: ConfigStatus | null = null;
       if (configResponse.ok) {
-        const nextConfig: ConfigStatus = await configResponse.json();
+        nextConfig = await configResponse.json();
         setConfigStatus(nextConfig);
-        setOpenAiBaseUrl(nextConfig.openai.base_url);
-        setOpenAiImageModel(nextConfig.openai.image_model);
+        setOpenAiBaseUrl(nextConfig!.openai.base_url);
+        setOpenAiImageModel(nextConfig!.openai.image_model);
       } else {
         setConfigStatus(null);
       }
-      setMessage(healthResponse.ok ? "本地服务已连接" : "本地服务未就绪");
+      setMessage(healthResponse.ok ? c.messages.localServiceConnected : c.messages.localServiceNotReady);
+      return nextConfig;
     } catch {
       setHealth(null);
       setConfigStatus(null);
-      setMessage("无法连接 127.0.0.1:8790");
+      setMessage(c.messages.localServiceUnreachable);
+      return null;
     }
   }
 
   async function saveConfig() {
     if (!clientId.trim() || !apiKey.trim()) {
-      setMessage("请填写真实的 Ozon Client ID 和 API Key");
+      setMessage(c.messages.fillOzonCredentials);
       return;
     }
-    const response = await api("/config/ozon", {
-      method: "POST",
-      body: JSON.stringify({ client_id: clientId.trim(), api_key: apiKey.trim() })
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      setMessage(`保存失败：${userFacingError(data.error)}`);
-      return;
-    }
-    setApiKey("");
-    await checkHealth();
+    try {
+      const response = await api("/config/ozon", {
+        method: "POST",
+        body: JSON.stringify({ client_id: clientId.trim(), api_key: apiKey.trim() })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage(c.messages.saveFailed(userFacingError(data.error)));
+        return;
+      }
+      setApiKey("");
+      const refreshedConfig = await checkHealth();
 
-    const validationResponse = await api("/config/ozon/validate", { method: "POST" });
-    const validationData = await validationResponse.json();
-    if (!validationResponse.ok) {
-      setValidation(null);
-      setMessage(`Ozon 凭据已保存，但校验没通过：${userFacingError(validationData.error)}`);
-      return;
+      const validationResponse = await api("/config/ozon/validate", { method: "POST" });
+      const validationData = await validationResponse.json();
+      if (!validationResponse.ok) {
+        setValidation(null);
+        setMessage(c.messages.ozonSavedValidationFailed(userFacingError(validationData.error)));
+        return;
+      }
+      setValidation(validationData);
+      setMessage(c.messages.ozonSavedValidated(data.client_id, refreshedConfig?.ozon.api_key_fingerprint ?? c.advanced.notSaved));
+    } catch {
+      setMessage(c.messages.saveFailed(c.messages.localServiceUnreachable));
     }
-    setValidation(validationData);
-    setMessage(`Ozon 凭据已保存并校验通过：${data.client_id} / ${data.api_key}`);
   }
 
   async function saveOpenAiConfig() {
@@ -500,102 +546,120 @@ function App() {
     if (keyIsBlank && !canReuseStoredOpenAiKey) {
       setMessage(
         configStatus?.openai.source === "env"
-          ? "当前 Key 来自启动环境变量。要在界面里修改地址或模型，请重新填写一次 API Key 后保存。"
-          : "第一次保存图片 API 配置需要填写 API Key；以后只改地址或模型可以留空。"
+          ? c.messages.envOpenAiKeyMustBeReentered
+          : c.messages.firstOpenAiKeyRequired
       );
       return;
     }
-    const response = await api("/config/openai", {
-      method: "POST",
-      body: JSON.stringify({
-        api_key: openAiApiKey.trim(),
-        base_url: openAiBaseUrl.trim(),
-        image_model: openAiImageModel.trim()
-      })
-    });
-    const data = await response.json();
-    setMessage(
-      response.ok
-        ? `图片 API 已保存：${data.base_url} / ${data.image_model} / ${data.api_key_fingerprint}`
-        : `图片 API 保存失败：${userFacingError(data.error)}`
-    );
-    if (response.ok) {
-      setOpenAiApiKey("");
-      setImageGenerationIssue(null);
-      await checkHealth();
+    try {
+      const response = await api("/config/openai", {
+        method: "POST",
+        body: JSON.stringify({
+          api_key: openAiApiKey.trim(),
+          base_url: openAiBaseUrl.trim(),
+          image_model: openAiImageModel.trim()
+        })
+      });
+      const data = await response.json();
+      setMessage(
+        response.ok
+          ? c.messages.imageApiSaved(data.base_url, data.image_model, data.api_key_fingerprint)
+          : c.messages.imageApiSaveFailed(userFacingError(data.error))
+      );
+      if (response.ok) {
+        setOpenAiApiKey("");
+        setImageGenerationIssue(null);
+        await checkHealth();
+      }
+    } catch {
+      setMessage(c.messages.imageApiSaveFailed(c.messages.localServiceUnreachable));
     }
   }
 
   async function validateConfig() {
-    const response = await api("/config/ozon/validate", { method: "POST" });
-    const data = await response.json();
-    if (!response.ok) {
+    try {
+      const response = await api("/config/ozon/validate", { method: "POST" });
+      const data = await response.json();
+      if (!response.ok) {
+        setValidation(null);
+        setMessage(c.messages.ozonValidationFailed(userFacingError(data.error)));
+        return;
+      }
+      setValidation(data);
+      setMessage(validationMessage(data, c));
+      await checkHealth();
+    } catch {
       setValidation(null);
-      setMessage(`Ozon 凭据校验失败：${userFacingError(data.error)}`);
-      return;
+      setMessage(c.messages.ozonValidationFailed(c.messages.localServiceUnreachable));
     }
-    setValidation(data);
-    setMessage(data.message);
-    await checkHealth();
   }
 
   async function loadProducts() {
-    if (!ensureOzonReadAccess("读取 Ozon 商品")) return;
-    const [countResponse, listResponse] = await Promise.all([
-      api("/tools/ozon.products.count", { method: "POST" }),
-      api("/tools/ozon.products.list", {
-        method: "POST",
-        body: JSON.stringify({ limit: 3 })
-      })
-    ]);
-    const countData = await countResponse.json();
-    const listData = await listResponse.json();
-    if (!countResponse.ok || !listResponse.ok) {
-      setMessage(`Ozon 读取失败：${userFacingError(countData.error ?? listData.error)}`);
-      return;
+    if (!ensureOzonReadAccess(c.actions.readProducts)) return;
+    try {
+      const [countResponse, listResponse] = await Promise.all([
+        api("/tools/ozon.products.count", { method: "POST" }),
+        api("/tools/ozon.products.list", {
+          method: "POST",
+          body: JSON.stringify({ limit: 3 })
+        })
+      ]);
+      const countData = await countResponse.json();
+      const listData = await listResponse.json();
+      if (!countResponse.ok || !listResponse.ok) {
+        setMessage(c.messages.ozonReadFailed(userFacingError(countData.error ?? listData.error)));
+        return;
+      }
+      const count = countData as ProductCountResult;
+      const list = listData as ProductListResult;
+      setProductCount(count.count);
+      setProducts(list.products);
+      setProductListMeta(list);
+      if (list.archived_fallback || count.archived_fallback) {
+        setMessage(c.messages.archivedLoaded(count.count));
+        return;
+      }
+      setMessage(
+        list.connector_mode === "real"
+          ? c.messages.productReadReal(count.count, list.products.length)
+          : c.messages.productReadMock
+      );
+    } catch {
+      setMessage(c.messages.ozonReadFailed(c.messages.localServiceUnreachable));
     }
-    const count = countData as ProductCountResult;
-    const list = listData as ProductListResult;
-    setProductCount(count.count);
-    setProducts(list.products);
-    setProductListMeta(list);
-    if (list.archived_fallback || count.archived_fallback) {
-      setMessage(`当前店铺没有读取到在售商品，已显示 ${count.count} 个归档商品。生成海报前请确认商品仍可销售。`);
-      return;
-    }
-    setMessage(
-      list.connector_mode === "real"
-        ? `真实 Ozon 商品读取完成：总数 ${count.count}，当前样本 ${list.products.length}`
-        : "开发模式 mock 商品读取完成；上线请使用 OZON_CONNECTOR_MODE=real"
-    );
   }
 
   async function loadProductDetail(lookup: { offer_id?: string; product_id?: string; sku?: string }) {
-    if (!ensureOzonReadAccess("读取商品详情")) return;
+    if (!ensureOzonReadAccess(c.actions.readDetails)) return;
     const cleanLookup = Object.fromEntries(
       Object.entries(lookup).filter(([, value]) => value && value.trim())
     );
     if (Object.keys(cleanLookup).length !== 1) {
-      setMessage("请填写一个 offer_id、product_id 或 sku 来读取详情");
+      setMessage(c.messages.lookupRequired);
       return;
     }
-    const response = await api("/tools/ozon.products.get", {
-      method: "POST",
-      body: JSON.stringify(cleanLookup)
-    });
-    const data = await response.json();
-    if (!response.ok) {
+    try {
+      const response = await api("/tools/ozon.products.get", {
+        method: "POST",
+        body: JSON.stringify(cleanLookup)
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setProductDetail(null);
+        setMessage(c.messages.productDetailFailed(userFacingError(data.error)));
+        return;
+      }
+      setProductDetail(data);
+      resetPosterWorkbench();
+      setMessage(
+        data.connector_mode === "real"
+          ? c.messages.productDetailReal(data.product.offer_id, data.product.images.length)
+          : c.messages.productDetailMock(data.product.offer_id)
+      );
+    } catch {
       setProductDetail(null);
-      setMessage(`Ozon 商品详情读取失败：${userFacingError(data.error)}`);
-      return;
+      setMessage(c.messages.productDetailFailed(c.messages.localServiceUnreachable));
     }
-    setProductDetail(data);
-    resetPosterWorkbench();
-    setMessage(
-      data.connector_mode === "real"
-        ? `真实商品详情读取完成：${data.product.offer_id}，图片 ${data.product.images.length} 张`
-        : `Mock 商品详情读取完成：${data.product.offer_id}`
-    );
   }
 
   function resetPosterWorkbench() {
@@ -643,120 +707,140 @@ function App() {
   }
 
   async function buildPosterBrief() {
-    if (!ensureOzonReadAccess("生成海报简报")) return;
+    if (!ensureOzonReadAccess(c.actions.buildPosterBrief)) return;
     const lookup = currentLookupPayload();
     if (!lookup) {
-      setMessage("先读取一个真实商品，再生成海报简报");
+      setMessage(c.messages.needProductForBrief);
       return;
     }
-    const response = await api("/poster/brief", {
-      method: "POST",
-      body: JSON.stringify({ ...lookup, theme: posterTheme, locale: "zh-CN" })
-    });
-    const data = await response.json();
-    if (!response.ok) {
+    try {
+      const response = await api("/poster/brief", {
+        method: "POST",
+        body: JSON.stringify({ ...lookup, theme: posterTheme, locale })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setPosterBrief(null);
+        setMessage(c.messages.posterBriefFailed(userFacingError(data.error)));
+        return;
+      }
+      setProductDetail({ connector_mode: data.connector_mode, product: data.product });
+      setPosterBrief(data);
+      setPosterBackground(null);
+      setPosterHandoff(null);
+      setPosterVerification(null);
+      applyPosterBrief(data.brief);
+      setMessage(c.messages.posterBriefReady);
+    } catch {
       setPosterBrief(null);
-      setMessage(`海报简报生成失败：${userFacingError(data.error)}`);
-      return;
+      setMessage(c.messages.posterBriefFailed(c.messages.localServiceUnreachable));
     }
-    setProductDetail({ connector_mode: data.connector_mode, product: data.product });
-    setPosterBrief(data);
-    setPosterBackground(null);
-    setPosterHandoff(null);
-    setPosterVerification(null);
-    applyPosterBrief(data.brief);
-    setMessage("海报简报已生成。推荐先复制给龙虾/Codex 出图；配置图片 API 后也可以后台自动生成背景。");
   }
 
   async function copyPosterHandoff() {
-    if (!ensureOzonReadAccess("准备龙虾/Codex 海报任务")) return;
+    if (!ensureOzonReadAccess(c.actions.preparePosterHandoff)) return;
     const lookup = currentLookupPayload();
     if (!lookup) {
-      setMessage("先读取一个真实商品，再复制给龙虾/Codex");
+      setMessage(c.messages.needProductForHandoff);
       return;
     }
-    const response = await api("/poster/handoff", {
-      method: "POST",
-      body: JSON.stringify({ ...lookup, theme: posterTheme, locale: "zh-CN" })
-    });
-    const data = await response.json();
-    if (!response.ok) {
+    try {
+      const response = await api("/poster/handoff", {
+        method: "POST",
+        body: JSON.stringify({ ...lookup, theme: posterTheme, locale })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setPosterHandoff(null);
+        setMessage(c.messages.posterHandoffFailed(userFacingError(data.error)));
+        return;
+      }
+      setProductDetail({ connector_mode: data.connector_mode, product: data.product });
+      setPosterBrief({ connector_mode: data.connector_mode, product: data.product, brief: data.brief });
+      setPosterHandoff(data);
+      setPosterBackground(null);
+      setPosterVerification(null);
+      applyPosterBrief(data.brief);
+      await navigator.clipboard.writeText(data.prompt);
+      setMessage(c.messages.posterHandoffCopied(data.product.offer_id, data.source_images.length));
+    } catch {
       setPosterHandoff(null);
-      setMessage(`龙虾/Codex 任务包生成失败：${userFacingError(data.error)}`);
-      return;
+      setMessage(c.messages.posterHandoffFailed(c.messages.localServiceUnreachable));
     }
-    setProductDetail({ connector_mode: data.connector_mode, product: data.product });
-    setPosterBrief({ connector_mode: data.connector_mode, product: data.product, brief: data.brief });
-    setPosterHandoff(data);
-    setPosterBackground(null);
-    setPosterVerification(null);
-    applyPosterBrief(data.brief);
-    await navigator.clipboard.writeText(data.prompt);
-    setMessage(`已复制给龙虾/Codex 的海报任务：${data.product.offer_id}，包含 ${data.source_images.length} 张商品图。`);
   }
 
   async function generatePosterBackground() {
     if (!canGeneratePosterBackground) {
-      setMessage(`生成海报背景被拦截：${posterGenerationGateMessage}`);
+      setMessage(c.messages.posterBackgroundBlocked(posterGenerationGateMessage));
       return;
     }
     const lookup = currentLookupPayload();
     if (!lookup) {
-      setMessage("先读取一个真实商品，再生成海报背景");
+      setMessage(c.messages.needProductForBackground);
       return;
     }
-    const response = await api("/poster/generate", {
-      method: "POST",
-      body: JSON.stringify({ ...lookup, theme: posterTheme, locale: "zh-CN" })
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      setPosterBackground(null);
-      const issue = userFacingError(data.error);
-      if (issue.includes("图片生成通道")) {
-        setImageGenerationIssue(issue);
+    try {
+      const response = await api("/poster/generate", {
+        method: "POST",
+        body: JSON.stringify({ ...lookup, theme: posterTheme, locale })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setPosterBackground(null);
+        const issue = userFacingError(data.error);
+        if (issue === c.errors.imageModelUnavailable) {
+          setImageGenerationIssue(issue);
+        }
+        setMessage(c.messages.posterBackgroundFailed(issue));
+        return;
       }
-      setMessage(`海报背景生成失败：${issue}`);
-      return;
+      setImageGenerationIssue(null);
+      setProductDetail({ connector_mode: data.connector_mode, product: data.product });
+      setPosterBrief({ connector_mode: data.connector_mode, product: data.product, brief: data.brief });
+      setPosterHandoff(null);
+      setPosterBackground(data);
+      setPosterVerification(null);
+      applyPosterBrief(data.brief);
+      setMessage(c.messages.posterBackgroundReady(data.image_model));
+    } catch {
+      setPosterBackground(null);
+      setMessage(c.messages.posterBackgroundFailed(c.messages.localServiceUnreachable));
     }
-    setImageGenerationIssue(null);
-    setProductDetail({ connector_mode: data.connector_mode, product: data.product });
-    setPosterBrief({ connector_mode: data.connector_mode, product: data.product, brief: data.brief });
-    setPosterHandoff(null);
-    setPosterBackground(data);
-    setPosterVerification(null);
-    applyPosterBrief(data.brief);
-    setMessage(`背景图已生成，模型 ${data.image_model}`);
   }
 
   async function verifyPosterCopy() {
-    if (!ensureOzonReadAccess("校验海报文案")) return;
+    if (!ensureOzonReadAccess(c.actions.verifyPosterCopy)) return;
     const lookup = currentLookupPayload();
     if (!lookup) {
-      setMessage("先读取商品，再校验海报文案");
+      setMessage(c.messages.needProductForVerify);
       return;
     }
-    const response = await api("/poster/verify", {
-      method: "POST",
-      body: JSON.stringify({
-        ...lookup,
-        theme: posterTheme,
-        locale: "zh-CN",
-        headline: posterHeadline,
-        subheadline: posterSubheadline,
-        selling_points: posterSellingPoints.filter((value) => value.trim()),
-        cta_line: posterCtaLine,
-        compliance_note: posterComplianceNote
-      })
-    });
-    const data = await response.json();
-    if (!response.ok) {
+    try {
+      const response = await api("/poster/verify", {
+        method: "POST",
+        body: JSON.stringify({
+          ...lookup,
+          theme: posterTheme,
+          locale,
+          headline: posterHeadline,
+          subheadline: posterSubheadline,
+          selling_points: posterSellingPoints.filter((value) => value.trim()),
+          cta_line: posterCtaLine,
+          compliance_note: posterComplianceNote
+        })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setPosterVerification(null);
+        setMessage(c.messages.posterVerifyFailed(userFacingError(data.error)));
+        return;
+      }
+      setPosterVerification(data);
+      setMessage(data.ok ? c.messages.posterVerifyPassed : c.messages.posterVerifyFailedCopy);
+    } catch {
       setPosterVerification(null);
-      setMessage(`海报校验失败：${userFacingError(data.error)}`);
-      return;
+      setMessage(c.messages.posterVerifyFailed(c.messages.localServiceUnreachable));
     }
-    setPosterVerification(data);
-    setMessage(data.ok ? "海报文案已通过系统稿一致性校验" : "海报文案和系统稿不一致，请回到商品属性再确认");
   }
 
   function updatePosterSellingPoint(index: number, value: string) {
@@ -772,106 +856,173 @@ function App() {
   async function loadProductDetailFromInput() {
     const value = productLookup.trim();
     if (!value) {
-      setMessage("请输入 offer_id、product_id 或 sku");
+      setMessage(c.messages.inputLookup);
       return;
     }
     const lookup = parseProductLookupInput(value);
     if (!lookup) {
-      setMessage("查询格式不对：可用 sku:、offer:、product: 前缀，或直接输入 offer_id / 数字 product_id");
+      setMessage(c.messages.invalidLookup);
       return;
     }
     await loadProductDetail(lookup);
   }
 
   async function createDryRun() {
-    const response = await api("/tasks/dry-run", {
-      method: "POST",
-      body: JSON.stringify({
-        operation: selectedOperation,
-        source: "open_claw",
-        shop_id: "default-shop",
-        risk: selectedOperation.includes("mock") ? "high" : "medium",
-        idempotency_key: `ui-${selectedOperation}-${Date.now()}`
-      })
-    });
-    const data = await response.json();
-    setMessage(response.ok ? "OpenClaw dry-run 提案已创建，等待本地审批" : `创建失败：${data.error}`);
-    await refresh();
+    try {
+      const response = await api("/tasks/dry-run", {
+        method: "POST",
+        body: JSON.stringify({
+          operation: selectedOperation,
+          source: "open_claw",
+          shop_id: "default-shop",
+          risk: selectedOperation.includes("mock") ? "high" : "medium",
+          idempotency_key: `ui-${selectedOperation}-${Date.now()}`
+        })
+      });
+      const data = await response.json();
+      setMessage(response.ok ? c.messages.dryRunCreated : c.messages.dryRunCreateFailed(userFacingError(data.error)));
+      await refresh();
+    } catch {
+      setMessage(c.messages.dryRunCreateFailed(c.messages.localServiceUnreachable));
+    }
   }
 
   async function approve(taskId: string) {
-    const response = await api(`/tasks/${taskId}/approve`, {
-      method: "POST",
-      body: JSON.stringify({ approved_by: "local-ui", note: "approved in local operator console" })
-    });
-    const data = await response.json();
-    setMessage(response.ok ? "任务已审批并进入队列" : `审批失败：${data.error}`);
-    await refresh();
+    try {
+      const response = await api(`/tasks/${taskId}/approve`, {
+        method: "POST",
+        body: JSON.stringify({ approved_by: "local-ui", note: "approved in local operator console" })
+      });
+      const data = await response.json();
+      setMessage(response.ok ? c.messages.approved : c.messages.approveFailed(userFacingError(data.error)));
+      await refresh();
+    } catch {
+      setMessage(c.messages.approveFailed(c.messages.localServiceUnreachable));
+    }
   }
 
   async function execute(taskId: string) {
-    const response = await api(`/tasks/${taskId}/execute-mock`, { method: "POST" });
-    const data = await response.json();
-    setMessage(response.ok ? "dry-run 执行完成，没有发送真实 Ozon 写操作" : `执行失败：${data.error}`);
-    await refresh();
+    try {
+      const response = await api(`/tasks/${taskId}/execute-mock`, { method: "POST" });
+      const data = await response.json();
+      setMessage(response.ok ? c.messages.executed : c.messages.executeFailed(userFacingError(data.error)));
+      await refresh();
+    } catch {
+      setMessage(c.messages.executeFailed(c.messages.localServiceUnreachable));
+    }
   }
 
   async function configureSchedule(enabled: boolean) {
-    if (enabled && !ensureOzonReadAccess("启用只读定时采集")) return;
-    const response = await api("/schedules/ecommerce-read", {
-      method: "POST",
-      body: JSON.stringify({
-        enabled,
-        interval_secs: scheduleInterval,
-        limit: scheduleLimit
-      })
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      setMessage(`定时读取配置失败：${userFacingError(data.error)}`);
-      return;
+    if (enabled && !ensureOzonReadAccess(c.actions.enableSchedule)) return;
+    try {
+      const response = await api("/schedules/ecommerce-read", {
+        method: "POST",
+        body: JSON.stringify({
+          enabled,
+          interval_secs: scheduleInterval,
+          limit: scheduleLimit
+        })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage(c.messages.scheduleConfigFailed(userFacingError(data.error)));
+        return;
+      }
+      setSchedule(data);
+      setMessage(enabled ? c.messages.scheduleEnabled : c.messages.scheduleStopped);
+    } catch {
+      setMessage(c.messages.scheduleConfigFailed(c.messages.localServiceUnreachable));
     }
-    setSchedule(data);
-    setMessage(enabled ? "只读定时采集已启用" : "只读定时采集已停止");
   }
 
   async function runScheduleNow() {
-    if (!ensureOzonReadAccess("立即采集")) return;
-    const response = await api("/schedules/ecommerce-read/run-now", { method: "POST" });
-    const data = await response.json();
-    if (!response.ok) {
-      setMessage(`手动采集失败：${userFacingError(data.error)}`);
-      return;
+    if (!ensureOzonReadAccess(c.actions.runNow)) return;
+    try {
+      const response = await api("/schedules/ecommerce-read/run-now", { method: "POST" });
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage(c.messages.manualRunFailed(userFacingError(data.error)));
+        return;
+      }
+      setProducts(data.run.products);
+      setProductCount(data.run.product_count);
+      setMessage(c.messages.manualRunDone(data.run.sample_size, data.run.duration_ms));
+      await refresh();
+    } catch {
+      setMessage(c.messages.manualRunFailed(c.messages.localServiceUnreachable));
     }
-    setProducts(data.run.products);
-    setProductCount(data.run.product_count);
-    setMessage(`采集完成：${data.run.sample_size} 个样本，${data.run.duration_ms}ms`);
-    await refresh();
   }
 
   async function copyManifest() {
     await navigator.clipboard.writeText(`${runtime.skill_api}/openclaw/manifest`);
-    setMessage("OpenClaw manifest URL 已复制");
+    setMessage(c.messages.manifestCopied);
   }
 
-  async function copyOpenClawToken() {
-    await navigator.clipboard.writeText(runtime.openclaw_token);
-    setMessage("OpenClaw bridge token 已复制");
+  async function copyOpenClawPairingLink() {
+    if (!openClawBridgeReady) {
+      setMessage(c.messages.nodeNotReadyRefresh);
+      return;
+    }
+    try {
+      const response = await api("/openclaw/pairing/start", { method: "POST" });
+      const data = (await response.json()) as OpenClawPairingStart & { error?: string };
+      if (!response.ok) {
+        setMessage(c.messages.pairingLinkFailed(userFacingError(data.error ?? "unknown error")));
+        return;
+      }
+      await navigator.clipboard.writeText(data.bind_url);
+      setMessage(c.messages.pairingLinkCopied);
+    } catch {
+      setMessage(c.messages.pairingLinkFailed(c.messages.localServiceUnreachable));
+    }
+  }
+
+  async function startOpenClawAutoBinding() {
+    if (!openClawBridgeReady) {
+      setMessage(c.messages.nodeNotReadyRecheck);
+      return;
+    }
+    let data: OpenClawPairingStart & { error?: string };
+    try {
+      const response = await api("/openclaw/pairing/start", { method: "POST" });
+      data = (await response.json()) as OpenClawPairingStart & { error?: string };
+      if (!response.ok) {
+        setMessage(c.messages.autoBindingFailed(userFacingError(data.error ?? "unknown error")));
+        return;
+      }
+    } catch {
+      setMessage(c.messages.autoBindingFailed(c.messages.localServiceUnreachable));
+      return;
+    }
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("open_openclaw_binding_url", { bindUrl: data.bind_url });
+    } catch (error) {
+      const errorText = error instanceof Error ? error.message : String(error);
+      if (isBindingUrlSafetyError(errorText)) {
+        setMessage(c.messages.bindingRejected(userFacingError(errorText)));
+        return;
+      }
+      await navigator.clipboard.writeText(data.bind_url);
+      setMessage(c.messages.bindingLinkCopiedFallback);
+      return;
+    }
+    setMessage(c.messages.bindingOpened);
   }
 
   async function restartSidecar() {
-    setMessage("正在重启本地节点");
+    setMessage(c.messages.restartingNode);
     try {
       const nextRuntime = await restartRuntimeConfig();
       setRuntime(nextRuntime);
       setRuntimeReady(true);
       setEventState("connecting");
-      setMessage("本地节点已请求重启，正在重新检测");
+      setMessage(c.messages.restartRequested);
       window.setTimeout(() => {
         checkHealth();
       }, 1200);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "当前环境不支持重启本地节点");
+      setMessage(error instanceof Error ? error.message : c.messages.restartUnsupported);
     }
   }
 
@@ -906,35 +1057,81 @@ function App() {
     checkHealth();
     refresh();
     let cancelled = false;
+    let attempt = 0;
+    let reconnectTimer: number | null = null;
+    let controller: AbortController | null = null;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+    function scheduleReconnect() {
+      if (cancelled || reconnectTimer !== null) {
+        return;
+      }
+      const delay = Math.min(1000 * 2 ** attempt, 30000);
+      attempt += 1;
+      setEventState("connecting");
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        connectEvents();
+      }, delay);
+    }
 
     async function connectEvents() {
+      if (cancelled) {
+        return;
+      }
+      controller = new AbortController();
       try {
         const response = await fetch(`${runtime.agent_api}/events`, {
-          headers: { "x-local-token": runtime.local_token }
+          headers: { "x-local-token": runtime.local_token },
+          signal: controller.signal
         });
         if (!response.ok || !response.body) {
           setEventState("offline");
+          scheduleReconnect();
           return;
         }
+        attempt = 0;
         setEventState("connected");
-        const reader = response.body.getReader();
+        reader = response.body.getReader();
         const decoder = new TextDecoder();
+        let buffer = "";
         while (!cancelled) {
           const { value, done } = await reader.read();
-          if (done) break;
-          const chunk = decoder.decode(value, { stream: true });
-          if (chunk.includes("event: task.changed")) {
-            refresh();
+          if (done) {
+            break;
+          }
+          buffer += decoder.decode(value, { stream: true });
+          let boundary = buffer.indexOf("\n\n");
+          while (boundary !== -1) {
+            const event = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+            if (event.includes("event: task.changed")) {
+              refresh();
+            }
+            boundary = buffer.indexOf("\n\n");
           }
         }
+        if (!cancelled) {
+          setEventState("offline");
+          scheduleReconnect();
+        }
       } catch {
-        if (!cancelled) setEventState("offline");
+        if (!cancelled) {
+          setEventState("offline");
+          scheduleReconnect();
+        }
       }
     }
 
     connectEvents();
     return () => {
       cancelled = true;
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      reader?.cancel().catch(() => {});
+      controller?.abort();
     };
   }, [runtimeReady, runtime.skill_api, runtime.agent_api, runtime.local_token]);
 
@@ -942,72 +1139,120 @@ function App() {
     <main>
       <nav>
         <div>
-          <strong>Ozon Rust Local</strong>
-          <span>Seller API console</span>
+          <strong>{c.app.title}</strong>
+          <span>{c.app.subtitle}</span>
         </div>
-        <span className={health ? "ok" : "warn"}>{health ? "ready" : "offline"}</span>
+        <label className="language-switch">
+          <span>{c.language.label}</span>
+          <select value={locale} onChange={(event) => setLocale(event.target.value as Locale)}>
+            {localeOptions.map((option) => (
+              <option key={option.locale} value={option.locale}>
+                {option.locale === "zh-CN" ? c.language.zh : c.language.en}
+              </option>
+            ))}
+          </select>
+        </label>
+        <span className={health ? "ok" : "warn"}>{health ? c.app.ready : c.app.offline}</span>
       </nav>
 
       <section className="overview">
         <div>
           <Activity />
-          <span>Skill API</span>
+          <span>{c.overview.localService}</span>
           <strong>{runtime.skill_api.replace("http://", "")}</strong>
         </div>
         <div>
           <Radio />
-          <span>Agent stream</span>
-          <strong>{eventState}</strong>
+          <span>{c.overview.openClawConnection}</span>
+          <strong>{eventState === "connected" ? c.overview.connected : c.overview.checking}</strong>
         </div>
         <div>
           <ListChecks />
-          <span>Pending approval</span>
+          <span>{c.overview.pendingApproval}</span>
           <strong>{queueStats.pending}</strong>
         </div>
         <div>
           <ShieldCheck />
-          <span>Write policy</span>
-          <strong>dry-run gated</strong>
+          <span>{c.overview.writePolicy}</span>
+          <strong>{c.overview.writePolicyValue}</strong>
         </div>
         <div>
           <SlidersHorizontal />
-          <span>Ozon mode</span>
-          <strong>{configStatus?.connector_mode === "real" ? "real API" : (configStatus?.connector_mode ?? runtime.connector_mode)}</strong>
+          <span>{c.overview.productMode}</span>
+          <strong>{configStatus?.connector_mode === "real" ? c.overview.realRead : (configStatus?.connector_mode ?? runtime.connector_mode)}</strong>
         </div>
         <div className="overview-sidecar">
           <TerminalSquare />
-          <span>Sidecar</span>
-          <strong>{sidecarSummary(runtime)}</strong>
-          <button className="mini-action" onClick={restartSidecar} title="重启本地节点">
+          <span>{c.overview.desktopNode}</span>
+          <strong>{sidecarSummary(runtime, c)}</strong>
+          <button className="mini-action" onClick={restartSidecar} title={c.overview.restartNode}>
             <RefreshCcw size={15} />
           </button>
         </div>
         <div>
           <Repeat2 />
-          <span>Read schedule</span>
-          <strong>{schedule?.enabled ? "enabled" : "paused"}</strong>
+          <span>{c.overview.readSchedule}</span>
+          <strong>{schedule?.enabled ? c.overview.scheduleOn : c.overview.schedulePaused}</strong>
         </div>
       </section>
 
       <section className={`runtime-strip ${isConnectedRuntime(runtime) ? "runtime-ok" : "runtime-warn"}`}>
         <div>
-          <strong>{sidecarStatusLabel(runtime)}</strong>
-          <span>{sidecarDiagnostic(runtime)}</span>
+          <strong>{sidecarStatusLabel(runtime, c)}</strong>
+          <span>{sidecarDiagnostic(runtime, c)}</span>
         </div>
         <button className="secondary-button" onClick={restartSidecar}>
           <RefreshCcw size={16} />
-          重启节点
+          {c.overview.restartNode}
         </button>
       </section>
 
       <section className="runtime-strip runtime-ok">
         <div>
-          <strong>节点协议 {health?.protocol_version ?? "等待 /health"}</strong>
+          <strong>{c.protocol.title(health?.protocol_version ?? c.protocol.waiting)}</strong>
           <span>
             {health
-              ? `版本 ${health.package_version ?? "unknown"} / ${shortCommit(health.build_commit)} / ${health.supervisor ?? "unknown supervisor"}`
-              : "检测通过后这里会显示协议、构建和 supervisor 信息。"}
+              ? c.protocol.detail(
+                  health.package_version ?? c.advanced.values.unknown,
+                  shortCommit(health.build_commit, c.advanced.values.unknown),
+                  health.supervisor ?? c.protocol.unknownSupervisor
+                )
+              : c.protocol.pending}
           </span>
+        </div>
+      </section>
+
+      <section className="setup-guide">
+        <div className="section-title">
+          <Workflow />
+          <div>
+            <h1>{c.setup.title}</h1>
+            <p>{c.setup.description}</p>
+          </div>
+        </div>
+        <div className="setup-steps">
+          {setupSteps.map((step) => (
+            <div className={`setup-step ${step.state}`} key={step.number}>
+              <span className="step-number">{step.number}</span>
+              <div>
+                <strong>{step.title}</strong>
+                <em>{step.status}</em>
+                <p>{step.detail}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="setup-action-row">
+          <button disabled={!openClawBridgeReady} onClick={startOpenClawAutoBinding}>
+            <Workflow size={18} /> {c.setup.actions.autoBind}
+          </button>
+          <button className="secondary-button" disabled={!openClawBridgeReady} onClick={copyOpenClawPairingLink}>
+            <Clipboard size={16} /> {c.setup.actions.copyPairing}
+          </button>
+          <button className="secondary-button" onClick={refresh}>
+            <RefreshCcw size={16} /> {c.setup.actions.recheck}
+          </button>
+          <p>{c.setup.note}</p>
         </div>
       </section>
 
@@ -1016,52 +1261,49 @@ function App() {
           <div className="section-title">
             <Workflow />
             <div>
-              <h1>龙虾 / Codex 连接</h1>
-              <p>推荐路径：龙虾用自己的登录账号出图，本机节点只提供真实商品和图片事实。</p>
+              <h2>{c.bridge.title}</h2>
+              <p>{c.bridge.description}</p>
             </div>
           </div>
-          <div className="bridge-endpoint">
-            <code>{runtime.skill_api}/openclaw/manifest</code>
-            <button className="icon-button" onClick={copyManifest} title="复制 manifest URL">
-              <Clipboard size={18} />
-            </button>
-          </div>
-          <div className="bridge-endpoint token-endpoint">
-            <code>x-openclaw-token: {maskSecret(runtime.openclaw_token)}</code>
-            <button className="icon-button" onClick={copyOpenClawToken} title="复制 OpenClaw bridge token">
-              <Clipboard size={18} />
-            </button>
-          </div>
-          <div className="tool-list">
-            {(manifest?.tools ?? []).map((tool) => (
-              <div key={tool.name}>
-                <span>{tool.risk}</span>
-                <strong>{tool.name}</strong>
-                <em>{tool.approval_required ? "requires approval" : "read-only"}</em>
-              </div>
-            ))}
-          </div>
+          <details className="advanced-connect">
+            <summary>{c.bridge.advancedSummary}</summary>
+            <div className="bridge-endpoint">
+              <code>{runtime.skill_api}/openclaw/manifest</code>
+              <button className="icon-button" onClick={copyManifest} title={c.bridge.copyManifestTitle}>
+                <Clipboard size={18} />
+              </button>
+            </div>
+            <div className="tool-list compact-tools">
+              {(manifest?.tools ?? []).map((tool) => (
+                <div key={tool.name}>
+                  <span>{tool.risk}</span>
+                  <strong>{tool.name}</strong>
+                  <em>{tool.approval_required ? c.bridge.approvalRequired : c.bridge.readOnly}</em>
+                </div>
+              ))}
+            </div>
+          </details>
         </div>
 
         <div className="panel config-panel">
           <div className="section-title">
             <KeyRound />
             <div>
-              <h2>本地密钥</h2>
-              <p>保存用户自己的 Ozon Seller API 凭据；优先写入系统钥匙串，并保留本机受限文件备份。</p>
+              <h2>{c.config.title}</h2>
+              <p>{c.config.description}</p>
             </div>
           </div>
           <p className="notice mode-notice">
             {configStatus?.real_ozon_enabled
-              ? "当前是真实 API 模式：未保存凭据时会拒绝读取，不会回退到假商品。"
-              : "当前是开发 mock 模式：仅用于本机演示，上线请用 OZON_CONNECTOR_MODE=real 启动。"}
+              ? c.config.realModeNotice
+              : c.config.mockModeNotice}
           </p>
           <div className="form-grid compact">
             <label>
               Ozon Client ID
               <input
                 autoComplete="off"
-                placeholder="从 Ozon Seller 后台复制"
+                placeholder={c.config.clientIdPlaceholder}
                 value={clientId}
                 onChange={(event) => setClientId(event.target.value)}
               />
@@ -1070,7 +1312,7 @@ function App() {
               Ozon API Key
               <input
                 autoComplete="off"
-                placeholder="保存后只显示指纹"
+                placeholder={c.config.apiKeyPlaceholder}
                 value={apiKey}
                 onChange={(event) => setApiKey(event.target.value)}
                 type="password"
@@ -1078,126 +1320,131 @@ function App() {
             </label>
           </div>
           <button onClick={saveConfig}>
-            <CheckCircle2 size={18} /> 保存凭据
+            <CheckCircle2 size={18} /> {c.config.saveAndValidate}
           </button>
         </div>
 
-        <div className="panel config-panel">
-          <div className="section-title">
-            <Sparkles />
-            <div>
-              <h2>可选：图片 API 自动出图</h2>
-              <p>龙虾/Codex 能出图时不需要填这里。只有要让本机后台自动生成背景时，才配置官方或中转 API。</p>
+        <details className="advanced-local-settings">
+          <summary>{c.advanced.summary}</summary>
+          <div className="advanced-local-grid">
+            <div className="panel config-panel">
+              <div className="section-title">
+                  <Sparkles />
+                  <div>
+                  <h2>{c.advanced.imageApiTitle}</h2>
+                  <p>{c.advanced.imageApiDescription}</p>
+                </div>
+              </div>
+              <div className="form-grid compact">
+                <label>
+                  Base URL
+                  <input
+                    autoComplete="off"
+                    placeholder={c.advanced.baseUrlPlaceholder}
+                    value={openAiBaseUrl}
+                    onChange={(event) => setOpenAiBaseUrl(event.target.value)}
+                  />
+                </label>
+                <label>
+                  Image model
+                  <input
+                    autoComplete="off"
+                    placeholder="gpt-image-1"
+                    value={openAiImageModel}
+                    onChange={(event) => setOpenAiImageModel(event.target.value)}
+                  />
+                </label>
+                <label>
+                  API Key
+                  <input
+                    autoComplete="off"
+                    placeholder={configStatus?.openai.configured ? c.advanced.apiKeyReusePlaceholder : c.advanced.apiKeyFirstPlaceholder}
+                    value={openAiApiKey}
+                    onChange={(event) => setOpenAiApiKey(event.target.value)}
+                    type="password"
+                  />
+                </label>
+              </div>
+              <button className="secondary-button" onClick={saveOpenAiConfig}>
+                <CheckCircle2 size={18} /> {c.advanced.saveImageConfig}
+              </button>
+              {imageGenerationIssue && <p className="notice warn-text">{imageGenerationIssue}</p>}
             </div>
-          </div>
-          <div className="form-grid compact">
-            <label>
-              Base URL
-              <input
-                autoComplete="off"
-                placeholder="https://api.openai.com 或中转地址"
-                value={openAiBaseUrl}
-                onChange={(event) => setOpenAiBaseUrl(event.target.value)}
-              />
-            </label>
-            <label>
-              Image model
-              <input
-                autoComplete="off"
-                placeholder="gpt-image-1"
-                value={openAiImageModel}
-                onChange={(event) => setOpenAiImageModel(event.target.value)}
-              />
-            </label>
-            <label>
-              API Key
-              <input
-                autoComplete="off"
-                placeholder={configStatus?.openai.configured ? "留空则沿用已保存的 Key" : "第一次保存需要填写"}
-                value={openAiApiKey}
-                onChange={(event) => setOpenAiApiKey(event.target.value)}
-                type="password"
-              />
-            </label>
-          </div>
-          <button className="secondary-button" onClick={saveOpenAiConfig}>
-            <CheckCircle2 size={18} /> 保存出图配置
-          </button>
-          {imageGenerationIssue && <p className="notice warn-text">{imageGenerationIssue}</p>}
-        </div>
 
-        <div className="panel diagnostics-panel">
-          <div className="section-title">
-            <SlidersHorizontal />
-            <div>
-              <h2>本地自检</h2>
-              <p>确认连接、密钥来源和 Ozon connector 模式。</p>
+            <div className="panel diagnostics-panel">
+              <div className="section-title">
+                <SlidersHorizontal />
+                <div>
+                  <h2>{c.advanced.diagnosticsTitle}</h2>
+                  <p>{c.advanced.diagnosticsDescription}</p>
+                </div>
+              </div>
+              <div className="inline-actions">
+                <button onClick={checkHealth}>
+                  <RefreshCcw size={18} /> {c.advanced.refreshDiagnostics}
+                </button>
+                <button onClick={validateConfig}>
+                  <ShieldCheck size={18} /> {c.advanced.validateOzonCredentials}
+                </button>
+              </div>
+              <div className="status-list">
+                <div className="status-item">
+                  <span>{c.advanced.labels.connector}</span>
+                  <strong>{configStatus?.connector_mode ?? c.advanced.values.unknown}</strong>
+                  <em className={configStatus?.real_ozon_enabled ? "badge warn-badge" : "badge ok-badge"}>
+                    {configStatus?.real_ozon_enabled ? c.advanced.values.realApi : c.advanced.values.mock}
+                  </em>
+                </div>
+                <div className="status-item">
+                  <span>{c.advanced.labels.secretStore}</span>
+                  <strong>{configStatus?.secret_store.backend ?? "system_keyring"}</strong>
+                  <em className={configStatus?.secret_store.available ? "badge ok-badge" : "badge warn-badge"}>
+                    {configStatus?.secret_store.available ? c.advanced.values.available : c.advanced.values.unavailable}
+                  </em>
+                </div>
+                <div className="status-item">
+                  <span>{c.advanced.labels.ozonConfig}</span>
+                  <strong>{configStatus?.ozon.configured ? c.advanced.values.configured : c.advanced.values.notConfigured}</strong>
+                  <em className="badge neutral-badge">{configStatus?.ozon.source ?? c.advanced.values.checking}</em>
+                </div>
+                <div className="status-item">
+                  <span>{c.advanced.labels.clientId}</span>
+                  <strong>{configStatus?.ozon.client_id ?? c.advanced.notSaved}</strong>
+                </div>
+                <div className="status-item">
+                  <span>{c.advanced.labels.apiKeyFingerprint}</span>
+                  <strong>{configStatus?.ozon.api_key_fingerprint ?? c.advanced.notSaved}</strong>
+                </div>
+                <div className="status-item">
+                  <span>{c.advanced.labels.imageApi}</span>
+                  <strong>{configStatus?.openai.configured ? configStatus.openai.base_url : c.advanced.values.notConfigured}</strong>
+                  <em className={configStatus?.openai.configured ? "badge ok-badge" : "badge warn-badge"}>
+                    {configStatus?.openai.source ?? c.advanced.values.checking}
+                  </em>
+                </div>
+                <div className="status-item">
+                  <span>{c.advanced.labels.imageModel}</span>
+                  <strong>{configStatus?.openai.image_model ?? c.advanced.notSaved}</strong>
+                </div>
+                <div className="status-item">
+                  <span>{c.advanced.labels.lease}</span>
+                  <strong>{configStatus?.lease.lease_id ?? c.advanced.notImported}</strong>
+                  <em className={configStatus?.lease.valid ? "badge ok-badge" : "badge warn-badge"}>
+                    {configStatus?.lease.valid ? c.advanced.values.valid : c.advanced.values.missing}
+                  </em>
+                </div>
+              </div>
+              {configStatus?.ozon.issue && <p className="notice warn-text">{userFacingError(configStatus.ozon.issue)}</p>}
+              {configStatus?.openai.issue && <p className="notice warn-text">{userFacingError(configStatus.openai.issue)}</p>}
+              {configStatus?.lease.issue && <p className="notice warn-text">{userFacingError(configStatus.lease.issue)}</p>}
+              {validation && (
+                <p className="notice">
+                  {validation.checked_at} · {validationMessage(validation, c)}
+                </p>
+              )}
             </div>
           </div>
-          <div className="inline-actions">
-            <button onClick={checkHealth}>
-              <RefreshCcw size={18} /> 刷新自检
-            </button>
-            <button onClick={validateConfig}>
-              <ShieldCheck size={18} /> 校验 Ozon 凭据
-            </button>
-          </div>
-          <div className="status-list">
-            <div className="status-item">
-              <span>Connector</span>
-              <strong>{configStatus?.connector_mode ?? "unknown"}</strong>
-              <em className={configStatus?.real_ozon_enabled ? "badge warn-badge" : "badge ok-badge"}>
-                {configStatus?.real_ozon_enabled ? "real API" : "mock"}
-              </em>
-            </div>
-            <div className="status-item">
-              <span>Secret store</span>
-              <strong>{configStatus?.secret_store.backend ?? "system_keyring"}</strong>
-              <em className={configStatus?.secret_store.available ? "badge ok-badge" : "badge warn-badge"}>
-                {configStatus?.secret_store.available ? "available" : "unavailable"}
-              </em>
-            </div>
-            <div className="status-item">
-              <span>Ozon config</span>
-              <strong>{configStatus?.ozon.configured ? "configured" : "not configured"}</strong>
-              <em className="badge neutral-badge">{configStatus?.ozon.source ?? "checking"}</em>
-            </div>
-            <div className="status-item">
-              <span>Client ID</span>
-              <strong>{configStatus?.ozon.client_id ?? "未保存"}</strong>
-            </div>
-            <div className="status-item">
-              <span>API key fingerprint</span>
-              <strong>{configStatus?.ozon.api_key_fingerprint ?? "未保存"}</strong>
-            </div>
-            <div className="status-item">
-              <span>Image API</span>
-              <strong>{configStatus?.openai.configured ? configStatus.openai.base_url : "not configured"}</strong>
-              <em className={configStatus?.openai.configured ? "badge ok-badge" : "badge warn-badge"}>
-                {configStatus?.openai.source ?? "checking"}
-              </em>
-            </div>
-            <div className="status-item">
-              <span>Image model</span>
-              <strong>{configStatus?.openai.image_model ?? "未保存"}</strong>
-            </div>
-            <div className="status-item">
-              <span>Lease</span>
-              <strong>{configStatus?.lease.lease_id ?? "未导入"}</strong>
-              <em className={configStatus?.lease.valid ? "badge ok-badge" : "badge warn-badge"}>
-                {configStatus?.lease.valid ? "valid" : "missing"}
-              </em>
-            </div>
-          </div>
-          {configStatus?.ozon.issue && <p className="notice warn-text">{userFacingError(configStatus.ozon.issue)}</p>}
-          {configStatus?.openai.issue && <p className="notice warn-text">{userFacingError(configStatus.openai.issue)}</p>}
-          {configStatus?.lease.issue && <p className="notice warn-text">{userFacingError(configStatus.lease.issue)}</p>}
-          {validation && (
-            <p className="notice">
-              {validation.checked_at} · {validation.message}
-            </p>
-          )}
-        </div>
+        </details>
       </section>
 
       <section className="workspace-grid">
@@ -1205,17 +1452,17 @@ function App() {
           <div className="section-title">
             <DatabaseZap />
             <div>
-              <h2>真实商品读取</h2>
-              <p>真实模式直接调用 Ozon Seller API；未配置凭据或授权租约时失败关闭。</p>
+              <h2>{c.read.title}</h2>
+              <p>{c.read.description}</p>
             </div>
           </div>
           <button disabled={!canUseOzonReadTools} onClick={loadProducts}>
-            读取 Ozon 商品
+            {c.read.loadProducts}
           </button>
           {!canUseOzonReadTools && <p className="notice warn-text">{ozonReadGateMessage}</p>}
           <div className="task-command product-lookup-command">
             <input
-              placeholder="offer_id、数字 product_id，或 sku:123"
+              placeholder={c.read.lookupPlaceholder}
               value={productLookup}
               onChange={(event) => setProductLookup(event.target.value)}
               onKeyDown={(event) => {
@@ -1225,42 +1472,40 @@ function App() {
               }}
             />
             <button disabled={!canUseOzonReadTools} onClick={loadProductDetailFromInput}>
-              <ImageIcon size={18} /> 读取详情/图片
+              <ImageIcon size={18} /> {c.read.readDetails}
             </button>
           </div>
           <div className="metric-row">
-            <span>Product count</span>
-            <strong>{productCount ?? "未读取"}</strong>
+            <span>{c.read.productCount}</span>
+            <strong>{productCount ?? c.read.notRead}</strong>
           </div>
           <div className="read-meta">
             <span className={productListMeta?.connector_mode === "real" ? "badge ok-badge" : "badge neutral-badge"}>
-              {productListMeta?.connector_mode === "real" ? "real seller data" : "not loaded"}
+              {productListMeta?.connector_mode === "real" ? c.read.realSellerData : c.read.notLoaded}
             </span>
-            {productListMeta?.archived_fallback && <span className="badge warn-badge">归档商品</span>}
+            {productListMeta?.archived_fallback && <span className="badge warn-badge">{c.read.archivedBadge}</span>}
             {productListMeta?.visibility && <code>{productListMeta.visibility}</code>}
-            {productListMeta?.last_id && <code>next: {productListMeta.last_id}</code>}
+            {productListMeta?.last_id && <code>{c.read.nextCursor(String(productListMeta.last_id))}</code>}
           </div>
           {productListMeta?.archived_fallback && (
-            <p className="notice warn-text">
-              当前没有读取到在售商品，已显示归档商品。归档商品可以用于历史查看和素材参考，生成海报或发布前请确认商品仍可销售。
-            </p>
+            <p className="notice warn-text">{c.read.archivedNotice}</p>
           )}
           <div className="product-list">
             {products.map((product) => (
               <div key={product.product_id}>
                 <strong>{product.offer_id}</strong>
-                <span>{product.name ?? `Product ${product.product_id}`}</span>
+                <span>{product.name ?? c.read.productFallback(product.product_id)}</span>
                 <em>
-                  {(product.visibility ?? "visibility n/a")} · FBO {product.has_fbo_stocks ? "yes" : "no"} · FBS{" "}
-                  {product.has_fbs_stocks ? "yes" : "no"}
-                  {product.archived ? " · archived" : ""}
+                  {(product.visibility ?? c.read.visibilityUnavailable)} · FBO {product.has_fbo_stocks ? c.read.yes : c.read.no} · FBS{" "}
+                  {product.has_fbs_stocks ? c.read.yes : c.read.no}
+                  {product.archived ? ` · ${c.read.archivedShort}` : ""}
                 </em>
                 <button
                   className="secondary-button"
                   disabled={!canUseOzonReadTools}
                   onClick={() => loadProductDetail({ offer_id: product.offer_id })}
                 >
-                  <ImageIcon size={16} /> 详情/图片
+                  <ImageIcon size={16} /> {c.read.readDetails}
                 </button>
               </div>
             ))}
@@ -1271,14 +1516,11 @@ function App() {
                 <ImageIcon />
                 <div>
                   <h3>{productDetail.product.name ?? productDetail.product.offer_id}</h3>
-                  <p>
-                    {productDetail.product.offer_id} · product {productDetail.product.product_id} ·{" "}
-                    {productDetail.connector_mode}
-                  </p>
+                  <p>{productDetail.product.offer_id} · {c.read.productMeta(productDetail.product.product_id, productDetail.connector_mode)}</p>
                 </div>
               </div>
               <div className="image-strip">
-                {productDetail.product.images.length === 0 && <p className="empty">Ozon 没有返回图片。</p>}
+                {productDetail.product.images.length === 0 && <p className="empty">{c.read.imageEmpty}</p>}
                 {productDetail.product.images.slice(0, 6).map((image) => (
                   <a key={`${image.role}-${image.position}-${image.url}`} href={image.url} target="_blank" rel="noreferrer">
                     <img src={image.url} alt={`${image.role} ${image.position}`} />
@@ -1288,24 +1530,24 @@ function App() {
               </div>
               <div className="fact-grid">
                 <div>
-                  <span>Primary image</span>
-                  <strong>{productDetail.product.primary_image ? "available" : "missing"}</strong>
+                  <span>{c.read.primaryImage}</span>
+                  <strong>{productDetail.product.primary_image ? c.read.available : c.read.missing}</strong>
                 </div>
                 <div>
-                  <span>Attributes</span>
+                  <span>{c.read.attributes}</span>
                   <strong>{productDetail.product.attributes.length}</strong>
                 </div>
                 <div>
-                  <span>Barcodes</span>
+                  <span>{c.read.barcodes}</span>
                   <strong>{productDetail.product.barcodes.length}</strong>
                 </div>
               </div>
               {productDetail.product.attributes.length > 0 && (
                 <div className="attribute-list">
                   {productDetail.product.attributes.slice(0, 8).map((attribute, index) => (
-                    <p key={`${attribute.id ?? index}-${attribute.name ?? "attribute"}`}>
-                      <strong>{attribute.name ?? attribute.id ?? "attribute"}</strong>
-                      <span>{attribute.values.join(", ") || "n/a"}</span>
+                    <p key={`${attribute.id ?? index}-${attribute.name ?? c.read.attributeFallback}`}>
+                      <strong>{attribute.name ?? attribute.id ?? c.read.attributeFallback}</strong>
+                      <span>{attribute.values.join(", ") || c.read.emptyValue}</span>
                     </p>
                   ))}
                 </div>
@@ -1322,57 +1564,57 @@ function App() {
               <div className="section-title compact-title">
                 <Sparkles />
                 <div>
-                  <h3>商品海报工作台</h3>
-                  <p>先从 Ozon 商品生成事实包，再交给龙虾/Codex 出图；本机 API 自动出图只是备用。</p>
+                  <h3>{c.poster.title}</h3>
+                  <p>{c.poster.description}</p>
                 </div>
               </div>
               <div className="task-command poster-toolbar">
                 <select value={posterTheme} onChange={(event) => setPosterTheme(event.target.value)}>
-                  <option value="studio">clean studio</option>
-                  <option value="spotlight">spotlight</option>
-                  <option value="launch">launch stage</option>
-                  <option value="lifestyle">lifestyle</option>
+                  <option value="studio">{c.poster.themes.studio}</option>
+                  <option value="spotlight">{c.poster.themes.spotlight}</option>
+                  <option value="launch">{c.poster.themes.launch}</option>
+                  <option value="lifestyle">{c.poster.themes.lifestyle}</option>
                 </select>
                 <button disabled={!canUseOzonReadTools} onClick={buildPosterBrief}>
-                  <Sparkles size={18} /> 生成文案简报
+                  <Sparkles size={18} /> {c.poster.buildBrief}
                 </button>
                 <button disabled={!canUseOzonReadTools} onClick={copyPosterHandoff}>
-                  <Clipboard size={18} /> 复制给龙虾/Codex
+                  <Clipboard size={18} /> {c.poster.copyHandoff}
                 </button>
                 <button disabled={!canGeneratePosterBackground} onClick={generatePosterBackground}>
-                  <ImageIcon size={18} /> API 自动生成背景
+                  <ImageIcon size={18} /> {c.poster.apiGenerate}
                 </button>
                 <button className="secondary-button" disabled={!canUseOzonReadTools} onClick={verifyPosterCopy}>
-                  <ShieldCheck size={16} /> 校验文案一致性
+                  <ShieldCheck size={16} /> {c.poster.verifyCopy}
                 </button>
               </div>
               {!canGeneratePosterBackground && (
                 <p className={`notice ${imageGenerationIssue ? "warn-text" : ""}`}>
-                  {posterGenerationGateMessage || "API 自动出图暂不可用；可以先复制给龙虾/Codex。"}
+                  {posterGenerationGateMessage || c.poster.apiUnavailable}
                 </p>
               )}
               {posterBrief && (
                 <div className="poster-editor">
                   <label>
-                    标题
+                    {c.poster.headline}
                     <input value={posterHeadline} onChange={(event) => setPosterHeadline(event.target.value)} />
                   </label>
                   <label>
-                    副标题
+                    {c.poster.subheadline}
                     <input value={posterSubheadline} onChange={(event) => setPosterSubheadline(event.target.value)} />
                   </label>
                   {posterSellingPoints.map((point, index) => (
                     <label key={`poster-point-${index}`}>
-                      卖点 {index + 1}
+                      {c.poster.sellingPoint(index + 1)}
                       <input value={point} onChange={(event) => updatePosterSellingPoint(index, event.target.value)} />
                     </label>
                   ))}
                   <label>
-                    收尾一句
+                    {c.poster.cta}
                     <input value={posterCtaLine} onChange={(event) => setPosterCtaLine(event.target.value)} />
                   </label>
                   <label className="full-span">
-                    说明
+                    {c.poster.note}
                     <input value={posterComplianceNote} onChange={(event) => setPosterComplianceNote(event.target.value)} />
                   </label>
                 </div>
@@ -1411,7 +1653,7 @@ function App() {
                           productDetail?.product.offer_id ??
                           posterBackground?.product.offer_id ??
                           posterBrief?.product.offer_id ??
-                          "product"
+                          c.poster.productAlt
                         }
                       />
                     )}
@@ -1419,36 +1661,34 @@ function App() {
                   <div className="poster-meta">
                     <div className="fact-grid">
                       <div>
-                        <span>出图路径</span>
+                        <span>{c.poster.route}</span>
                         <strong>
-                          {posterBackground?.image_model ?? (posterHandoff ? "龙虾/Codex" : "未生成")}
+                          {posterBackground?.image_model ?? (posterHandoff ? c.poster.viaOpenClaw : c.poster.notGenerated)}
                         </strong>
                       </div>
                       <div>
-                        <span>主题</span>
+                        <span>{c.poster.theme}</span>
                         <strong>{posterBrief?.brief.theme ?? posterTheme}</strong>
                       </div>
                       <div>
-                        <span>校验</span>
-                        <strong>{posterVerification ? (posterVerification.ok ? "通过" : "待修正") : "未校验"}</strong>
+                        <span>{c.poster.verification}</span>
+                        <strong>{posterVerification ? (posterVerification.ok ? c.poster.passed : c.poster.needsFix) : c.poster.notChecked}</strong>
                       </div>
                     </div>
                     {posterHandoff && (
                       <div className="poster-handoff">
-                        <div>
-                          <span>已复制给龙虾/Codex</span>
-                          <p>
-                            任务包包含商品事实、{posterHandoff.source_images.length} 张图片 URL 和海报约束；使用龙虾自己的登录账号生成，不需要在本机填写 OpenAI API Key。
-                          </p>
+                      <div>
+                          <span>{c.poster.copiedTitle}</span>
+                          <p>{c.poster.copiedDescription(posterHandoff.source_images.length)}</p>
                         </div>
                         <button className="secondary-button" onClick={() => navigator.clipboard.writeText(posterHandoff.prompt)}>
-                          <Clipboard size={16} /> 再复制一次
+                          <Clipboard size={16} /> {c.poster.copyAgain}
                         </button>
                       </div>
                     )}
                     {posterBackground && (
                       <div className="poster-prompt">
-                        <span>背景提示词</span>
+                        <span>{c.poster.backgroundPrompt}</span>
                         <p>{posterBackground.revised_prompt ?? posterBackground.prompt}</p>
                       </div>
                     )}
@@ -1459,7 +1699,7 @@ function App() {
                         ))}
                         {posterVerification.mismatches.map((mismatch) => (
                           <p key={`${mismatch.field}-${mismatch.expected}`}>
-                            {mismatch.field}: 期望“{mismatch.expected}”，当前是“{mismatch.actual}”
+                            {c.poster.mismatch(mismatch.field, mismatch.expected, mismatch.actual)}
                           </p>
                         ))}
                       </div>
@@ -1475,8 +1715,8 @@ function App() {
           <div className="section-title">
             <Repeat2 />
             <div>
-              <h2>只读定时采集</h2>
-              <p>按固定间隔调用官方 Ozon read-only API；OpenClaw 只能提议，不能启用。</p>
+              <h2>{c.schedule.title}</h2>
+              <p>{c.schedule.description}</p>
             </div>
           </div>
           <div className="task-command">
@@ -1487,7 +1727,7 @@ function App() {
               type="number"
               value={scheduleInterval}
               onChange={(event) => setScheduleInterval(Number(event.target.value))}
-              title="采集间隔秒数"
+              title={c.schedule.intervalTitle}
             />
             <input
               min={1}
@@ -1495,36 +1735,36 @@ function App() {
               type="number"
               value={scheduleLimit}
               onChange={(event) => setScheduleLimit(Number(event.target.value))}
-              title="每次读取样本数量"
+              title={c.schedule.limitTitle}
             />
           </div>
           <div className="inline-actions">
             <button disabled={!canUseOzonReadTools} onClick={() => configureSchedule(true)}>
-              <Play size={18} /> 启用
+              <Play size={18} /> {c.schedule.enable}
             </button>
             <button onClick={() => configureSchedule(false)}>
-              <PauseCircle size={18} /> 停止
+              <PauseCircle size={18} /> {c.schedule.stop}
             </button>
             <button disabled={!canUseOzonReadTools} onClick={runScheduleNow}>
-              <RefreshCcw size={18} /> 立即采集
+              <RefreshCcw size={18} /> {c.schedule.runNow}
             </button>
           </div>
           {!canUseOzonReadTools && <p className="notice warn-text">{ozonReadGateMessage}</p>}
           <div className="status-list schedule-status">
             <div className="status-item">
-              <span>Status</span>
-              <strong>{schedule?.enabled ? "enabled" : "paused"}</strong>
+              <span>{c.schedule.status}</span>
+              <strong>{schedule?.enabled ? c.schedule.enabled : c.schedule.paused}</strong>
               <em className={schedule?.enabled ? "badge ok-badge" : "badge neutral-badge"}>
-                {schedule?.connector_mode ?? "mock"}
+                {schedule?.connector_mode ?? c.advanced.values.mock}
               </em>
             </div>
             <div className="status-item">
-              <span>Last count</span>
-              <strong>{schedule?.last_run?.product_count ?? "未运行"}</strong>
+              <span>{c.schedule.lastCount}</span>
+              <strong>{schedule?.last_run?.product_count ?? c.schedule.notRun}</strong>
             </div>
             <div className="status-item">
-              <span>Last sample</span>
-              <strong>{schedule?.last_run?.sample_size ?? "未运行"}</strong>
+              <span>{c.schedule.lastSample}</span>
+              <strong>{schedule?.last_run?.sample_size ?? c.schedule.notRun}</strong>
             </div>
           </div>
           {schedule?.last_error && <p className="notice warn-text">{schedule.last_error}</p>}
@@ -1539,35 +1779,35 @@ function App() {
           <div className="section-title">
             <Play />
             <div>
-              <h2>提案、审批、执行</h2>
-              <p>OpenClaw 只创建 dry-run 提案，本地操作员审批后才进入执行队列。</p>
+              <h2>{c.tasks.title}</h2>
+              <p>{c.tasks.description}</p>
             </div>
           </div>
           <div className="task-command">
             <select value={selectedOperation} onChange={(event) => setSelectedOperation(event.target.value)}>
-              <option value="ozon_update_price_mock">改价提案</option>
-              <option value="ozon_update_inventory_mock">改库存提案</option>
-              <option value="ozon_join_promotion_mock">参加促销提案</option>
-              <option value="draft_upload_mock">草稿上传预演</option>
-              <option value="import1688_mock">1688 导入预演</option>
+              <option value="ozon_update_price_mock">{c.tasks.operations.ozon_update_price_mock}</option>
+              <option value="ozon_update_inventory_mock">{c.tasks.operations.ozon_update_inventory_mock}</option>
+              <option value="ozon_join_promotion_mock">{c.tasks.operations.ozon_join_promotion_mock}</option>
+              <option value="draft_upload_mock">{c.tasks.operations.draft_upload_mock}</option>
+              <option value="import1688_mock">{c.tasks.operations.import1688_mock}</option>
             </select>
-            <button onClick={createDryRun}>创建 dry-run</button>
+            <button onClick={createDryRun}>{c.tasks.create}</button>
           </div>
           <div className="task-list">
-            {tasks.length === 0 && <p className="empty">还没有任务。先创建一个 dry-run。</p>}
+            {tasks.length === 0 && <p className="empty">{c.tasks.empty}</p>}
             {tasks.map((task) => (
               <article key={task.id}>
                 <div className="task-copy">
                   <span>{task.operation}</span>
                   <strong>{task.dry_run.summary}</strong>
-                  <p>{task.dry_run.warnings.join(" · ") || "No warnings"}</p>
+                  <p>{task.dry_run.warnings.join(" · ") || c.tasks.noWarnings}</p>
                   {task.receipt && <code>{task.receipt.result_summary}</code>}
                 </div>
                 <div className="task-actions">
-                  <em className={`state ${task.state}`}>{task.state}</em>
-                  <em>{task.risk}</em>
-                  {task.state === "pending_approval" && <button onClick={() => approve(task.id)}>审批</button>}
-                  {task.state === "queued" && <button onClick={() => execute(task.id)}>执行 dry-run</button>}
+                  <em className={`state ${task.state}`}>{taskStateLabel(task.state, c)}</em>
+                  <em>{taskRiskLabel(task.risk, c)}</em>
+                  {task.state === "pending_approval" && <button onClick={() => approve(task.id)}>{c.tasks.approve}</button>}
+                  {task.state === "queued" && <button onClick={() => execute(task.id)}>{c.tasks.execute}</button>}
                 </div>
               </article>
             ))}
@@ -1589,7 +1829,6 @@ function defaultRuntimeConfig(): RuntimeConfig {
     skill_api: DEFAULT_LOCAL_API,
     agent_api: DEFAULT_AGENT_API,
     local_token: DEFAULT_LOCAL_TOKEN,
-    openclaw_token: DEFAULT_OPENCLAW_TOKEN,
     connector_mode: import.meta.env.DEV ? "mock" : "real",
     sidecar_pid: null,
     sidecar_status: "external",
@@ -1597,7 +1836,7 @@ function defaultRuntimeConfig(): RuntimeConfig {
     sidecar_last_started_at_ms: null,
     sidecar_last_exit: null,
     sidecar_last_error: null,
-    sidecar_log_path: "not available outside the desktop app"
+    sidecar_log_path: ""
   };
 }
 
@@ -1615,15 +1854,17 @@ async function restartRuntimeConfig(): Promise<RuntimeConfig> {
   return await invoke<RuntimeConfig>("restart_local_node");
 }
 
-function sidecarSummary(runtime: RuntimeConfig) {
+type LocalNodeCopy = ReturnType<typeof copyFor>;
+
+function sidecarSummary(runtime: RuntimeConfig, c: LocalNodeCopy) {
   if (runtime.sidecar_status === "running" && runtime.sidecar_pid) {
     return `pid ${runtime.sidecar_pid}`;
   }
   if (runtime.sidecar_status === "external") {
-    return "已连接";
+    return c.sidecar.external;
   }
   if (runtime.sidecar_status === "blocked") {
-    return "需处理";
+    return c.sidecar.blocked;
   }
   return runtime.sidecar_status || "external";
 }
@@ -1632,58 +1873,80 @@ function isConnectedRuntime(runtime: RuntimeConfig) {
   return runtime.sidecar_status === "running" || runtime.sidecar_status === "external";
 }
 
-function sidecarStatusLabel(runtime: RuntimeConfig) {
+function sidecarStatusLabel(runtime: RuntimeConfig, c: LocalNodeCopy) {
   if (runtime.sidecar_status === "running") {
     return runtime.sidecar_restart_count > 0
-      ? `本地节点运行中，已自恢复 ${runtime.sidecar_restart_count} 次`
-      : "本地节点运行中";
+      ? c.sidecar.recovered(runtime.sidecar_restart_count)
+      : c.sidecar.running;
   }
   if (runtime.sidecar_status === "failed") {
-    return "本地节点启动失败";
+    return c.sidecar.failed;
   }
   if (runtime.sidecar_status === "restarting") {
-    return "本地节点正在重启";
+    return c.sidecar.restarting;
   }
   if (runtime.sidecar_status === "external") {
-    return "本地节点已连接";
+    return c.sidecar.connected;
   }
   if (runtime.sidecar_status === "blocked") {
-    return "本地节点端口被占用";
+    return c.sidecar.portBlocked;
   }
-  return "本地节点未确认运行";
+  return c.sidecar.unknown;
 }
 
-function sidecarDiagnostic(runtime: RuntimeConfig) {
+function sidecarDiagnostic(runtime: RuntimeConfig, c: LocalNodeCopy) {
+  const logPath = runtime.sidecar_log_path || c.sidecar.logUnavailable;
   if (runtime.sidecar_last_error) {
-    return `${runtime.sidecar_last_error} · log ${runtime.sidecar_log_path}`;
+    if (runtime.sidecar_last_error === "existing_node_agent_port_not_ready") {
+      return c.sidecar.existingAgentPortNotReady(logPath);
+    }
+    if (runtime.sidecar_last_error === "existing_node_token_rejected") {
+      return c.sidecar.existingTokenRejected(logPath);
+    }
+    return c.sidecar.lastError(runtime.sidecar_last_error, logPath);
   }
   if (runtime.sidecar_last_exit) {
-    return `${runtime.sidecar_last_exit} · log ${runtime.sidecar_log_path}`;
+    return c.sidecar.lastExit(runtime.sidecar_last_exit, logPath);
   }
   if (runtime.sidecar_status === "running" && runtime.sidecar_pid) {
     const started = runtime.sidecar_last_started_at_ms
       ? new Date(runtime.sidecar_last_started_at_ms).toLocaleString()
-      : "刚刚";
-    return `监听 127.0.0.1:8790 / 17870，启动时间 ${started}，日志 ${runtime.sidecar_log_path}`;
+      : c.sidecar.justNow;
+    return c.sidecar.runningDiagnostic(started, logPath);
   }
   if (runtime.sidecar_status === "external") {
-    return `检测到已有 Ozon Rust Local 节点正在监听 127.0.0.1:8790 / 17870，桌面端已直接连接。日志 ${runtime.sidecar_log_path}`;
+    return c.sidecar.externalDiagnostic(logPath);
   }
-  return "桌面端会托管 local-node；若端口被占用或 sidecar 缺失，这里会显示具体错误。";
+  return c.sidecar.defaultDiagnostic;
 }
 
-function shortCommit(value?: string) {
+function validationMessage(validation: ValidationResult, c: LocalNodeCopy) {
+  return validation.connector_mode === "real" ? c.advanced.validationReal : c.advanced.validationMock;
+}
+
+function taskStateLabel(state: string, c: LocalNodeCopy) {
+  return c.tasks.states[state as keyof typeof c.tasks.states] ?? state;
+}
+
+function taskRiskLabel(risk: string, c: LocalNodeCopy) {
+  return c.tasks.risks[risk as keyof typeof c.tasks.risks] ?? risk;
+}
+
+function shortCommit(value: string | undefined, fallback: string) {
   if (!value || value === "local-build") {
-    return value ?? "unknown";
+    return value ?? fallback;
   }
   return value.slice(0, 8);
 }
 
-function maskSecret(value: string) {
-  if (value.length <= 12) {
-    return "configured";
-  }
-  return `${value.slice(0, 4)}...${value.slice(-4)}`;
+function isBindingUrlSafetyError(errorText: string) {
+  const normalized = errorText.toLowerCase();
+  return (
+    normalized.includes("binding url") ||
+    normalized.includes("not allowed") ||
+    normalized.includes("pairing fragment") ||
+    normalized.includes("pairing code")
+  );
 }
 
 function parseProductLookupInput(value: string): { offer_id?: string; product_id?: string; sku?: string } | null {

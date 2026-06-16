@@ -324,6 +324,20 @@ impl AppConfig {
         if production_like && self.admin_token.len() < 24 {
             anyhow::bail!("OZON_SUITE_ADMIN_TOKEN must be at least 24 bytes in production");
         }
+        // Reject the .env*.example placeholder values: they satisfy the length checks above
+        // but are publicly known, so deploying them verbatim would ship guessable secrets.
+        if production_like && !dev_override {
+            for (name, value) in [
+                ("OZON_SUITE_JWT_SECRET", &self.jwt_secret),
+                ("OZON_SUITE_ADMIN_TOKEN", &self.admin_token),
+            ] {
+                if value.starts_with("replace-with") || value.starts_with("change-this") {
+                    anyhow::bail!(
+                        "{name} is still set to a placeholder value; generate a real high-entropy secret before running in production"
+                    );
+                }
+            }
+        }
         if production_like && !self.cors_allowed_origins_configured && !dev_override {
             anyhow::bail!(
                 "OZON_SUITE_CORS_ALLOWED_ORIGINS must be set before running cloud-api in production or on a non-loopback bind"
@@ -1427,9 +1441,13 @@ fn decrypt_wechatpay_resource(
     let ciphertext = BASE64_STANDARD
         .decode(&resource.ciphertext)
         .map_err(|_| ApiError::bad_request("invalid WeChat Pay resource ciphertext"))?;
+    let nonce_bytes = resource.nonce.as_bytes();
+    if nonce_bytes.len() != 12 {
+        return Err(ApiError::bad_request("invalid WeChat Pay resource nonce"));
+    }
     let plaintext = cipher
         .decrypt(
-            Nonce::from_slice(resource.nonce.as_bytes()),
+            Nonce::from_slice(nonce_bytes),
             Payload {
                 msg: &ciphertext,
                 aad: resource.associated_data.as_deref().unwrap_or("").as_bytes(),
@@ -1853,7 +1871,9 @@ async fn activate_device(
     let device = upsert_device(
         &mut tx,
         Device {
-            id: DeviceId::new(),
+            // Deterministic, user+machine-bound id so the issued lease binds to this device and
+            // cannot be replayed on another machine (the local node recomputes and verifies it).
+            id: ozon_domain::device_id_for(claims.sub, &input.fingerprint),
             tenant_id: claims.tenant_id,
             user_id: claims.sub,
             name: input.name,

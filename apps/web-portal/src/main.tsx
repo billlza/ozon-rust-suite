@@ -25,6 +25,14 @@ import {
 } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import { CustomerGuide } from "./CustomerGuide";
+import {
+  applyDocumentLocale,
+  getCurrentLocale,
+  getPortalCopy,
+  portalMessageTone,
+  useI18n
+} from "./i18n";
+import { LanguageSwitch } from "./LanguageSwitch";
 import "./styles.css";
 
 const API_BASE = normalizeBaseUrl(import.meta.env.VITE_CLOUD_API ?? defaultCloudApiBase());
@@ -43,14 +51,23 @@ const SKYBRIDGE_AUTH_BASE = normalizeBaseUrl(
     import.meta.env.VITE_SUPABASE_URL ??
     (import.meta.env.DEV ? DEFAULT_SKYBRIDGE_SUPABASE_URL : "")
 );
-const SKYBRIDGE_ANON_KEY =
+const SKYBRIDGE_PUBLIC_AUTH_KEY =
+  import.meta.env.VITE_SKYBRIDGE_SUPABASE_PUBLISHABLE_KEY ??
+  import.meta.env.VITE_SKYBRIDGE_PUBLISHABLE_KEY ??
   import.meta.env.VITE_SKYBRIDGE_SUPABASE_ANON_KEY ??
   import.meta.env.VITE_SUPABASE_ANON_KEY ??
   "";
-const SKYBRIDGE_AUTH_CONFIGURED = Boolean(SKYBRIDGE_AUTH_BASE && SKYBRIDGE_ANON_KEY);
+const SKYBRIDGE_AUTH_CONFIGURED = Boolean(SKYBRIDGE_AUTH_BASE && SKYBRIDGE_PUBLIC_AUTH_KEY.trim());
 const DIRECT_SKYBRIDGE_AUTH_ENABLED =
   SKYBRIDGE_AUTH_CONFIGURED &&
-  !["0", "false", "no"].includes((import.meta.env.VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH ?? "").toLowerCase());
+  ["1", "true", "yes"].includes((import.meta.env.VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH ?? "").toLowerCase());
+const SKYBRIDGE_PHONE_SMS_PROVIDER_READY = ["1", "true", "yes"].includes(
+  (import.meta.env.VITE_SKYBRIDGE_PHONE_SMS_PROVIDER_READY ?? "").toLowerCase()
+);
+const SKYBRIDGE_PHONE_AUTH_ENABLED =
+  DIRECT_SKYBRIDGE_AUTH_ENABLED &&
+  ["1", "true", "yes"].includes((import.meta.env.VITE_ENABLE_SKYBRIDGE_PHONE_AUTH ?? "").toLowerCase()) &&
+  SKYBRIDGE_PHONE_SMS_PROVIDER_READY;
 const DEV_NEBULA_OAUTH_BASE = import.meta.env.DEV ? "http://127.0.0.1:8788" : "";
 const DEV_NEBULA_CLIENT_ID = import.meta.env.DEV ? "ozon_rust_suite_portal" : "";
 const NEBULA_OAUTH_BASE = normalizeBaseUrl(
@@ -301,13 +318,6 @@ type SkybridgeAuthSession = {
   refresh_token?: string;
 };
 
-type SkybridgeCurrentUserProfile = {
-  id?: string;
-  email?: string | null;
-  phone?: string | null;
-  user_metadata?: Record<string, unknown> | null;
-};
-
 type NebulaOAuthFlow = "login" | "register";
 
 type NebulaOAuthSession = {
@@ -340,6 +350,8 @@ declare global {
 }
 
 function App() {
+  const { copy, locale, setLocale } = useI18n();
+  const portalCopy = copy.portal;
   const [authDialogMode, setAuthDialogMode] = useState<AuthMode | null>(null);
   const [authMode, setAuthMode] = useState<AuthMode>("login");
   const [authMethod, setAuthMethod] = useState<LoginMethod>("email");
@@ -353,7 +365,7 @@ function App() {
   const [skybridgeAccessToken, setSkybridgeAccessToken] = useState("");
   const [turnstileToken, setTurnstileToken] = useState("");
   const [turnstileStatus, setTurnstileStatus] = useState(
-    SKYBRIDGE_TURNSTILE_CONFIGURED ? "等待安全验证" : "无需验证"
+    SKYBRIDGE_TURNSTILE_CONFIGURED ? portalCopy.messages.turnstileWaiting : portalCopy.messages.turnstileNotRequired
   );
   const turnstileContainerRef = useRef<HTMLDivElement | null>(null);
   const turnstileWidgetId = useRef<string | null>(null);
@@ -367,8 +379,8 @@ function App() {
 
   const [session, setSession] = useState<Session | null>(() => loadSession());
   const [authState, dispatchAuth] = useReducer(authReducer, {
-    phase: loadSession() ? "authenticated" : "idle",
-    message: loadSession() ? "已恢复本地会话，正在等待刷新" : "请选择邮箱或手机号登录",
+    phase: session ? "authenticated" : "idle",
+    message: session ? portalCopy.messages.restoredSession : portalCopy.messages.chooseLogin,
     requestId: 0
   });
   const [operationStatus, setOperationStatus] = useState<string | null>(null);
@@ -381,14 +393,14 @@ function App() {
   const [paymentSession, setPaymentSession] = useState<PaymentSession | null>(null);
   const [cardKey, setCardKey] = useState("");
   const [entitlements, setEntitlements] = useState<Entitlement[]>([]);
-  const [deviceName, setDeviceName] = useState("我的电脑");
+  const [deviceName, setDeviceName] = useState(portalCopy.defaults.deviceName);
   const [deviceFingerprint, setDeviceFingerprint] = useState(() => defaultFingerprint());
   const [device, setDevice] = useState<Device | null>(null);
   const [lease, setLease] = useState<Lease | null>(null);
   const [downloads, setDownloads] = useState<Downloads | null>(null);
   const [localNode, setLocalNode] = useState<LocalNodeProbe>({
     phase: "idle",
-    message: "登录后会检测电脑助手是否打开"
+    message: portalCopy.messages.localNodeIdle
   });
 
   const activeEntitlement = useMemo(
@@ -417,9 +429,9 @@ function App() {
     [localPlatform, localNodeMacDmgUrl, localNodeMsiUrl, localNodeExeUrl]
   );
   const primaryDownloadOption = localNodeDownloadOptions[0] ?? null;
-  const releaseVersion = releaseManifest?.version ?? "待同步";
-  const releaseCommit = releaseManifest?.commit ? shortCommit(releaseManifest.commit) : "待同步";
-  const releaseChecksum = releaseManifest ? releaseChecksumLabel(releaseManifest) : "等待 release-manifest.json";
+  const releaseVersion = releaseManifest?.version ?? portalCopy.defaults.releasePending;
+  const releaseCommit = releaseManifest?.commit ? shortCommit(releaseManifest.commit) : portalCopy.defaults.releasePending;
+  const releaseChecksum = releaseManifest ? releaseChecksumLabel(releaseManifest) : portalCopy.defaults.releaseChecksumPending;
   const openclawPluginUrl = downloads?.openclaw_plugin ? absolutePortalUrl(downloads.openclaw_plugin) : "";
   const localManifestUrl = localNode.portal?.manifest_url ?? `${LOCAL_NODE_API}/openclaw/manifest`;
   const canOpenLocalConsole = Boolean(LOCAL_CONSOLE_URL);
@@ -430,22 +442,35 @@ function App() {
   const computerAuthorized = localLeaseStatus?.valid === true;
   const storeCredentialsReady = localNode.portal?.ozon?.configured === true;
   const posterConfigReady = localNode.portal?.openai?.configured === true;
-  const directAuthUnavailableMessage = "邮箱/手机号入口尚未开通，请联系运营支持。";
+  const directAuthUnavailableMessage = portalCopy.messages.directAuthUnavailable;
+  const directAuthContext = SKYBRIDGE_PHONE_AUTH_ENABLED
+    ? portalCopy.auth.contextDirect
+    : portalCopy.auth.contextDirectEmailOnly;
+  const directAuthText = SKYBRIDGE_PHONE_AUTH_ENABLED ? portalCopy.auth.directText : portalCopy.auth.directTextEmailOnly;
+  const directAuthTitle =
+    authMode === "register"
+      ? SKYBRIDGE_PHONE_AUTH_ENABLED
+        ? portalCopy.auth.directTitleRegister
+        : portalCopy.auth.directTitleRegisterEmailOnly
+      : SKYBRIDGE_PHONE_AUTH_ENABLED
+        ? portalCopy.auth.directTitleLogin
+        : portalCopy.auth.directTitleLoginEmailOnly;
+  const heroMeta = SKYBRIDGE_PHONE_AUTH_ENABLED ? portalCopy.hero.meta : portalCopy.hero.emailOnlyMeta;
   const authSubmitText =
     authMethod === "phone"
       ? authMode === "register"
-        ? "手机号注册"
-        : "手机号登录"
+        ? portalCopy.auth.submit.phoneRegister
+        : portalCopy.auth.submit.phoneLogin
       : authMethod === "nebula"
-        ? "账号编号登录"
+        ? portalCopy.auth.submit.nebulaLogin
       : authMode === "register"
-        ? "邮箱注册"
-        : "邮箱登录";
-  const authDialogTitle = authMode === "register" ? "创建账号" : "登录工作台";
+        ? portalCopy.auth.submit.emailRegister
+        : portalCopy.auth.submit.emailLogin;
+  const authDialogTitle = authMode === "register" ? portalCopy.auth.titleRegister : portalCopy.auth.titleLogin;
   const authDialogDescription =
     authMode === "register"
-      ? "账号创建后，按页面提示开通服务、安装电脑助手并连接店铺。"
-      : "登录后继续完成开通、安装和电脑授权。";
+      ? portalCopy.auth.descriptionRegister
+      : portalCopy.auth.descriptionLogin;
   const shouldShowAuthDialogStatus =
     authBusy || authState.phase === "failed" || authState.phase === "authenticated" || Boolean(operationStatus);
   const statusTone = statusMessageTone(statusMessage, authState.phase, authBusy);
@@ -531,8 +556,8 @@ function App() {
   }
 
   function commitSession(nextSession: Session) {
-    setSession(nextSession);
     localStorage.setItem(SESSION_KEY, JSON.stringify(nextSession));
+    setSession(nextSession);
     setAuthDialogMode(null);
   }
 
@@ -551,7 +576,7 @@ function App() {
     setAuthMode("login");
     setAuthDialogMode("login");
     setOperationStatus(null);
-    dispatchAuth({ type: "failure", message: "登录已过期，请重新登录", requestId });
+    dispatchAuth({ type: "failure", message: portalCopy.messages.sessionExpired, requestId });
   }
 
   function openAuthDialog(mode: AuthMode) {
@@ -576,13 +601,13 @@ function App() {
       window.turnstile.reset(turnstileWidgetId.current);
     }
     turnstileTokenRef.current = "";
-    setTurnstileStatus(SKYBRIDGE_TURNSTILE_CONFIGURED ? "等待安全验证" : "无需验证");
+    setTurnstileStatus(SKYBRIDGE_TURNSTILE_CONFIGURED ? portalCopy.messages.turnstileWaiting : portalCopy.messages.turnstileNotRequired);
   }
 
   async function startNebulaOAuth(flow: NebulaOAuthFlow) {
     const requestId = beginAuth(
       "authenticating_skybridge",
-      `正在打开统一身份${flow === "register" ? "注册" : "登录"}页`
+      portalCopy.messages.openingUnified(flow)
     );
     try {
       await redirectToNebulaOAuth(flow);
@@ -590,7 +615,7 @@ function App() {
       if (isCurrentAuth(requestId)) {
         dispatchAuth({
           type: "failure",
-          message: `统一授权启动失败：${errorMessage(error)}`,
+          message: portalCopy.messages.unifiedStartFailed(errorMessage(error)),
           requestId
         });
       }
@@ -606,13 +631,13 @@ function App() {
       return false;
     }
 
-    const requestId = beginAuth("creating_service_session", "正在完成统一身份授权回调");
+    const requestId = beginAuth("creating_service_session", portalCopy.messages.completingUnifiedCallback);
     const authError = currentUrl.searchParams.get("error_description") ?? currentUrl.searchParams.get("error");
     if (!storedSession) {
       replaceLocationPath("/");
       dispatchAuth({
         type: "failure",
-        message: "授权上下文已失效，请从门户重新发起登录",
+        message: portalCopy.messages.unifiedContextExpired,
         requestId
       });
       return true;
@@ -623,7 +648,7 @@ function App() {
       replaceLocationPath("/");
       dispatchAuth({
         type: "failure",
-        message: `统一身份授权失败：${authError}`,
+        message: portalCopy.messages.unifiedAuthFailed(authError),
         requestId
       });
       return true;
@@ -636,7 +661,7 @@ function App() {
       replaceLocationPath("/");
       dispatchAuth({
         type: "failure",
-        message: "授权回调缺少 code/state，请重新登录",
+        message: portalCopy.messages.unifiedCallbackMissing,
         requestId
       });
       return true;
@@ -647,7 +672,7 @@ function App() {
       replaceLocationPath("/");
       dispatchAuth({
         type: "failure",
-        message: "授权状态校验失败，请重新登录",
+        message: portalCopy.messages.unifiedStateFailed,
         requestId
       });
       return true;
@@ -664,7 +689,7 @@ function App() {
       if (isCurrentAuth(requestId)) {
         dispatchAuth({
           type: "failure",
-          message: `统一身份登录失败：${errorMessage(error)}`,
+          message: portalCopy.messages.unifiedLoginFailed(errorMessage(error)),
           requestId
         });
       }
@@ -682,11 +707,25 @@ function App() {
       });
       return;
     }
-    if (!skybridgeIdentifier.trim() || (authMethod === "phone" ? !skybridgePhoneCode.trim() : !skybridgePassword)) {
-      const requestId = beginAuth("failed", authMethod === "phone" ? "请填写手机号和短信验证码" : `请填写${methodLabel(authMethod)}和密码`);
+    if (authMethod === "phone" && !SKYBRIDGE_PHONE_AUTH_ENABLED) {
+      const message = portalCopy.auth.phoneAuthUnavailable;
+      const requestId = beginAuth("failed", message);
       dispatchAuth({
         type: "failure",
-        message: authMethod === "phone" ? "请填写手机号和短信验证码" : `请填写${methodLabel(authMethod)}和密码`,
+        message,
+        requestId
+      });
+      return;
+    }
+    if (!skybridgeIdentifier.trim() || (authMethod === "phone" ? !skybridgePhoneCode.trim() : !skybridgePassword)) {
+      const message =
+        authMethod === "phone"
+          ? portalCopy.messages.fillPhoneAndCode
+          : portalCopy.messages.fillMethodAndPassword(methodLabel(authMethod));
+      const requestId = beginAuth("failed", message);
+      dispatchAuth({
+        type: "failure",
+        message,
         requestId
       });
       return;
@@ -694,15 +733,23 @@ function App() {
 
     const requestId = beginAuth(
       "authenticating_skybridge",
-      `${authMode === "register" ? "正在注册" : "正在验证"}${methodLabel(authMethod)}`
+      portalCopy.messages.authenticatingMethod(authMode, methodLabel(authMethod))
     );
     try {
       const normalizedIdentifier =
         authMethod === "phone" ? normalizePhoneForSkybridge(skybridgeIdentifier) : skybridgeIdentifier.trim();
       if (authMethod === "phone" && !isValidSkybridgePhone(normalizedIdentifier)) {
-        const message = "请填写有效手机号，例如 +8613800138000";
+        const message = portalCopy.messages.invalidPhone;
         dispatchAuth({ type: "failure", message, requestId });
         return;
+      }
+
+      if (authMode === "register" && authMethod === "phone") {
+        if (!skybridgeName.trim() || !skybridgePhoneEmail.trim()) {
+          const message = portalCopy.messages.phoneRegisterNeedsProfile;
+          dispatchAuth({ type: "failure", message, requestId });
+          return;
+        }
       }
 
       const skybridgeSession = await skybridgePasswordAuth({
@@ -715,11 +762,6 @@ function App() {
         captchaToken: turnstileToken
       });
       if (authMode === "register" && authMethod === "phone") {
-        if (!skybridgeName.trim() || !skybridgePhoneEmail.trim()) {
-          const message = "手机号注册需要填写昵称和联系邮箱";
-          dispatchAuth({ type: "failure", message, requestId });
-          return;
-        }
         await skybridgeUpdatePhoneRegistrationProfile({
           accessToken: skybridgeSession.access_token,
           phone: normalizedIdentifier,
@@ -747,7 +789,7 @@ function App() {
         resetTurnstileWidget();
         dispatchAuth({
           type: "failure",
-          message: `账号登录失败：${skybridgeDirectAuthFailureMessage(error)}`,
+          message: portalCopy.messages.accountLoginFailed(skybridgeDirectAuthFailureMessage(error)),
           requestId
         });
       }
@@ -763,30 +805,34 @@ function App() {
   }
 
   async function sendSkybridgePhoneCode() {
+    if (!SKYBRIDGE_PHONE_AUTH_ENABLED) {
+      setSkybridgeOtpStatus(portalCopy.auth.phoneAuthUnavailable);
+      return;
+    }
     if (!SKYBRIDGE_AUTH_CONFIGURED) {
       setSkybridgeOtpStatus(directAuthUnavailableMessage);
       return;
     }
     if (!skybridgeIdentifier.trim()) {
-      setSkybridgeOtpStatus("请先填写手机号");
+      setSkybridgeOtpStatus(portalCopy.messages.fillPhoneFirst);
       return;
     }
     const normalizedPhone = normalizePhoneForSkybridge(skybridgeIdentifier);
     if (!isValidSkybridgePhone(normalizedPhone)) {
-      setSkybridgeOtpStatus("请填写有效手机号，例如 +8613800138000");
+      setSkybridgeOtpStatus(portalCopy.messages.invalidPhone);
       return;
     }
     if (authMode === "register" && (!skybridgeName.trim() || !skybridgePhoneEmail.trim())) {
-      setSkybridgeOtpStatus("手机号注册需要先填写昵称和联系邮箱");
+      setSkybridgeOtpStatus(portalCopy.messages.phoneRegisterNeedsProfileBeforeCode);
       return;
     }
     if (directAuthNeedsTurnstile) {
-      setSkybridgeOtpStatus("请先完成安全验证，再获取短信验证码");
+      setSkybridgeOtpStatus(portalCopy.messages.completeSecurityBeforeCode);
       return;
     }
 
     setSkybridgeOtpBusy(true);
-    setSkybridgeOtpStatus("正在请求短信验证码");
+    setSkybridgeOtpStatus(portalCopy.messages.requestingSmsCode);
     try {
       await skybridgeSendPhoneOtp({
         phone: normalizedPhone,
@@ -794,9 +840,9 @@ function App() {
         name: skybridgeName,
         captchaToken: turnstileToken
       });
-      setSkybridgeOtpStatus("短信验证码已发送，请查收后继续");
+      setSkybridgeOtpStatus(portalCopy.messages.smsCodeSent);
     } catch (error) {
-      setSkybridgeOtpStatus(`短信验证码发送失败：${skybridgeDirectAuthFailureMessage(error)}`);
+      setSkybridgeOtpStatus(portalCopy.messages.smsCodeFailed(skybridgeDirectAuthFailureMessage(error)));
     } finally {
       setSkybridgeOtpBusy(false);
     }
@@ -804,11 +850,11 @@ function App() {
 
   async function createManualSkybridgeServiceSession() {
     if (!skybridgeAccessToken.trim()) {
-      const requestId = beginAuth("failed", "请粘贴已登录会话 token");
-      dispatchAuth({ type: "failure", message: "请粘贴已登录会话 token", requestId });
+      const requestId = beginAuth("failed", portalCopy.messages.pasteSessionToken);
+      dispatchAuth({ type: "failure", message: portalCopy.messages.pasteSessionToken, requestId });
       return;
     }
-    const requestId = beginAuth("creating_service_session", "正在用身份会话创建 Ozon 服务会话");
+    const requestId = beginAuth("creating_service_session", portalCopy.messages.creatingFromIdentityToken);
     try {
       await createSkybridgeServiceSession(skybridgeAccessToken.trim(), requestId);
       if (isCurrentAuth(requestId)) {
@@ -818,7 +864,7 @@ function App() {
       if (isCurrentAuth(requestId)) {
         dispatchAuth({
           type: "failure",
-          message: `身份会话交换失败：${errorMessage(error)}`,
+          message: portalCopy.messages.identityExchangeFailed(errorMessage(error)),
           requestId
         });
       }
@@ -829,7 +875,7 @@ function App() {
     dispatchAuth({
       type: "begin",
       phase: "creating_service_session",
-      message: "正在创建 Ozon 服务会话",
+      message: portalCopy.messages.creatingServiceSession,
       requestId
     });
     const data = await api<{ token: string; user: User }>("/auth/skybridge", {
@@ -841,14 +887,14 @@ function App() {
     commitSession(nextSession);
     dispatchAuth({
       type: "success",
-      message: `账号已登录：${displayLoginAlias(data.user)}`,
+      message: portalCopy.messages.accountLoggedIn(displayLoginAlias(data.user)),
       requestId
     });
     await refreshAccount(nextSession.token, requestId);
   }
 
   async function authenticateLocalDev() {
-    const requestId = beginAuth("authenticating_local_dev", "正在使用本地开发兜底入口");
+    const requestId = beginAuth("authenticating_local_dev", portalCopy.messages.authenticatingLocalDev);
     const path = localMode === "register" ? "/auth/register" : "/auth/login";
     const body = buildLocalAuthBody(localMode, localMethod, localIdentifier, localPassword, localName);
     try {
@@ -861,7 +907,7 @@ function App() {
       commitSession(nextSession);
       dispatchAuth({
         type: "success",
-        message: `local_dev 会话已建立：${data.user.nebula_id}`,
+        message: portalCopy.messages.localDevSessionCreated(data.user.nebula_id),
         requestId
       });
       await refreshAccount(nextSession.token, requestId);
@@ -869,7 +915,7 @@ function App() {
       if (isCurrentAuth(requestId)) {
         dispatchAuth({
           type: "failure",
-          message: `本地开发入口失败：${errorMessage(error)}`,
+          message: portalCopy.messages.localDevFailed(errorMessage(error)),
           requestId
         });
       }
@@ -878,16 +924,16 @@ function App() {
 
   async function refreshAccount(token = session?.token, requestId?: number) {
     if (!token) {
-      const nextRequestId = beginAuth("failed", "请先登录账号");
-      dispatchAuth({ type: "failure", message: "请先登录账号", requestId: nextRequestId });
+      const nextRequestId = beginAuth("failed", portalCopy.messages.loginRequired);
+      dispatchAuth({ type: "failure", message: portalCopy.messages.loginRequired, requestId: nextRequestId });
       return;
     }
-    const currentRequestId = requestId ?? beginAuth("refreshing", "正在刷新账户状态");
+    const currentRequestId = requestId ?? beginAuth("refreshing", portalCopy.messages.refreshingAccount);
     if (requestId) {
       dispatchAuth({
         type: "begin",
         phase: "refreshing",
-        message: "正在刷新账户状态",
+        message: portalCopy.messages.refreshingAccount,
         requestId
       });
     }
@@ -904,7 +950,7 @@ function App() {
       if (downloadData) {
         setDownloads(downloadData);
       }
-      dispatchAuth({ type: "success", message: "账户状态已刷新", requestId: currentRequestId });
+      dispatchAuth({ type: "success", message: portalCopy.messages.accountRefreshed, requestId: currentRequestId });
     } catch (error) {
       if (isCurrentAuth(currentRequestId)) {
         if (isInvalidSessionError(error)) {
@@ -913,7 +959,7 @@ function App() {
         }
         dispatchAuth({
           type: "failure",
-          message: `账户刷新失败：${errorMessage(error)}`,
+          message: portalCopy.messages.accountRefreshFailed(errorMessage(error)),
           requestId: currentRequestId
         });
       }
@@ -925,12 +971,12 @@ function App() {
     authRequestId.current = requestId;
     resetSessionState();
     setOperationStatus(null);
-    dispatchAuth({ type: "signed_out", message: "已退出登录", requestId });
+    dispatchAuth({ type: "signed_out", message: portalCopy.messages.signedOut, requestId });
   }
 
   async function createOrder() {
     if (!session) {
-      setOperationStatus("请先登录账号");
+      setOperationStatus(portalCopy.messages.loginRequired);
       openAuthDialog("login");
       return;
     }
@@ -942,30 +988,34 @@ function App() {
       setOrder(data.order);
       setPaymentSession(data.payment ?? null);
       if (data.payment?.checkout_url) {
-        setOperationStatus("订单已创建，正在打开支付页");
+        setOperationStatus(portalCopy.messages.orderCreatedOpeningPayment);
         window.location.assign(data.payment.checkout_url);
         return;
       }
-      setOperationStatus(data.payment?.message ?? "订单已创建，请按支付备注完成确认");
+      setOperationStatus(data.payment?.message ?? portalCopy.messages.orderCreatedManual);
     } catch (error) {
-      setOperationStatus(`创建订单失败：${errorMessage(error)}`);
+      setOperationStatus(portalCopy.messages.createOrderFailed(errorMessage(error)));
     }
   }
 
   async function copyOrderInfo() {
     if (!order) {
-      setOperationStatus("还没有可复制的订单");
+      setOperationStatus(portalCopy.messages.noOrderToCopy);
       return;
     }
-    await navigator.clipboard.writeText(
-      `申请编号: ${order.id}\n付款方式: ${paymentProviderLabel(order.payment_provider)}\n付款备注: ${order.payment_reference}`
-    );
-    setOperationStatus("申请信息已复制");
+    try {
+      await copyText(
+        `${portalCopy.console.orderDetails.id}: ${order.id}\n${portalCopy.console.orderDetails.provider}: ${paymentProviderLabel(order.payment_provider)}\n${portalCopy.console.orderDetails.paymentReference}: ${order.payment_reference}`
+      );
+      setOperationStatus(portalCopy.messages.orderInfoCopied);
+    } catch {
+      setOperationStatus(portalCopy.messages.copyFailed);
+    }
   }
 
   async function refreshOrder() {
     if (!order) {
-      setOperationStatus("还没有可刷新的订单");
+      setOperationStatus(portalCopy.messages.noOrderToRefresh);
       return;
     }
     try {
@@ -975,16 +1025,16 @@ function App() {
       setOperationStatus(
         data.order.status === "confirmed"
           ? confirmedOrderMessage(data.order)
-          : `开通状态已刷新：${orderStatusLabel(data.order.status)}`
+          : portalCopy.messages.orderStatusRefreshed(orderStatusLabel(data.order.status))
       );
     } catch (error) {
-      setOperationStatus(`刷新订单失败：${errorMessage(error)}`);
+      setOperationStatus(portalCopy.messages.refreshOrderFailed(errorMessage(error)));
     }
   }
 
   async function redeem() {
     if (!session || !cardKey.trim()) {
-      setOperationStatus("需要登录并填写开通码");
+      setOperationStatus(portalCopy.messages.redeemNeedsLoginAndCode);
       return;
     }
     try {
@@ -993,16 +1043,16 @@ function App() {
         body: JSON.stringify({ card_key: cardKey.trim() })
       });
       setCardKey("");
-      setOperationStatus("开通码已使用，服务已开通");
+      setOperationStatus(portalCopy.messages.cardRedeemed);
       await refreshAccount();
     } catch (error) {
-      setOperationStatus(`开通失败：${errorMessage(error)}`);
+      setOperationStatus(portalCopy.messages.redeemFailed(errorMessage(error)));
     }
   }
 
   async function activateDevice() {
     if (!session) {
-      setOperationStatus("请先登录账号");
+      setOperationStatus(portalCopy.messages.loginRequired);
       openAuthDialog("login");
       return;
     }
@@ -1013,15 +1063,15 @@ function App() {
       });
       setDevice(data.device);
       setLease(null);
-      setOperationStatus("这台电脑已加入你的账号");
+      setOperationStatus(portalCopy.messages.deviceActivated);
     } catch (error) {
-      setOperationStatus(`授权这台电脑失败：${errorMessage(error)}`);
+      setOperationStatus(portalCopy.messages.deviceActivateFailed(errorMessage(error)));
     }
   }
 
   async function issueLease() {
     if (!session || !device) {
-      setOperationStatus("需要先登录并绑定设备");
+      setOperationStatus(portalCopy.messages.needsLoginAndDevice);
       return;
     }
     try {
@@ -1033,7 +1083,7 @@ function App() {
         const localLease = await localNodePost<PortalLeaseResponse>("/portal/lease", { lease: data.lease });
         setLease(data.lease);
         applyLocalLeaseStatus(localLease.lease);
-        setOperationStatus("这台电脑已完成授权");
+        setOperationStatus(portalCopy.messages.computerAuthorized);
         await probeLocalNode();
       } catch (localError) {
         setLease(null);
@@ -1041,7 +1091,7 @@ function App() {
         setOperationStatus(localLeaseWriteFailureMessage(localError));
       }
     } catch (error) {
-      setOperationStatus(`电脑授权失败：${errorMessage(error)}`);
+      setOperationStatus(portalCopy.messages.computerAuthorizeFailed(errorMessage(error)));
     }
   }
 
@@ -1082,7 +1132,7 @@ function App() {
   async function probeLocalNode() {
     setLocalNode({
       phase: "checking",
-      message: "正在检测电脑助手是否已打开"
+      message: portalCopy.messages.checkingLocalNode
     });
     try {
       const health = await localNodeJson<LocalNodeHealth>("/health").catch((error) => {
@@ -1118,11 +1168,11 @@ function App() {
 
   async function copyLocalManifestUrl() {
     if (!canCopyLocalManifest) {
-      setOperationStatus("电脑助手连接成功后，才能复制 OpenClaw 连接地址");
+      setOperationStatus(portalCopy.messages.copyManifestAfterConnect);
       return;
     }
     await copyText(localManifestUrl);
-    setOperationStatus("OpenClaw 连接地址已复制");
+    setOperationStatus(portalCopy.messages.manifestCopied);
   }
 
   useEffect(() => {
@@ -1140,7 +1190,7 @@ function App() {
 
       const restoredSession = loadSession();
       if (restoredSession?.token) {
-        const requestId = beginAuth("refreshing", "正在恢复账户状态");
+        const requestId = beginAuth("refreshing", portalCopy.messages.restoringAccount);
         refreshAccount(restoredSession.token, requestId);
       }
     }
@@ -1156,7 +1206,7 @@ function App() {
     } else {
       setLocalNode({
         phase: "idle",
-        message: "登录后会检测电脑助手是否打开"
+        message: portalCopy.messages.localNodeIdle
       });
     }
   }, [session?.token]);
@@ -1167,17 +1217,20 @@ function App() {
     if (!checkout) return;
     checkoutNoticeHandled.current = true;
     if (checkout === "success") {
-      setOperationStatus("支付完成，正在刷新授权状态");
+      setOperationStatus(portalCopy.messages.checkoutSuccess);
       if (session?.token) {
         refreshAccount();
       }
     } else if (checkout === "cancelled") {
-      setOperationStatus("支付已取消，订单还没有扣款");
+      setOperationStatus(portalCopy.messages.checkoutCancelled);
     }
   }, [session?.token]);
 
   useEffect(() => {
     if (authMode === "register" && authMethod === "nebula") {
+      setAuthMethod("email");
+    }
+    if (!SKYBRIDGE_PHONE_AUTH_ENABLED && authMethod === "phone") {
       setAuthMethod("email");
     }
   }, [authMode, authMethod]);
@@ -1190,7 +1243,7 @@ function App() {
     let cancelled = false;
     turnstileTokenRef.current = "";
     setTurnstileToken("");
-    setTurnstileStatus("正在加载安全验证");
+    setTurnstileStatus(portalCopy.messages.loadingTurnstile);
     loadTurnstileScript()
       .then(() => {
         if (cancelled || !turnstileContainerRef.current || !window.turnstile || turnstileWidgetId.current) {
@@ -1203,12 +1256,12 @@ function App() {
             callback: (token) => {
               turnstileTokenRef.current = token;
               setTurnstileToken(token);
-              setTurnstileStatus("安全验证已通过");
+              setTurnstileStatus(portalCopy.messages.turnstilePassed);
             },
             "expired-callback": () => {
               turnstileTokenRef.current = "";
               setTurnstileToken("");
-              setTurnstileStatus("安全验证已过期，请重新验证");
+              setTurnstileStatus(portalCopy.messages.turnstileExpired);
             },
             "error-callback": (error) => {
               turnstileTokenRef.current = "";
@@ -1218,19 +1271,19 @@ function App() {
             }
           });
         } catch (error) {
-          setTurnstileStatus(`安全验证组件渲染失败：${errorMessage(error)}`);
+          setTurnstileStatus(portalCopy.messages.turnstileRenderFailed(errorMessage(error)));
           return;
         }
-        setTurnstileStatus("安全验证组件已加载；完成验证后可提交");
+        setTurnstileStatus(portalCopy.messages.turnstileLoaded);
         window.setTimeout(() => {
           if (!cancelled && !turnstileTokenRef.current) {
-            setTurnstileStatus("如果没有看到安全验证，请刷新页面或联系运营支持");
+            setTurnstileStatus(portalCopy.messages.turnstileHiddenHint);
           }
         }, 4_000);
       })
       .catch((error) => {
         if (!cancelled) {
-          setTurnstileStatus(`安全验证组件加载失败：${errorMessage(error)}`);
+          setTurnstileStatus(portalCopy.messages.turnstileLoadFailed(errorMessage(error)));
         }
       });
 
@@ -1268,45 +1321,46 @@ function App() {
   return (
     <main className={session ? "motion-stage motion-stage-console" : "motion-stage"}>
       <header className="site-nav">
-        <a className="brand-mark" href="#top" aria-label="Ozon Rust Suite">
+        <a className="brand-mark" href="#top" aria-label={copy.common.brand}>
           <span className="brand-icon">
             <Orbit size={18} />
           </span>
-          <span>Ozon Rust Suite</span>
+          <span>{copy.common.brand}</span>
         </a>
-        <nav aria-label="primary navigation">
+        <nav aria-label={portalCopy.nav.primaryAria}>
           {session ? (
             <>
-              <a href="#console">接入向导</a>
-              <a href="/customer-guide.html">操作说明</a>
-              <a href="#advanced">排查</a>
+              <a href="#console">{portalCopy.nav.loggedIn.guide}</a>
+              <a href="/customer-guide.html">{portalCopy.nav.loggedIn.manual}</a>
+              <a href="#advanced">{portalCopy.nav.loggedIn.troubleshoot}</a>
             </>
           ) : (
             <>
-              <a href="#capabilities">功能</a>
-              <a href="#workflow">流程</a>
-              <a href="#pricing">方案</a>
-              <a href="/customer-guide.html">操作说明</a>
+              <a href="#capabilities">{portalCopy.nav.public.capabilities}</a>
+              <a href="#workflow">{portalCopy.nav.public.workflow}</a>
+              <a href="#pricing">{portalCopy.nav.public.pricing}</a>
+              <a href="/customer-guide.html">{portalCopy.nav.public.manual}</a>
             </>
           )}
         </nav>
         <div className="nav-actions">
+          <LanguageSwitch locale={locale} setLocale={setLocale} />
           {session ? (
             <>
               <button className="quiet" disabled={authBusy} onClick={() => refreshAccount()}>
-                <RefreshCcw size={18} /> 刷新
+                <RefreshCcw size={18} /> {portalCopy.nav.actions.refresh}
               </button>
               <button className="quiet" onClick={logout}>
-                <LogOut size={18} /> 退出
+                <LogOut size={18} /> {portalCopy.nav.actions.logout}
               </button>
             </>
           ) : (
             <>
               <button className="quiet" onClick={() => openAuthDialog("login")}>
-                <LogIn size={18} /> 登录
+                <LogIn size={18} /> {portalCopy.nav.actions.login}
               </button>
               <button onClick={() => openAuthDialog("register")}>
-                <UserPlus size={18} /> 注册
+                <UserPlus size={18} /> {portalCopy.nav.actions.register}
               </button>
             </>
           )}
@@ -1317,94 +1371,81 @@ function App() {
         <>
       <section className="hero-section motion-hero motion-stage-entry" id="top">
         <div className="hero-copy">
-          <p className="eyebrow">Ozon Rust Suite</p>
-          <h1>
-            <span>商品图进来，</span>
-            <span>海报成稿出去。</span>
+          <p className="eyebrow">{portalCopy.hero.eyebrow}</p>
+          <h1 aria-label={`${portalCopy.hero.titleLine1}${portalCopy.hero.titleLine2}`}>
+            <span>{portalCopy.hero.titleLine1}</span>
+            <span>{portalCopy.hero.titleLine2}</span>
           </h1>
-          <p>
-            读取真实商品图、标题和卖点，本机助手负责店铺授权，龙虾/Codex 负责成图。少填表，多看成稿。
-          </p>
+          <p>{portalCopy.hero.description}</p>
           <div className="hero-actions">
             {session ? (
               <>
                 <a className="download" href="#console">
-                  <ArrowRight size={18} /> 继续接入流程
+                  <ArrowRight size={18} /> {portalCopy.hero.continueSetup}
                 </a>
                 {canOpenLocalConsole && (
                   <a className="download secondary" href={LOCAL_CONSOLE_URL} target="_blank" rel="noreferrer">
-                    <MonitorCheck size={18} /> 打开工作台
+                    <MonitorCheck size={18} /> {portalCopy.hero.openWorkspace}
                   </a>
                 )}
                 <button className="secondary" disabled={authBusy} onClick={() => refreshAccount()}>
-                  <RefreshCcw size={18} /> 刷新状态
+                  <RefreshCcw size={18} /> {portalCopy.hero.refreshStatus}
                 </button>
               </>
             ) : (
               <>
                 <button onClick={() => openAuthDialog("login")}>
-                  <LogIn size={18} /> 登录工作台
+                  <LogIn size={18} /> {portalCopy.hero.loginWorkspace}
                 </button>
                 <button className="secondary" onClick={() => openAuthDialog("register")}>
-                  <UserPlus size={18} /> 创建账号
+                  <UserPlus size={18} /> {portalCopy.hero.createAccount}
                 </button>
               </>
             )}
           </div>
           <div className="hero-meta">
-            <span>邮箱/手机号登录</span>
-            <span>真实商品读取</span>
-            <span>龙虾/Codex 出图</span>
+            {heroMeta.map((item) => (
+              <span key={item}>{item}</span>
+            ))}
           </div>
         </div>
-        <div className="hero-visual motion-card-flow" aria-label="商品海报生成预览">
+        <div className="hero-visual motion-card-flow" aria-label={portalCopy.hero.visualAria}>
           <div className="showcase-toolbar">
-            <span>Live product brief</span>
-            <strong>Ozon item #3169219</strong>
+            <span>{portalCopy.hero.visual.toolbarLabel}</span>
+            <strong>{portalCopy.hero.visual.toolbarItem}</strong>
           </div>
           <div className="poster-stage">
             <article className="poster-card product-card">
-              <span className="poster-label">商品原图</span>
+              <span className="poster-label">{portalCopy.hero.visual.sourceLabel}</span>
               <div className="product-photo">
                 <span className="lighter-shape" />
               </div>
-              <strong>车系打火机</strong>
-              <p>紫色车贴 · 金属喷嘴 · 随身款</p>
+              <strong>{portalCopy.hero.visual.sourceTitle}</strong>
+              <p>{portalCopy.hero.visual.sourceBody}</p>
             </article>
             <article className="poster-card output-card">
-              <span className="poster-label">海报成稿</span>
+              <span className="poster-label">{portalCopy.hero.visual.outputLabel}</span>
               <div className="poster-art">
                 <span className="poster-product" />
                 <span className="poster-road" />
               </div>
-              <strong>时尚车系打火机</strong>
-              <p>点亮风格，随身有行</p>
+              <strong>{portalCopy.hero.visual.outputTitle}</strong>
+              <p>{portalCopy.hero.visual.outputBody}</p>
             </article>
             <article className="poster-card brief-card">
-              <span className="poster-label">生成 brief</span>
+              <span className="poster-label">{portalCopy.hero.visual.briefLabel}</span>
               <ul>
-                <li>保留商品颜色和车系元素</li>
-                <li>突出便携、防风和礼品感</li>
-                <li>禁止改品牌、改外观、乱写参数</li>
+                {portalCopy.hero.visual.briefItems.map((item) => (
+                  <li key={item}>{item}</li>
+                ))}
               </ul>
             </article>
           </div>
           <div className="template-marquee" aria-hidden="true">
             <div>
-              <span>新品首图</span>
-              <span>节日促销</span>
-              <span>车品风格</span>
-              <span>黑金质感</span>
-              <span>俄语卖点</span>
-              <span>竖版社媒</span>
-              <span>商品对比</span>
-              <span>新品首图</span>
-              <span>节日促销</span>
-              <span>车品风格</span>
-              <span>黑金质感</span>
-              <span>俄语卖点</span>
-              <span>竖版社媒</span>
-              <span>商品对比</span>
+              {[...portalCopy.hero.visual.marquee, ...portalCopy.hero.visual.marquee].map((item, index) => (
+                <span key={`${item}-${index}`}>{item}</span>
+              ))}
             </div>
           </div>
         </div>
@@ -1412,57 +1453,37 @@ function App() {
 
       <section className="capability-band motion-reveal" data-reveal id="capabilities">
         <div className="band-title">
-          <p className="eyebrow">能做什么</p>
-          <h2>先把商品拿准，再谈生成效果。</h2>
+          <p className="eyebrow">{portalCopy.capabilities.eyebrow}</p>
+          <h2>{portalCopy.capabilities.title}</h2>
         </div>
         <div className="capability-grid">
-          <article>
-            <PackageCheck />
-            <h3>店铺商品是真实来源</h3>
-            <p>读取 Ozon 商品详情和图片，海报从真实资料开始，不让模型凭空编。</p>
-          </article>
-          <article>
-            <Boxes />
-            <h3>电脑助手保管授权</h3>
-            <p>店铺密钥留在本机，网页只看连接状态，断在哪一步就显示哪一步。</p>
-          </article>
-          <article>
-            <Bot />
-            <h3>成稿要能复核</h3>
-            <p>生成后检查商品外观、卖点和文字，明显跑偏就不当成成功。</p>
-          </article>
+          {portalCopy.capabilities.cards.map((card, index) => {
+            const Icon = index === 0 ? PackageCheck : index === 1 ? Boxes : Bot;
+            return (
+              <article key={card.title}>
+                <Icon />
+                <h3>{card.title}</h3>
+                <p>{card.text}</p>
+              </article>
+            );
+          })}
         </div>
       </section>
 
       <section className="workflow-band motion-reveal" data-reveal id="workflow">
         <div className="workflow-copy">
-          <p className="eyebrow">上手路径</p>
-          <h2>用户只需要顺着下一步走。</h2>
-          <p>
-            默认路径保留给新手，排查信息收起来。客服需要定位问题时，再看版本、节点和授权状态。
-          </p>
+          <p className="eyebrow">{portalCopy.workflow.eyebrow}</p>
+          <h2>{portalCopy.workflow.title}</h2>
+          <p>{portalCopy.workflow.text}</p>
         </div>
         <div className="workflow-steps">
-          <div>
-            <span>01</span>
-            <strong>登录账号</strong>
-            <p>优先使用邮箱或手机号，不把普通用户送去额外安全页。</p>
-          </div>
-          <div>
-            <span>02</span>
-            <strong>安装电脑助手</strong>
-            <p>电脑助手负责保存店铺授权信息，网页不会保存你的店铺密钥。</p>
-          </div>
-          <div>
-            <span>03</span>
-            <strong>连接这台电脑</strong>
-            <p>打开电脑助手后，网页会确认它是否已经在运行。</p>
-          </div>
-          <div>
-            <span>04</span>
-            <strong>打开工作台</strong>
-            <p>在工作台检查店铺授权，读取真实商品，并生成不乱写卖点的海报。</p>
-          </div>
+          {portalCopy.workflow.steps.map((step, index) => (
+            <div key={step.title}>
+              <span>{String(index + 1).padStart(2, "0")}</span>
+              <strong>{step.title}</strong>
+              <p>{step.text}</p>
+            </div>
+          ))}
         </div>
       </section>
         </>
@@ -1471,52 +1492,64 @@ function App() {
       {session && (
         <section className="account-console account-console-simple" id="console">
           <aside className="identity-panel">
-            <p className="eyebrow">已登录</p>
+            <p className="eyebrow">{portalCopy.console.identity.eyebrow}</p>
             <h2>{displayLoginAlias(session.user)}</h2>
             <div className="rail-status">
-              <span>服务状态</span>
-              <strong>{activeEntitlement ? "已开通" : order ? "申请处理中" : "未开通"}</strong>
+              <span>{portalCopy.console.identity.serviceStatus}</span>
+              <strong>
+                {activeEntitlement
+                  ? portalCopy.console.identity.serviceOpen
+                  : order
+                    ? portalCopy.console.identity.servicePending
+                    : portalCopy.console.identity.serviceClosed}
+              </strong>
             </div>
             <div className="rail-status">
-              <span>电脑助手</span>
-              <strong>{computerHelperOnline ? "已连接" : "未连接"}</strong>
+              <span>{portalCopy.console.identity.helper}</span>
+              <strong>{computerHelperOnline ? portalCopy.console.identity.helperConnected : portalCopy.console.identity.helperDisconnected}</strong>
             </div>
             <div className="rail-status">
-              <span>电脑授权</span>
-              <strong>{computerAuthorized ? "已完成" : "未完成"}</strong>
+              <span>{portalCopy.console.identity.computerAuth}</span>
+              <strong>{computerAuthorized ? portalCopy.console.identity.authComplete : portalCopy.console.identity.authIncomplete}</strong>
             </div>
             <div className="rail-status">
-              <span>店铺授权</span>
-              <strong>{storeCredentialsReady ? "已保存" : readyForWorkspace ? "待填写" : "未开始"}</strong>
+              <span>{portalCopy.console.identity.storeAuth}</span>
+              <strong>
+                {storeCredentialsReady
+                  ? portalCopy.console.identity.saved
+                  : readyForWorkspace
+                    ? portalCopy.console.identity.pendingFill
+                    : portalCopy.console.identity.notStarted}
+              </strong>
             </div>
           </aside>
 
           <section className="workspace">
             {LOCAL_DEV_AUTH_ENABLED && (
             <details className="local-dev-panel">
-              <summary>开发调试</summary>
+              <summary>{portalCopy.console.localDev.summary}</summary>
               <div className="auth-strip local-dev-strip">
                 <div className="section-title">
                   <Orbit />
                   <div>
-                    <h2>Nebula access_token</h2>
-                    <p>仅用于开发诊断：用已登录的 Nebula 会话换取 Ozon 服务会话。</p>
+                    <h2>{portalCopy.console.localDev.tokenTitle}</h2>
+                    <p>{portalCopy.console.localDev.tokenText}</p>
                   </div>
                 </div>
               </div>
               <div className="form-grid skybridge-grid">
                 <label>
-                  Nebula access_token
+                  {portalCopy.console.localDev.tokenTitle}
                   <input
                     autoComplete="off"
-                    placeholder="从 Nebula 开发环境获取"
+                    placeholder={portalCopy.console.localDev.tokenPlaceholder}
                     type="password"
                     value={skybridgeAccessToken}
                     onChange={(event) => setSkybridgeAccessToken(event.target.value)}
                   />
                 </label>
                 <button disabled={authBusy} onClick={createManualSkybridgeServiceSession}>
-                  <Orbit size={18} /> 创建服务会话
+                  <Orbit size={18} /> {portalCopy.console.localDev.createServiceSession}
                 </button>
               </div>
 
@@ -1524,30 +1557,30 @@ function App() {
                 <div className="section-title">
                   <ShieldCheck />
                   <div>
-                    <h2>local_dev 账户</h2>
-                    <p>仅用于离线调试；正式用户必须通过 Nebula，身份来源应显示 Nebula。</p>
+                    <h2>{portalCopy.console.localDev.localAccountTitle}</h2>
+                    <p>{portalCopy.console.localDev.localAccountText}</p>
                   </div>
                 </div>
-                <div className="mode-switch" aria-label="local auth mode">
+                <div className="mode-switch" aria-label={portalCopy.console.localDev.modeAria}>
                   <button className={localMode === "register" ? "active" : ""} onClick={() => setLocalMode("register")}>
-                    <UserPlus size={18} /> 注册
+                    <UserPlus size={18} /> {portalCopy.console.localDev.register}
                   </button>
                   <button className={localMode === "login" ? "active" : ""} onClick={() => setLocalMode("login")}>
-                    <LogIn size={18} /> 登录
+                    <LogIn size={18} /> {portalCopy.console.localDev.login}
                   </button>
                 </div>
               </div>
 
-              <div className="method-switch" aria-label="local login method">
+              <div className="method-switch" aria-label={portalCopy.console.localDev.methodAria}>
                 <button className={localMethod === "email" ? "active" : ""} onClick={() => setLocalMethod("email")}>
-                  <Mail size={18} /> 邮箱
+                  <Mail size={18} /> {portalCopy.console.localDev.email}
                 </button>
                 <button className={localMethod === "phone" ? "active" : ""} onClick={() => setLocalMethod("phone")}>
-                  <Smartphone size={18} /> 手机号
+                  <Smartphone size={18} /> {portalCopy.console.localDev.phone}
                 </button>
                 {localMode === "login" && (
                   <button className={localMethod === "nebula" ? "active" : ""} onClick={() => setLocalMethod("nebula")}>
-                    <KeyRound size={18} /> 账号编号
+                    <KeyRound size={18} /> {portalCopy.console.localDev.nebula}
                   </button>
                 )}
               </div>
@@ -1564,20 +1597,20 @@ function App() {
                 </label>
                 {localMode === "register" && (
                   <label>
-                    昵称
+                    {portalCopy.console.localDev.name}
                     <input
                       autoComplete="name"
-                      placeholder="Ozon operator"
+                      placeholder={portalCopy.console.localDev.namePlaceholder}
                       value={localName}
                       onChange={(event) => setLocalName(event.target.value)}
                     />
                   </label>
                 )}
                 <label>
-                  本地密码
+                  {portalCopy.console.localDev.localPassword}
                   <input
                     autoComplete={localMode === "register" ? "new-password" : "current-password"}
-                    placeholder="仅 local_dev 使用"
+                    placeholder={portalCopy.console.localDev.localPasswordPlaceholder}
                     value={localPassword}
                     onChange={(event) => setLocalPassword(event.target.value)}
                     type="password"
@@ -1585,7 +1618,7 @@ function App() {
                 </label>
                 <button disabled={authBusy} onClick={authenticateLocalDev}>
                   {localMode === "register" ? <UserPlus size={18} /> : <LogIn size={18} />}
-                  {localMode === "register" ? "创建 local_dev" : "登录 local_dev"}
+                  {localMode === "register" ? portalCopy.console.localDev.createLocalDev : portalCopy.console.localDev.loginLocalDev}
                 </button>
               </div>
             </details>
@@ -1604,7 +1637,7 @@ function App() {
           <section className="operations setup-wizard motion-card-flow" data-current-step={currentSetupStep}>
             <div className={`setup-panel ${setupStatus.kind} motion-current-step`}>
               <div>
-                <span>下一步</span>
+                <span>{portalCopy.console.setup.nextStep}</span>
                 <h2>{setupStatus.title}</h2>
                 <p>{setupStatus.message}</p>
               </div>
@@ -1612,16 +1645,16 @@ function App() {
                 {!activeEntitlement && order && (
                   <>
                     <button disabled={authBusy} onClick={refreshOrder}>
-                      <RefreshCcw size={18} /> 刷新开通状态
+                      <RefreshCcw size={18} /> {portalCopy.console.setup.actions.refreshOrder}
                     </button>
                     <button className="secondary" onClick={copyOrderInfo}>
-                      复制申请信息
+                      {portalCopy.console.setup.actions.copyOrder}
                     </button>
                   </>
                 )}
                 {!activeEntitlement && !order && (
                   <button disabled={!canUseProtectedActions} onClick={createOrder}>
-                    <ArrowRight size={18} /> 开通服务
+                    <ArrowRight size={18} /> {portalCopy.console.setup.actions.openService}
                   </button>
                 )}
                 {activeEntitlement && !computerHelperOnline && primaryDownloadOption && (
@@ -1631,61 +1664,61 @@ function App() {
                 )}
                 {activeEntitlement && !computerHelperOnline && (
                   <button className="secondary" disabled={localNode.phase === "checking"} onClick={probeLocalNode}>
-                    <RefreshCcw size={18} /> 我已打开，检测一下
+                    <RefreshCcw size={18} /> {portalCopy.console.setup.actions.openedProbe}
                   </button>
                 )}
                 {activeEntitlement && computerHelperOnline && !device && !computerAuthorized && (
                   <button disabled={!canBindLocalDevice} onClick={activateDevice}>
-                    <MonitorCheck size={18} /> 授权这台电脑
+                    <MonitorCheck size={18} /> {portalCopy.console.setup.actions.authorizeComputer}
                   </button>
                 )}
                 {activeEntitlement && device && !computerAuthorized && (
                   <button onClick={issueLease} disabled={authBusy}>
-                    <Radio size={18} /> 完成电脑授权
+                    <Radio size={18} /> {portalCopy.console.setup.actions.completeComputerAuth}
                   </button>
                 )}
                 {canStartWorkspace && (
                   <a className="download" href={LOCAL_CONSOLE_URL} target="_blank" rel="noreferrer">
-                    <MonitorCheck size={18} /> 打开工作台
+                    <MonitorCheck size={18} /> {portalCopy.console.setup.actions.openWorkspace}
                   </a>
                 )}
                 {readyForWorkspace && !canOpenLocalConsole && (
                   <span className="inline-next-step">
-                    <MonitorCheck size={18} /> 去电脑上的 Ozon Rust Local 继续
+                    <MonitorCheck size={18} /> {portalCopy.console.setup.actions.continueOnLocal}
                   </span>
                 )}
               </div>
             </div>
 
-            <div className="wizard-steps" aria-label="接入步骤">
+            <div className="wizard-steps" aria-label={portalCopy.console.setup.stepsAria}>
               <article
                 className={wizardStepClass(Boolean(activeEntitlement), currentSetupStep === 1)}
                 aria-current={currentSetupStep === 1 ? "step" : undefined}
               >
                 <span className="step-number">1</span>
                 <div>
-                  <h3>开通服务</h3>
+                  <h3>{portalCopy.console.setup.step1.title}</h3>
                   <p>
                     {activeEntitlement
-                      ? "服务已开通，可以继续连接电脑。"
+                      ? portalCopy.console.setup.step1.done
                       : order
-                        ? "申请已经提交。付款或客服确认后，点刷新查看结果。"
-                        : "先开通服务，后面才能连接电脑和读取商品。"}
+                        ? portalCopy.console.setup.step1.pending
+                        : portalCopy.console.setup.step1.todo}
                   </p>
                   {!activeEntitlement && (
                     <div className="step-actions">
                       {order ? (
                         <>
                           <button disabled={authBusy} onClick={refreshOrder}>
-                            <RefreshCcw size={18} /> 刷新开通状态
+                            <RefreshCcw size={18} /> {portalCopy.console.setup.actions.refreshOrder}
                           </button>
                           <button className="secondary" onClick={copyOrderInfo}>
-                            复制申请信息
+                            {portalCopy.console.setup.actions.copyOrder}
                           </button>
                         </>
                       ) : (
                         <button disabled={!canUseProtectedActions} onClick={createOrder}>
-                          <ArrowRight size={18} /> 开通服务
+                          <ArrowRight size={18} /> {portalCopy.console.setup.actions.openService}
                         </button>
                       )}
                     </div>
@@ -1699,13 +1732,13 @@ function App() {
               >
                 <span className="step-number">2</span>
                 <div>
-                  <h3>安装并打开电脑助手</h3>
+                  <h3>{portalCopy.console.setup.step2.title}</h3>
                   <p>
                     {computerHelperOnline
-                      ? "电脑助手已经打开。"
+                      ? portalCopy.console.setup.step2.done
                       : activeEntitlement
-                        ? "下载安装到这台电脑，打开后回到这里点“检测一下”。"
-                        : "服务开通后，这里会给你下载入口。"}
+                        ? portalCopy.console.setup.step2.todo
+                        : portalCopy.console.setup.step2.locked}
                   </p>
                   {activeEntitlement && !computerHelperOnline && (
                     <div className="step-actions">
@@ -1715,11 +1748,11 @@ function App() {
                         </a>
                       ) : (
                         <button className="secondary" disabled>
-                          <Download size={18} /> 安装包准备中
+                          <Download size={18} /> {portalCopy.console.setup.actions.packagePreparing}
                         </button>
                       )}
                       <button disabled={localNode.phase === "checking"} onClick={probeLocalNode}>
-                        <RefreshCcw size={18} /> 我已打开，检测一下
+                        <RefreshCcw size={18} /> {portalCopy.console.setup.actions.openedProbe}
                       </button>
                     </div>
                   )}
@@ -1732,21 +1765,21 @@ function App() {
               >
                 <span className="step-number">3</span>
                 <div>
-                  <h3>授权这台电脑</h3>
+                  <h3>{portalCopy.console.setup.step3.title}</h3>
                   <p>
                     {computerAuthorized
-                      ? "这台电脑已经可以使用你的服务。"
-                      : "只允许已授权的电脑读取商品，并把任务交给龙虾/Codex。"}
+                      ? portalCopy.console.setup.step3.done
+                      : portalCopy.console.setup.step3.todo}
                   </p>
                   {activeEntitlement && computerHelperOnline && !computerAuthorized && (
                     <div className="step-actions">
                       {!device ? (
                         <button disabled={!canBindLocalDevice} onClick={activateDevice}>
-                          <MonitorCheck size={18} /> 授权这台电脑
+                          <MonitorCheck size={18} /> {portalCopy.console.setup.actions.authorizeComputer}
                         </button>
                       ) : (
                         <button disabled={authBusy} onClick={issueLease}>
-                          <Radio size={18} /> 完成授权
+                          <Radio size={18} /> {portalCopy.console.setup.actions.completeComputerAuth}
                         </button>
                       )}
                     </div>
@@ -1760,27 +1793,27 @@ function App() {
               >
                 <span className="step-number">4</span>
                 <div>
-                  <h3>{storeCredentialsReady ? "开始读取商品" : "连接 Ozon 店铺"}</h3>
+                  <h3>{storeCredentialsReady ? portalCopy.console.setup.step4.readyTitle : portalCopy.console.setup.step4.connectTitle}</h3>
                   <p>
                     {!readyForWorkspace
-                      ? "前面几步完成后，这里会告诉你去哪里填写店铺授权。"
+                      ? portalCopy.console.setup.step4.locked
                       : storeCredentialsReady
-                        ? "店铺授权已经保存。打开工作台读取商品，再把海报任务复制给龙虾/Codex。"
-                        : "切到电脑上的 Ozon Rust Local，在“店铺授权”里填写 Ozon Client ID 和 API Key，保存后回这里刷新。"}
+                        ? portalCopy.console.setup.step4.ready
+                        : portalCopy.console.setup.step4.todo}
                   </p>
                   {readyForWorkspace && (
                     <div className="step-actions">
                       {canStartWorkspace ? (
                         <a className="download" href={LOCAL_CONSOLE_URL} target="_blank" rel="noreferrer">
-                          <MonitorCheck size={18} /> 打开工作台
+                          <MonitorCheck size={18} /> {portalCopy.console.setup.actions.openWorkspace}
                         </a>
                       ) : (
                         <span className="inline-next-step">
-                          <MonitorCheck size={18} /> 请打开电脑上的 Ozon Rust Local
+                          <MonitorCheck size={18} /> {portalCopy.console.setup.actions.openLocalApp}
                         </span>
                       )}
                       <button className="secondary" disabled={localNode.phase === "checking"} onClick={probeLocalNode}>
-                        <RefreshCcw size={18} /> 我已处理，刷新状态
+                        <RefreshCcw size={18} /> {portalCopy.console.setup.actions.refreshAfterHandled}
                       </button>
                     </div>
                   )}
@@ -1791,17 +1824,17 @@ function App() {
             {readyForWorkspace && (
               <div className={`handoff-card ${storeCredentialsReady ? "online" : "warn"}`}>
                 <div>
-                  <span>{storeCredentialsReady ? "店铺已连好" : "现在去电脑助手"}</span>
-                  <h3>{storeCredentialsReady ? "可以读取真实商品了" : "把 Ozon API 填到电脑助手里"}</h3>
+                  <span>{storeCredentialsReady ? portalCopy.console.setup.handoff.readyBadge : portalCopy.console.setup.handoff.todoBadge}</span>
+                  <h3>{storeCredentialsReady ? portalCopy.console.setup.handoff.readyTitle : portalCopy.console.setup.handoff.todoTitle}</h3>
                   <p>
                     {storeCredentialsReady
-                      ? "下一步在 Ozon Rust Local 里读取商品，点“复制给龙虾/Codex”。图片 API 只是自动后台出图的可选项。"
-                      : "网页已经确认这台电脑能用。接下来不是在网页里填密钥，而是在电脑助手里保存店铺授权，这样密钥只留在你的电脑上。"}
+                      ? portalCopy.console.setup.handoff.readyText
+                      : portalCopy.console.setup.handoff.todoText}
                   </p>
                 </div>
                 <div className="handoff-actions">
                   <button className="secondary" disabled={localNode.phase === "checking"} onClick={probeLocalNode}>
-                    <RefreshCcw size={18} /> 刷新检查
+                    <RefreshCcw size={18} /> {portalCopy.console.setup.handoff.refreshCheck}
                   </button>
                 </div>
               </div>
@@ -1816,9 +1849,9 @@ function App() {
                     <div className="wechat-pay-box">
                       <QRCodeSVG value={paymentSession.native_code_url} size={148} marginSize={2} />
                       <div>
-                        <strong>微信扫码支付</strong>
+                        <strong>{portalCopy.console.payment.wechatTitle}</strong>
                         <p>
-                          支付备注：{paymentSession.payment_reference} ·{" "}
+                          {portalCopy.console.payment.paymentReference}: {paymentSession.payment_reference} ·{" "}
                           {formatMoney(paymentSession.amount_minor, paymentSession.currency)}
                         </p>
                       </div>
@@ -1826,7 +1859,7 @@ function App() {
                   )}
                   {paymentSession.checkout_url && (
                     <a href={paymentSession.checkout_url}>
-                      <ExternalLink size={16} /> 打开支付页
+                      <ExternalLink size={16} /> {portalCopy.console.payment.openCheckout}
                     </a>
                   )}
                 </div>
@@ -1837,27 +1870,27 @@ function App() {
               <summary>
                 <KeyRound size={20} />
                 <div>
-                  <strong>客服给了开通码？</strong>
-                  <span>有开通码时再打开这里。</span>
+                  <strong>{portalCopy.console.supportCode.summaryTitle}</strong>
+                  <span>{portalCopy.console.supportCode.summaryText}</span>
                 </div>
               </summary>
               <div className="form-grid">
                 <label>
-                  开通码
+                  {portalCopy.console.supportCode.code}
                   <input value={cardKey} onChange={(event) => setCardKey(event.target.value)} placeholder="ORS-..." />
                 </label>
                 <label>
-                  服务状态
-                  <input value={activeEntitlement ? "已开通" : "未开通"} readOnly />
+                  {portalCopy.console.supportCode.serviceStatus}
+                  <input value={activeEntitlement ? portalCopy.console.identity.serviceOpen : portalCopy.console.identity.serviceClosed} readOnly />
                 </label>
                 <label>
-                  有效期
-                  <input value={activeEntitlement?.expires_at ?? "开通后显示"} readOnly />
+                  {portalCopy.console.supportCode.expiry}
+                  <input value={activeEntitlement?.expires_at ?? portalCopy.console.supportCode.pendingExpiry} readOnly />
                 </label>
               </div>
               <div className="command-row">
                 <button disabled={!canUseProtectedActions} onClick={redeem}>
-                  <KeyRound size={18} /> 使用开通码
+                  <KeyRound size={18} /> {portalCopy.console.supportCode.redeem}
                 </button>
               </div>
             </details>
@@ -1866,42 +1899,42 @@ function App() {
               <summary>
                 <Clipboard size={20} />
                 <div>
-                  <strong>申请详情</strong>
-                  <span>需要发给客服或核对付款时再打开。</span>
+                  <strong>{portalCopy.console.orderDetails.summaryTitle}</strong>
+                  <span>{portalCopy.console.orderDetails.summaryText}</span>
                 </div>
               </summary>
               {order ? (
                 <div className="form-grid">
                   <label>
-                    申请编号
+                    {portalCopy.console.orderDetails.id}
                     <input value={order.id} readOnly />
                   </label>
                   <label>
-                    支付备注
+                    {portalCopy.console.orderDetails.paymentReference}
                     <input value={order.payment_reference} readOnly />
                   </label>
                   <label>
-                    状态
+                    {portalCopy.console.orderDetails.status}
                     <input value={orderStatusLabel(order.status)} readOnly />
                   </label>
                   <label>
-                    通道
+                    {portalCopy.console.orderDetails.provider}
                     <input value={paymentProviderLabel(order.payment_provider)} readOnly />
                   </label>
                   <label>
-                    金额
+                    {portalCopy.console.orderDetails.amount}
                     <input value={formatMoney(order.amount_minor, order.currency)} readOnly />
                   </label>
                 </div>
               ) : (
-                <p className="section-hint">还没有申请记录。点“开通服务”后，这里会显示申请编号和付款备注。</p>
+                <p className="section-hint">{portalCopy.console.orderDetails.empty}</p>
               )}
               <div className="command-row">
                 <button className="secondary" onClick={copyOrderInfo} disabled={!order}>
-                  复制申请信息
+                  {portalCopy.console.orderDetails.copy}
                 </button>
                 <button className="secondary" onClick={refreshOrder} disabled={!order || authBusy}>
-                  <RefreshCcw size={18} /> 刷新状态
+                  <RefreshCcw size={18} /> {portalCopy.console.orderDetails.refresh}
                 </button>
               </div>
             </details>
@@ -1910,57 +1943,57 @@ function App() {
               <summary>
                 <MonitorCheck size={20} />
                 <div>
-                  <strong>排查用信息</strong>
-                  <span>一般不用看；客服排查安装或插件问题时再打开。</span>
+                  <strong>{portalCopy.console.advanced.summaryTitle}</strong>
+                  <span>{portalCopy.console.advanced.summaryText}</span>
                 </div>
               </summary>
               <div className="local-node-grid">
                 <div className={`local-node-card ${localNode.phase}`}>
-                  <span>电脑助手</span>
+                  <span>{portalCopy.console.advanced.helper}</span>
                   <strong>{localNodeStatusLabel(localNode.phase)}</strong>
                   <p>{localNode.message}</p>
                 </div>
                 <div className={`local-node-card ${localPairingStatus.kind}`}>
-                  <span>电脑授权</span>
+                  <span>{portalCopy.console.advanced.computerAuth}</span>
                   <strong>{localPairingStatus.title}</strong>
                   <p>{localPairingStatus.message}</p>
                 </div>
                 <div className={`local-node-card ${storeCredentialsReady ? "online" : "warn"}`}>
-                  <span>店铺授权</span>
-                  <strong>{storeCredentialsReady ? "已保存" : "待填写"}</strong>
+                  <span>{portalCopy.console.advanced.storeAuth}</span>
+                  <strong>{storeCredentialsReady ? portalCopy.console.advanced.storeReady : portalCopy.console.advanced.storePending}</strong>
                   <p>
                     {storeCredentialsReady
-                      ? "电脑助手已保存 Ozon 店铺授权，可以读取商品。"
-                      : "切到 Ozon Rust Local，在店铺授权里填写 Client ID 和 API Key。"}
+                      ? portalCopy.console.advanced.storeReadyText
+                      : portalCopy.console.advanced.storePendingText}
                   </p>
                 </div>
                 <div className={`local-node-card ${posterConfigReady ? "online" : "warn"}`}>
-                  <span>API 自动出图</span>
-                  <strong>{posterConfigReady ? "已配置" : "可选"}</strong>
+                  <span>{portalCopy.console.advanced.posterApi}</span>
+                  <strong>{posterConfigReady ? portalCopy.console.advanced.posterReady : portalCopy.console.advanced.posterOptional}</strong>
                   <p>
                     {posterConfigReady
-                      ? `图片 API 已保存：${localNode.portal?.openai?.image_model ?? "当前模型"}。`
-                      : "默认用龙虾/Codex 出图；只有需要后台自动生成时才配置图片 API。"}
+                      ? portalCopy.console.advanced.posterReadyText(localNode.portal?.openai?.image_model ?? portalCopy.defaults.currentModel)
+                      : portalCopy.console.advanced.posterOptionalText}
                   </p>
                 </div>
                 <div className="local-node-card">
-                  <span>安装包版本</span>
+                  <span>{portalCopy.console.advanced.packageVersion}</span>
                   <strong>{releaseVersion}</strong>
-                  <p>{downloads?.release_manifest_url ?? "等待下载信息同步"}</p>
+                  <p>{downloads?.release_manifest_url ?? portalCopy.defaults.downloadSyncPending}</p>
                 </div>
                 <div className="local-node-card">
-                  <span>发布校验</span>
+                  <span>{portalCopy.console.advanced.releaseCheck}</span>
                   <strong>{releaseCommit}</strong>
                   <p>{releaseChecksum}</p>
                 </div>
               </div>
               <div className="command-row">
                 <button disabled={localNode.phase === "checking"} onClick={probeLocalNode}>
-                  <RefreshCcw size={18} /> 检测连接
+                  <RefreshCcw size={18} /> {portalCopy.console.advanced.probe}
                 </button>
                 {localNodeDownloadOptions.length === 0 && (
                   <button className="secondary" disabled>
-                    <Download size={18} /> 安装包准备中
+                    <Download size={18} /> {portalCopy.console.setup.actions.packagePreparing}
                   </button>
                 )}
                 {localNodeDownloadOptions.map((option, index) => (
@@ -1970,16 +2003,16 @@ function App() {
                 ))}
                 {canOpenLocalConsole && (
                   <a className="download secondary" href={LOCAL_CONSOLE_URL} target="_blank" rel="noreferrer">
-                    <MonitorCheck size={18} /> 打开工作台
+                    <MonitorCheck size={18} /> {portalCopy.console.setup.actions.openWorkspace}
                   </a>
                 )}
                 {canDownloadOpenClawPlugin && (
                   <a className="download secondary" href={openclawPluginUrl} target="_blank" rel="noreferrer">
-                    <Download size={18} /> 插件安装包
+                    <Download size={18} /> {portalCopy.console.advanced.pluginPackage}
                   </a>
                 )}
                 <button className="secondary" disabled={!canCopyLocalManifest} onClick={copyLocalManifestUrl}>
-                  <Clipboard size={18} /> 复制插件连接地址
+                  <Clipboard size={18} /> {portalCopy.console.advanced.copyPluginUrl}
                 </button>
               </div>
               {localNode.manifest && (
@@ -1988,7 +2021,7 @@ function App() {
                     <div key={tool.name}>
                       <span>{tool.risk}</span>
                       <strong>{tool.name}</strong>
-                      <em>{tool.approval_required ? "需要确认" : "只读"}</em>
+                      <em>{tool.approval_required ? portalCopy.console.advanced.approvalRequired : portalCopy.console.advanced.readOnly}</em>
                     </div>
                   ))}
                 </div>
@@ -1999,42 +2032,51 @@ function App() {
               <summary>
                 <ShieldCheck size={20} />
                 <div>
-                  <strong>更换电脑或改名称</strong>
-                  <span>需要改设备名、查看授权时间时再打开。</span>
+                  <strong>{portalCopy.console.device.summaryTitle}</strong>
+                  <span>{portalCopy.console.device.summaryText}</span>
                 </div>
               </summary>
               <div className="form-grid">
                 <label>
-                  设备名
+                  {portalCopy.console.device.name}
                   <input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} />
                 </label>
                 <label>
-                  设备码
+                  {portalCopy.console.device.code}
                   <input
                     value={deviceFingerprint}
                     readOnly
-                    placeholder="连接电脑助手后自动生成"
-                    title="设备码由电脑助手生成，门户不允许手写伪造"
+                    placeholder={portalCopy.console.device.codePlaceholder}
+                    title={portalCopy.console.device.codeTitle}
                   />
                 </label>
                 <label>
-                  授权状态
-                  <input value={computerAuthorized ? "已完成" : device ? "还差最后一步" : "未授权"} readOnly />
+                  {portalCopy.console.device.authStatus}
+                  <input
+                    value={
+                      computerAuthorized
+                        ? portalCopy.console.device.complete
+                        : device
+                          ? portalCopy.console.device.almostDone
+                          : portalCopy.console.device.unauthorized
+                    }
+                    readOnly
+                  />
                 </label>
               </div>
               <div className="command-row">
                 <button disabled={!canBindLocalDevice} onClick={activateDevice}>
-                  <MonitorCheck size={18} /> 授权这台电脑
+                  <MonitorCheck size={18} /> {portalCopy.console.device.authorize}
                 </button>
                 <button className="secondary" onClick={issueLease} disabled={!device || computerAuthorized || authBusy}>
-                  <Radio size={18} /> 完成授权
+                  <Radio size={18} /> {portalCopy.console.device.completeAuth}
                 </button>
               </div>
               {lease && (
                 <div className="lease-line">
-                  <span>授权</span>
+                  <span>{portalCopy.console.device.lease}</span>
                   <strong>{lease.lease_id}</strong>
-                  <em>有效期至 {lease.expires_at}</em>
+                  <em>{portalCopy.console.device.expiresAt(lease.expires_at)}</em>
                 </div>
               )}
             </details>
@@ -2046,17 +2088,17 @@ function App() {
       {!session && (
       <section className="pricing-band motion-reveal" data-reveal id="pricing">
         <div>
-          <p className="eyebrow">开始接入</p>
-          <h2>进入工作台，按步骤完成 Ozon 商品读取。</h2>
-          <p>登录后页面会告诉你下一步该点什么：开通服务、安装电脑助手、连接这台电脑，然后开始读取商品。</p>
+          <p className="eyebrow">{portalCopy.pricing.eyebrow}</p>
+          <h2>{portalCopy.pricing.title}</h2>
+          <p>{portalCopy.pricing.text}</p>
         </div>
         {session ? (
           <a className="download" href="#console">
-            <ArrowRight size={18} /> 进入账户授权
+            <ArrowRight size={18} /> {portalCopy.pricing.accountAuth}
           </a>
         ) : (
           <button onClick={() => openAuthDialog("register")}>
-            <UserPlus size={18} /> 开始使用
+            <UserPlus size={18} /> {portalCopy.pricing.start}
           </button>
         )}
       </section>
@@ -2071,11 +2113,11 @@ function App() {
             role="dialog"
             onMouseDown={(event) => event.stopPropagation()}
           >
-            <button className="icon-button close-button" aria-label="关闭登录面板" onClick={() => setAuthDialogMode(null)}>
+            <button className="icon-button close-button" aria-label={portalCopy.auth.closeAria} onClick={() => setAuthDialogMode(null)}>
               <X size={18} />
             </button>
             <div className="dialog-heading">
-              <p className="eyebrow">Ozon Rust Suite</p>
+              <p className="eyebrow">{copy.common.brand}</p>
               <h2 id="auth-dialog-title">{authDialogTitle}</h2>
               <p>{authDialogDescription}</p>
             </div>
@@ -2084,10 +2126,10 @@ function App() {
               <ShieldCheck size={17} />
               <span>
                 {DIRECT_SKYBRIDGE_AUTH_ENABLED
-                  ? "默认使用邮箱或手机号登录；统一身份入口只作为企业账号备用。"
+                  ? directAuthContext
                   : NEBULA_OAUTH_CONFIGURED
-                    ? "当前只配置了企业统一身份入口；如果安全验证失败，请联系运营开通邮箱/手机号入口。"
-                    : "账号服务正在维护，请联系运营支持。"}
+                    ? portalCopy.auth.contextSsoOnly
+                    : portalCopy.auth.contextMaintenance}
               </span>
             </div>
 
@@ -2096,21 +2138,23 @@ function App() {
                 <div className="section-title compact-title">
                   {authMethod === "phone" ? <Smartphone /> : <Mail />}
                   <div>
-                    <h2>{authMode === "register" ? "创建账号" : "邮箱/手机号登录"}</h2>
-                    <p>不跳出当前门户。登录后继续开通服务、安装电脑助手并读取商品。</p>
+                    <h2>{directAuthTitle}</h2>
+                    <p>{directAuthText}</p>
                   </div>
                 </div>
                 <form className="form-grid skybridge-auth-grid auth-card-form" onSubmit={handleSkybridgePasswordSubmit}>
-                  <div className="method-switch auth-methods" aria-label="账号登录方式">
+                  <div className="method-switch auth-methods" aria-label={portalCopy.auth.methodsAria}>
                     <button className={authMethod === "email" ? "active" : ""} type="button" onClick={() => setAuthMethod("email")}>
-                      <Mail size={18} /> 邮箱
+                      <Mail size={18} /> {portalCopy.auth.email}
                     </button>
-                    <button className={authMethod === "phone" ? "active" : ""} type="button" onClick={() => setAuthMethod("phone")}>
-                      <Smartphone size={18} /> 手机号
-                    </button>
+                    {SKYBRIDGE_PHONE_AUTH_ENABLED ? (
+                      <button className={authMethod === "phone" ? "active" : ""} type="button" onClick={() => setAuthMethod("phone")}>
+                        <Smartphone size={18} /> {portalCopy.auth.phone}
+                      </button>
+                    ) : null}
                     {authMode === "login" && (
                       <button className={authMethod === "nebula" ? "active" : ""} type="button" onClick={() => setAuthMethod("nebula")}>
-                        <KeyRound size={18} /> 账号编号
+                        <KeyRound size={18} /> {portalCopy.auth.nebula}
                       </button>
                     )}
                   </div>
@@ -2126,10 +2170,10 @@ function App() {
                   </label>
                   {authMode === "register" && (
                     <label>
-                      昵称
+                      {portalCopy.auth.name}
                       <input
                         autoComplete="name"
-                        placeholder="姓名或团队昵称"
+                        placeholder={portalCopy.auth.namePlaceholder}
                         value={skybridgeName}
                         onChange={(event) => setSkybridgeName(event.target.value)}
                       />
@@ -2137,10 +2181,10 @@ function App() {
                   )}
                   {authMode === "register" && authMethod === "phone" && (
                     <label>
-                      备用邮箱
+                      {portalCopy.auth.backupEmail}
                       <input
                         autoComplete="email"
-                        placeholder="用于接收账号通知"
+                        placeholder={portalCopy.auth.backupEmailPlaceholder}
                         value={skybridgePhoneEmail}
                         onChange={(event) => setSkybridgePhoneEmail(event.target.value)}
                       />
@@ -2148,20 +2192,20 @@ function App() {
                   )}
                   {authMethod === "phone" ? (
                     <label>
-                      短信验证码
+                      {portalCopy.auth.smsCode}
                       <input
                         autoComplete="one-time-code"
-                        placeholder="请输入验证码"
+                        placeholder={portalCopy.auth.smsCodePlaceholder}
                         value={skybridgePhoneCode}
                         onChange={(event) => setSkybridgePhoneCode(event.target.value)}
                       />
                     </label>
                   ) : (
                     <label>
-                      密码
+                      {portalCopy.auth.password}
                       <input
                         autoComplete={authMode === "register" ? "new-password" : "current-password"}
-                        placeholder="请输入密码"
+                        placeholder={portalCopy.auth.passwordPlaceholder}
                         value={skybridgePassword}
                         onChange={(event) => setSkybridgePassword(event.target.value)}
                         type="password"
@@ -2175,7 +2219,7 @@ function App() {
                       type="button"
                       onClick={sendSkybridgePhoneCode}
                     >
-                      <Smartphone size={18} /> 获取验证码
+                      <Smartphone size={18} /> {portalCopy.auth.requestCode}
                     </button>
                   )}
                   <button disabled={authBusy || directAuthNeedsTurnstile} type="submit">
@@ -2184,6 +2228,7 @@ function App() {
                   </button>
                 </form>
 
+                {!SKYBRIDGE_PHONE_AUTH_ENABLED && <p className="identity-note">{portalCopy.auth.phoneAuthUnavailable}</p>}
                 {skybridgeOtpStatus && <p className="identity-note">{skybridgeOtpStatus}</p>}
 
                 {SKYBRIDGE_TURNSTILE_CONFIGURED && (
@@ -2194,7 +2239,7 @@ function App() {
                 )}
 
                 {directAuthNeedsTurnstile && (
-                  <p className="identity-note">当前登录需要先完成安全验证，验证通过后再提交。</p>
+                  <p className="identity-note">{portalCopy.auth.needsVerification}</p>
                 )}
               </section>
             )}
@@ -2205,18 +2250,18 @@ function App() {
 
             {NEBULA_OAUTH_ENTRY_ENABLED && (
               <details className="compat-panel sso-panel">
-                <summary>企业统一身份入口</summary>
+                <summary>{portalCopy.auth.ssoSummary}</summary>
                 <section className="nebula-oauth-panel">
                   <div className="section-title compact-title">
                     <ShieldCheck />
                     <div>
-                      <h2>统一身份{authMode === "register" ? "注册" : "登录"}</h2>
-                      <p>仅在企业账号或客服要求时使用；打开后会离开当前页面完成验证。</p>
+                      <h2>{portalCopy.auth.ssoTitle(authMode)}</h2>
+                      <p>{portalCopy.auth.ssoText}</p>
                     </div>
                   </div>
                   <div className="oauth-actions">
                     <button disabled={authBusy || !NEBULA_OAUTH_CONFIGURED} onClick={() => startNebulaOAuth(authMode)}>
-                      <ExternalLink size={18} /> {authMode === "register" ? "打开统一注册页" : "打开统一登录页"}
+                      <ExternalLink size={18} /> {authMode === "register" ? portalCopy.auth.openSsoRegister : portalCopy.auth.openSsoLogin}
                     </button>
                   </div>
                 </section>
@@ -2227,10 +2272,8 @@ function App() {
               <div className="captcha-callout">
                 <AlertCircle />
                 <div>
-                  <strong>这次登录还差安全验证</strong>
-                  <p>
-                    账号服务要求先完成验证码或二次确认。请刷新后重试；如果仍失败，请联系运营处理账号风控。
-                  </p>
+                  <strong>{portalCopy.auth.captchaTitle}</strong>
+                  <p>{portalCopy.auth.captchaText}</p>
                 </div>
               </div>
             )}
@@ -2249,9 +2292,9 @@ function App() {
             )}
 
             <p className="auth-switch-copy">
-              {authMode === "login" ? "还没有账号？" : "已有账号？"}
+              {authMode === "login" ? portalCopy.auth.switchQuestionLogin : portalCopy.auth.switchQuestionRegister}
               <button type="button" onClick={() => switchAuthMode(authMode === "login" ? "register" : "login")}>
-                {authMode === "login" ? "创建账号" : "登录"}
+                {authMode === "login" ? portalCopy.auth.switchToRegister : portalCopy.auth.switchToLogin}
               </button>
             </p>
           </section>
@@ -2286,10 +2329,26 @@ function isAuthBusy(phase: AuthPhase) {
   );
 }
 
+function isValidStoredSession(value: unknown): value is Session {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as { token?: unknown; user?: unknown };
+  if (typeof candidate.token !== "string" || !candidate.token) return false;
+  const user = candidate.user as Partial<User> | undefined;
+  if (!user || typeof user !== "object") return false;
+  return (
+    typeof user.id === "string" &&
+    typeof user.tenant_id === "string" &&
+    typeof user.nebula_id === "string" &&
+    typeof user.role === "string"
+  );
+}
+
 function loadSession(): Session | null {
   try {
     const raw = localStorage.getItem(SESSION_KEY);
-    return raw ? (JSON.parse(raw) as Session) : null;
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    return isValidStoredSession(parsed) ? parsed : null;
   } catch {
     return null;
   }
@@ -2319,7 +2378,7 @@ async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}
     });
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") {
-      throw new Error("请求超时，请检查账号服务或 Ozon 服务是否可访问");
+      throw new Error(getPortalCopy().messages.requestTimeout);
     }
     throw error;
   } finally {
@@ -2365,12 +2424,13 @@ async function localNodePost<T>(path: string, body: unknown): Promise<T> {
 }
 
 function localNodeOnlineMessage(health: LocalNodeHealth, portalError: unknown | null) {
-  const mode = health.real_ozon_enabled ? "真实 Ozon 商品读取已开启" : "开发模式";
+  const copy = getPortalCopy();
+  const mode = health.real_ozon_enabled ? copy.messages.realOzonEnabled : copy.messages.devMode;
   const version = health.package_version ? ` v${health.package_version}` : "";
   if (portalError) {
-    return `电脑助手${version}已打开，${mode}；${userFacingLocalNodeIssue(portalError)}`;
+    return copy.messages.localNodeOnlineWithIssue(version, mode, userFacingLocalNodeIssue(portalError));
   }
-  return `电脑助手${version}已连接，${mode}`;
+  return copy.messages.localNodeOnline(version, mode);
 }
 
 function localNodeFailedEndpoint(error: unknown) {
@@ -2385,19 +2445,20 @@ function stripLocalNodeEndpointPrefix(message: string) {
 }
 
 function localNodeFailureMessage(error: unknown, endpoint: string | null = localNodeFailedEndpoint(error)) {
+  const copy = getPortalCopy();
   if (endpoint === "health") {
     if (isLocalNodeBrowserBlock(error)) {
-      return "网页没有找到电脑助手。请先打开电脑助手；如果已经打开，安装最新版后再试。";
+      return copy.messages.localNodeHealthBlocked;
     }
-    return "电脑助手没有回应。请确认已打开，或重启电脑助手后再点检测。";
+    return copy.messages.localNodeNoResponse;
   }
   if (endpoint === "manifest") {
-    return "电脑助手已打开，但连接信息读取失败。请重启电脑助手，仍不行就安装最新版。";
+    return copy.messages.localNodeManifestFailed;
   }
   if (isLocalNodeBrowserBlock(error)) {
-    return "网页没有找到电脑助手。请打开电脑助手；如果还是不行，安装最新版后再点检测。";
+    return copy.messages.localNodeBlocked;
   }
-  return "未检测到电脑助手。请确认已打开，或安装最新版后再点检测。";
+  return copy.messages.localNodeNotDetected;
 }
 
 function isLocalNodeBrowserBlock(error: unknown) {
@@ -2406,27 +2467,29 @@ function isLocalNodeBrowserBlock(error: unknown) {
 }
 
 function localNodeStatusLabel(phase: LocalNodePhase) {
+  const labels = getPortalCopy().labels.localNodePhase;
   switch (phase) {
     case "checking":
-      return "检测中";
+      return labels.checking;
     case "online":
-      return "已在线";
+      return labels.online;
     case "degraded":
-      return "部分可用";
+      return labels.degraded;
     case "blocked":
-      return "未连上";
+      return labels.blocked;
     case "offline":
-      return "未启动";
+      return labels.offline;
     default:
-      return "待检测";
+      return labels.idle;
   }
 }
 
 function confirmedOrderMessage(order: Order) {
+  const messages = getPortalCopy().messages;
   if (order.payment_provider === "manual") {
-    return "申请已人工确认。请使用运营发送的开通码完成开通。";
+    return messages.confirmedManualOrder;
   }
-  return "开通已确认，刷新账户后即可继续下一步";
+  return messages.confirmedOrder;
 }
 
 function wizardStepClass(done: boolean, current: boolean) {
@@ -2449,28 +2512,30 @@ function setupStepNumber(input: {
 }
 
 function orderStatusLabel(status: string) {
+  const labels = getPortalCopy().labels.orderStatus;
   switch (status) {
     case "confirmed":
-      return "已开通";
+      return labels.confirmed;
     case "pending_manual_payment":
-      return "等待付款确认";
+      return labels.pendingManualPayment;
     case "pending":
-      return "处理中";
+      return labels.pending;
     case "cancelled":
-      return "已取消";
+      return labels.cancelled;
     default:
       return status;
   }
 }
 
 function paymentProviderLabel(provider: string) {
+  const labels = getPortalCopy().labels.paymentProvider;
   switch (provider) {
     case "manual":
-      return "人工确认";
+      return labels.manual;
     case "wechat":
-      return "微信支付";
+      return labels.wechat;
     case "stripe":
-      return "Stripe";
+      return labels.stripe;
     default:
       return provider;
   }
@@ -2483,39 +2548,40 @@ function localNodePairingStatus(
   leaseStatus: LocalLeaseStatus | null,
   cloudLeaseIssued: boolean
 ) {
+  const labels = getPortalCopy().labels.pairing;
   if (!entitlement) {
     return {
       kind: "warn",
-      title: "服务未开通",
-      message: "先开通服务或输入开通码，才能连接店铺并读取商品。"
+      title: labels.serviceClosedTitle,
+      message: labels.serviceClosedText
     };
   }
   if (!device) {
     if (localNode.phase !== "online") {
       return {
         kind: "warn",
-        title: "先连接电脑助手",
-        message: "服务已开通。打开电脑助手并检测成功后，就能授权这台电脑。"
+        title: labels.connectHelperTitle,
+        message: labels.connectHelperText
       };
     }
     return {
       kind: "warn",
-      title: "还没授权这台电脑",
-      message: "点“授权这台电脑”，把当前电脑加入你的账号。"
+      title: labels.notAuthorizedTitle,
+      message: labels.notAuthorizedText
     };
   }
   if (!leaseStatus?.valid) {
     const issue = userFacingLocalLeaseIssue(leaseStatus?.issue);
     return {
       kind: localNode.phase === "online" ? "warn" : "offline",
-      title: cloudLeaseIssued ? "电脑助手还没保存授权" : "还差最后一步",
-      message: issue ?? "再点一次“完成授权”，电脑助手就能开始工作。"
+      title: cloudLeaseIssued ? labels.helperLeaseMissingTitle : labels.almostDoneTitle,
+      message: issue ?? labels.confirmAgainText
     };
   }
   return {
     kind: localNode.phase === "online" ? "online" : "warn",
-    title: localNode.phase === "online" ? "这台电脑已授权" : "电脑授权已保存",
-    message: `有效期至 ${leaseStatus.expires_at ?? "授权到期前"}。`
+    title: localNode.phase === "online" ? labels.authorizedTitle : labels.savedTitle,
+    message: labels.expiresAt(leaseStatus.expires_at ?? labels.beforeExpiry)
   };
 }
 
@@ -2528,96 +2594,90 @@ function setupStatusModel(input: {
   order: Order | null;
   storeCredentialsReady: boolean;
 }) {
+  const labels = getPortalCopy().labels.setupStatus;
   const nodeOnline = input.localNode.phase === "online";
   if (!input.activeEntitlement) {
     return {
       kind: "warn",
-      title: input.order ? "等待服务开通" : "先开通服务",
-      message: input.order
-        ? "申请已经提交。付款或客服确认后，点“刷新开通状态”。"
-        : "开通后按提示安装电脑助手，再授权这台电脑。"
+      title: input.order ? labels.waitServiceTitle : labels.openServiceTitle,
+      message: input.order ? labels.orderPendingText : labels.openServiceText
     };
   }
   if (!nodeOnline) {
     return {
       kind: "warn",
-      title: "安装并打开电脑助手",
-      message: "下载电脑助手，打开后回到这里点“检测一下”。"
+      title: labels.installHelperTitle,
+      message: labels.installHelperText
     };
   }
   if (input.computerAuthorized) {
     if (!input.storeCredentialsReady) {
       return {
         kind: "warn",
-        title: "去电脑助手填写店铺 API",
-        message: "这台电脑已经授权。现在切到 Ozon Rust Local，在店铺授权里保存 Ozon Client ID 和 API Key。"
+        title: labels.fillStoreTitle,
+        message: labels.fillStoreText
       };
     }
     return {
       kind: "online",
-      title: "可以开始了",
-      message: "服务、电脑和店铺授权都准备好了。打开工作台读取商品，再把海报任务交给龙虾/Codex。"
+      title: labels.readyTitle,
+      message: labels.readyTextBrief
     };
   }
   if (!input.device) {
     return {
       kind: "warn",
-      title: "授权这台电脑",
-      message: "服务已开通，电脑助手也在线。现在把这台电脑加入账号。"
+      title: labels.authorizeTitle,
+      message: labels.authorizeText
     };
   }
   if (!input.computerAuthorized) {
     const issue = userFacingLocalLeaseIssue(input.localLeaseIssue);
     return {
       kind: "warn",
-      title: issue ? "电脑授权没有完成" : "完成电脑授权",
-      message: issue ?? "再确认一次授权，电脑助手就可以读取商品并交给龙虾/Codex。"
+      title: issue ? labels.incompleteTitle : labels.completeTitle,
+      message: issue ?? labels.completeText
     };
   }
   return {
     kind: "online",
-    title: "可以开始了",
-    message: "服务、电脑和店铺授权都准备好了。打开工作台读取商品，再交给龙虾/Codex 出图。"
+    title: labels.readyTitle,
+    message: labels.readyTextImage
   };
 }
 
 function userFacingLocalLeaseIssue(issue?: string | null) {
+  const messages = getPortalCopy().messages;
   if (!issue || issue === "cloud lease is not installed") return null;
   if (isLocalNodeBrowserBlock(new Error(issue))) {
-    return "网页没有连上电脑助手。请先打开电脑助手，再点“我已打开，检测一下”。";
+    return messages.localLeaseBrowserBlock;
   }
   if (issue.includes("public key") || issue.includes("signature")) {
-    return "你现在打开的是旧版电脑助手。请下载安装最新版，打开后再点“完成授权”。";
+    return messages.localLeaseOldHelper;
   }
   if (issue.includes("expired")) {
-    return "电脑授权已过期，请重新完成授权。";
+    return messages.localLeaseExpired;
   }
   if (issue.includes("stored cloud lease is invalid")) {
-    return "电脑里的授权记录已失效，请重新点“完成授权”。";
+    return messages.localLeaseInvalid;
   }
-  return "电脑助手没有保存授权。请重启电脑助手，仍不行就安装最新版后再试。";
+  return messages.localLeaseMissing;
 }
 
 function localLeaseWriteFailureMessage(error: unknown) {
   const issue = userFacingLocalLeaseIssue(errorMessage(error));
-  return issue ?? "电脑助手没有保存授权。请重启电脑助手，仍不行就安装最新版后再试。";
+  return issue ?? getPortalCopy().messages.localLeaseMissing;
 }
 
 function userFacingLocalNodeIssue(error: unknown) {
   const issue = userFacingLocalLeaseIssue(stripLocalNodeEndpointPrefix(errorMessage(error)));
-  return issue ?? "账户授权状态读取失败。请重启电脑助手，仍不行就安装最新版。";
+  return issue ?? getPortalCopy().messages.localNodeIssue;
 }
 
 function statusMessageTone(message: string, phase: AuthPhase, busy: boolean) {
   if (busy) return "ok";
   if (phase === "failed") return "danger";
-  if (/(失败|不能|没有找到|没有保存|读取失败|未检测|太旧|不完整|失效|过期)/.test(message)) {
-    return "danger";
-  }
-  if (/(请|需要|等待|未开通|未启动|处理中)/.test(message)) {
-    return "warn";
-  }
-  return "ok";
+  return portalMessageTone(message);
 }
 
 function absolutePortalUrl(pathOrUrl: string) {
@@ -2647,12 +2707,13 @@ function localNodeDownloads(
   msiUrl: string,
   exeUrl: string
 ): LocalNodeDownloadOption[] {
+  const labels = getPortalCopy().labels.downloads;
   const mac = macDmgUrl
-    ? [{ key: "mac-dmg", label: "Mac 安装包", shortLabel: "下载 Mac 版", url: macDmgUrl }]
+    ? [{ key: "mac-dmg", label: labels.macLabel, shortLabel: labels.macShort, url: macDmgUrl }]
     : [];
   const windows = [
-    ...(msiUrl ? [{ key: "windows-msi", label: "Windows 安装包", shortLabel: "下载 Windows 版", url: msiUrl }] : []),
-    ...(exeUrl ? [{ key: "windows-exe", label: "Windows 备用安装包", shortLabel: "备用下载", url: exeUrl }] : [])
+    ...(msiUrl ? [{ key: "windows-msi", label: labels.windowsMsiLabel, shortLabel: labels.windowsMsiShort, url: msiUrl }] : []),
+    ...(exeUrl ? [{ key: "windows-exe", label: labels.windowsExeLabel, shortLabel: labels.windowsExeShort, url: exeUrl }] : [])
   ];
 
   if (platform === "mac") return [...mac, ...windows];
@@ -2692,7 +2753,7 @@ function defaultCloudApiBase() {
   if (import.meta.env.DEV) {
     return "http://127.0.0.1:8080";
   }
-  throw new Error("VITE_CLOUD_API must be configured for this production portal host");
+  throw new Error(getPortalCopy().messages.cloudApiRequired);
 }
 
 function normalizeOptionalUrl(value: string | undefined) {
@@ -2710,43 +2771,8 @@ async function skybridgePasswordAuth(input: {
   name: string;
   captchaToken?: string;
 }): Promise<SkybridgeAuthSession> {
-  if (!SKYBRIDGE_AUTH_CONFIGURED) {
-    throw new Error("邮箱/手机号登录未配置");
-  }
-  if (input.mode === "register" && input.method === "nebula") {
-    throw new Error("账号编号由系统分配，注册请使用邮箱或手机号");
-  }
-  if (input.method === "nebula") {
-    return skybridgeNebulaLogin(input.identifier, input.password);
-  }
-  if (input.method === "phone") {
-    return skybridgePhoneOtpLogin(input.identifier, input.phoneCode ?? "");
-  }
-
-  const endpoint =
-    input.mode === "register"
-      ? `${SKYBRIDGE_AUTH_BASE}/auth/v1/signup`
-      : `${SKYBRIDGE_AUTH_BASE}/auth/v1/token?grant_type=password`;
-  const body = {
-    email: input.identifier.trim(),
-    password: input.password,
-    data: skybridgeMetadata(input.name, "email"),
-    gotrue_meta_security: skybridgeCaptchaMetadata(input.captchaToken)
-  };
-  const response = await fetchWithTimeout(endpoint, {
-    method: "POST",
-    headers: skybridgeAuthHeaders(),
-    body: JSON.stringify(body)
-  });
-  const result = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(skybridgeErrorMessage(result, "账号认证失败"));
-  }
-  const session = extractSkybridgeSession(result);
-  if (!session?.access_token) {
-    throw new Error("身份服务已接受请求，请完成邮箱验证后再登录");
-  }
-  return session;
+  const directAuth = await loadDirectSkybridgeAuth();
+  return directAuth.skybridgePasswordAuth(input, directSkybridgeAuthConfig());
 }
 
 async function skybridgeSendPhoneOtp(input: {
@@ -2755,49 +2781,8 @@ async function skybridgeSendPhoneOtp(input: {
   name: string;
   captchaToken?: string;
 }) {
-  if (!SKYBRIDGE_AUTH_CONFIGURED) {
-    throw new Error("邮箱/手机号登录未配置");
-  }
-
-  const body: Record<string, unknown> = {
-    phone: input.phone.trim(),
-    gotrue_meta_security: skybridgeCaptchaMetadata(input.captchaToken)
-  };
-  if (input.mode === "register") {
-    body.data = skybridgeMetadata(input.name, "phone");
-  }
-
-  const response = await fetchWithTimeout(`${SKYBRIDGE_AUTH_BASE}/auth/v1/otp`, {
-    method: "POST",
-    headers: skybridgeAuthHeaders(),
-    body: JSON.stringify(body)
-  });
-  const result = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(skybridgeErrorMessage(result, "短信验证码发送失败"));
-  }
-}
-
-async function skybridgePhoneOtpLogin(phone: string, token: string): Promise<SkybridgeAuthSession> {
-  const response = await fetchWithTimeout(`${SKYBRIDGE_AUTH_BASE}/auth/v1/token`, {
-    method: "POST",
-    headers: skybridgeAuthHeaders(),
-    body: JSON.stringify({
-      phone: phone.trim(),
-      token: token.trim(),
-      type: "sms",
-      grant_type: "otp"
-    })
-  });
-  const result = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(skybridgeErrorMessage(result, "手机号验证码登录失败"));
-  }
-  const session = extractSkybridgeSession(result);
-  if (!session?.access_token) {
-    throw new Error("手机号验证码响应无效");
-  }
-  return session;
+  const directAuth = await loadDirectSkybridgeAuth();
+  await directAuth.skybridgeSendPhoneOtp(input, directSkybridgeAuthConfig());
 }
 
 async function skybridgeUpdatePhoneRegistrationProfile(input: {
@@ -2806,88 +2791,38 @@ async function skybridgeUpdatePhoneRegistrationProfile(input: {
   email: string;
   name: string;
 }) {
-  const displayName = input.name.trim();
-  const email = input.email.trim();
-  if (!displayName || !email) {
-    throw new Error("手机号注册需要填写昵称和联系邮箱");
-  }
-
-  const currentProfile = await skybridgeFetchCurrentUserProfile(input.accessToken);
-  if (!shouldBootstrapSkybridgePhoneProfile(currentProfile)) {
-    return;
-  }
-
-  const response = await fetchWithTimeout(`${SKYBRIDGE_AUTH_BASE}/auth/v1/user`, {
-    method: "PUT",
-    headers: {
-      ...skybridgeAuthHeaders(),
-      Authorization: `Bearer ${input.accessToken}`
-    },
-    body: JSON.stringify({
-      email,
-      data: {
-        display_name: displayName,
-        phone_number: input.phone.trim()
-      }
-    })
-  });
-  const result = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(skybridgeErrorMessage(result, "手机号注册资料回写失败"));
-  }
+  const directAuth = await loadDirectSkybridgeAuth();
+  await directAuth.skybridgeUpdatePhoneRegistrationProfile(input, directSkybridgeAuthConfig());
 }
 
-async function skybridgeFetchCurrentUserProfile(accessToken: string): Promise<SkybridgeCurrentUserProfile | null> {
-  const response = await fetchWithTimeout(`${SKYBRIDGE_AUTH_BASE}/auth/v1/user`, {
-    headers: {
-      apikey: SKYBRIDGE_ANON_KEY,
-      Authorization: `Bearer ${accessToken}`
-    }
-  });
-  const result = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(skybridgeErrorMessage(result, "用户资料读取失败"));
+async function loadDirectSkybridgeAuth() {
+  if (!DIRECT_SKYBRIDGE_AUTH_ENABLED) {
+    throw new Error(getPortalCopy().messages.directAuthNotConfigured);
   }
-  return typeof result === "object" && result !== null ? (result as SkybridgeCurrentUserProfile) : null;
+  if (
+    import.meta.env.VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH === "1" ||
+    import.meta.env.VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH === "true" ||
+    import.meta.env.VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH === "yes"
+  ) {
+    return import("./skybridgeAuth");
+  }
+  throw new Error(getPortalCopy().messages.directAuthNotConfigured);
 }
 
-function shouldBootstrapSkybridgePhoneProfile(profile: SkybridgeCurrentUserProfile | null) {
-  if (!profile) return false;
-  const metadata = profile.user_metadata ?? {};
-  const nebulaId = stringFromMetadata(metadata, "nebula_id") ?? stringFromMetadata(metadata, "nebulaId");
-  const displayName =
-    stringFromMetadata(metadata, "display_name") ??
-    stringFromMetadata(metadata, "full_name") ??
-    stringFromMetadata(metadata, "name");
-  return !nebulaId && !profile.email && isPlaceholderDisplayName(displayName);
-}
-
-async function skybridgeNebulaLogin(nebulaId: string, password: string): Promise<SkybridgeAuthSession> {
-  const response = await fetchWithTimeout(`${SKYBRIDGE_AUTH_BASE}/functions/v1/nebula-login`, {
-    method: "POST",
-    headers: skybridgeAuthHeaders(),
-    body: JSON.stringify({
-      nebula_id: nebulaId.trim().toUpperCase(),
-      password
-    })
-  });
-  const result = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(skybridgeErrorMessage(result, "账号编号登录失败"));
-  }
-  const session = extractSkybridgeSession(result);
-  if (!session?.access_token) {
-    throw new Error("账号编号登录响应无效");
-  }
-  return session;
+function directSkybridgeAuthConfig() {
+  return {
+    authBase: SKYBRIDGE_AUTH_BASE,
+    publicAuthKey: SKYBRIDGE_PUBLIC_AUTH_KEY.trim(),
+    phoneAuthEnabled: SKYBRIDGE_PHONE_AUTH_ENABLED
+  };
 }
 
 async function redirectToNebulaOAuth(flow: NebulaOAuthFlow) {
   if (!NEBULA_OAUTH_CONFIGURED) {
-    throw new Error("请先配置 VITE_NEBULA_BASE_URL 和 VITE_NEBULA_CLIENT_ID");
+    throw new Error(getPortalCopy().messages.oauthConfigRequired);
   }
   if (!crypto.getRandomValues || !crypto.subtle) {
-    throw new Error("当前浏览器不支持 Web Crypto，无法启动 PKCE 授权");
+    throw new Error(getPortalCopy().messages.cryptoUnsupported);
   }
 
   const state = randomPkceString(32);
@@ -2939,11 +2874,11 @@ async function exchangeNebulaOAuthCode(
   });
   const result = await response.json().catch(() => null);
   if (!response.ok) {
-    throw new Error(skybridgeErrorMessage(result, "网页登录失败"));
+    throw new Error(skybridgeErrorMessage(result, getPortalCopy().messages.webLoginFailed));
   }
   const session = extractSkybridgeSession(result);
   if (!session?.access_token) {
-    throw new Error("网页登录返回信息无效");
+    throw new Error(getPortalCopy().messages.webLoginInvalid);
   }
   return session;
 }
@@ -3004,26 +2939,6 @@ async function sha256Base64Url(value: string) {
   return encodeBase64Url(new Uint8Array(digest));
 }
 
-function skybridgeAuthHeaders() {
-  return {
-    "Content-Type": "application/json",
-    apikey: SKYBRIDGE_ANON_KEY,
-    Authorization: `Bearer ${SKYBRIDGE_ANON_KEY}`
-  };
-}
-
-function skybridgeMetadata(name: string, accountType: "email" | "phone") {
-  return {
-    account_type: accountType,
-    full_name: name.trim() || undefined
-  };
-}
-
-function skybridgeCaptchaMetadata(captchaToken?: string) {
-  const token = captchaToken?.trim();
-  return token ? { captcha_token: token } : undefined;
-}
-
 function normalizePhoneForSkybridge(value: string) {
   const sanitized = value
     .trim()
@@ -3040,20 +2955,9 @@ function isValidSkybridgePhone(value: string) {
   return /^\+[1-9]\d{1,14}$/.test(value);
 }
 
-function stringFromMetadata(metadata: Record<string, unknown>, key: string) {
-  const value = metadata[key];
-  return typeof value === "string" ? value.trim() : undefined;
-}
-
-function isPlaceholderDisplayName(value: string | undefined) {
-  const trimmed = value?.trim() ?? "";
-  if (!trimmed) return true;
-  return ["用户", "新用户", "访客", "Apple 用户", "Nebula 用户", "User", "New User", "Guest"].includes(trimmed);
-}
-
 function loadTurnstileScript() {
   if (!SKYBRIDGE_TURNSTILE_SCRIPT_URL) {
-    return Promise.reject(new Error("安全验证脚本未配置"));
+    return Promise.reject(new Error(getPortalCopy().messages.turnstileScriptNotConfigured));
   }
   if (window.turnstile) {
     return Promise.resolve();
@@ -3063,7 +2967,7 @@ function loadTurnstileScript() {
   if (existing) {
     return new Promise<void>((resolve, reject) => {
       existing.addEventListener("load", () => resolve(), { once: true });
-      existing.addEventListener("error", () => reject(new Error("Cloudflare Turnstile 脚本加载失败")), {
+      existing.addEventListener("error", () => reject(new Error(getPortalCopy().messages.turnstileScriptLoadFailed)), {
         once: true
       });
     });
@@ -3076,20 +2980,21 @@ function loadTurnstileScript() {
     script.defer = true;
     script.src = SKYBRIDGE_TURNSTILE_SCRIPT_URL;
     script.onload = () => resolve();
-    script.onerror = () => reject(new Error("Cloudflare Turnstile 脚本加载失败"));
+    script.onerror = () => reject(new Error(getPortalCopy().messages.turnstileScriptLoadFailed));
     document.head.appendChild(script);
   });
 }
 
 function turnstileFailureMessage(error: unknown) {
+  const messages = getPortalCopy().messages;
   const code = String(error ?? "").trim();
   if (code.startsWith("200500")) {
-    return "安全验证没有加载成功。请确认浏览器没有拦截验证服务。";
+    return messages.turnstileServiceBlocked;
   }
   if (code.startsWith("300") || code.startsWith("600")) {
-    return "安全验证没有通过。请关闭代理或脚本拦截，换浏览器/网络后重试。";
+    return messages.turnstileNotPassed;
   }
-  return code ? `安全验证失败：${code}` : "安全验证失败，请刷新页面后重试";
+  return messages.turnstileFailed(code);
 }
 
 function extractSkybridgeSession(value: unknown): SkybridgeAuthSession | null {
@@ -3161,33 +3066,28 @@ function buildLocalAuthBody(
 function displayLoginAlias(user: User) {
   if (user.email) return user.email;
   if (user.phone) return user.phone;
-  return "未绑定";
-}
-
-function displayNebulaId(user: User) {
-  return user.nebula_id ?? "刷新中";
-}
-
-function identitySourceLabel(source: User["nebula_source"]) {
-  return source === "skybridge" ? "Nebula" : "local_dev";
+  return getPortalCopy().labels.display.unbound;
 }
 
 function methodLabel(method: LoginMethod) {
-  if (method === "email") return "邮箱";
-  if (method === "phone") return "手机号";
-  return "账号编号";
+  const labels = getPortalCopy().labels.methods;
+  if (method === "email") return labels.email;
+  if (method === "phone") return labels.phone;
+  return labels.nebula;
 }
 
 function identifierLabel(mode: AuthMode, loginMethod: LoginMethod) {
-  if (loginMethod === "email") return "邮箱";
-  if (loginMethod === "phone") return "手机号";
-  return mode === "login" ? "账号编号" : "邮箱";
+  const labels = getPortalCopy().labels.methods;
+  if (loginMethod === "email") return labels.email;
+  if (loginMethod === "phone") return labels.phone;
+  return mode === "login" ? labels.nebula : labels.email;
 }
 
 function identifierPlaceholder(mode: AuthMode, loginMethod: LoginMethod) {
-  if (loginMethod === "email") return "name@example.com";
-  if (loginMethod === "phone") return "请输入手机号";
-  return mode === "login" ? "请输入账号编号" : "name@example.com";
+  const placeholders = getPortalCopy().labels.placeholders;
+  if (loginMethod === "email") return placeholders.email;
+  if (loginMethod === "phone") return placeholders.phone;
+  return mode === "login" ? placeholders.nebula : placeholders.email;
 }
 
 function identifierAutocomplete(loginMethod: LoginMethod) {
@@ -3199,7 +3099,7 @@ function identifierAutocomplete(loginMethod: LoginMethod) {
 function formatMoney(amountMinor: number, currency: string) {
   const normalizedCurrency = currency.toUpperCase();
   try {
-    return new Intl.NumberFormat("zh-CN", {
+    return new Intl.NumberFormat(getCurrentLocale() === "zh" ? "zh-CN" : "en-US", {
       style: "currency",
       currency: normalizedCurrency
     }).format(amountMinor / 100);
@@ -3229,7 +3129,7 @@ function isInvalidSessionError(error: unknown) {
 function skybridgeDirectAuthFailureMessage(error: unknown) {
   const message = errorMessage(error);
   if (isCaptchaProtectionMessage(message)) {
-    return "这次登录需要先完成安全验证。请刷新页面重试；如果仍失败，请联系运营处理账号风控。";
+    return getPortalCopy().messages.captchaProtection;
   }
   return message;
 }
@@ -3245,12 +3145,13 @@ type PortalWindow = Window & {
 
 const rootElement = document.getElementById("root");
 if (!rootElement) {
-  throw new Error("missing root element");
+  throw new Error(getPortalCopy().messages.missingRoot);
 }
 
 const portalWindow = window as PortalWindow;
 const root = portalWindow.__OZON_PORTAL_ROOT__ ?? createRoot(rootElement);
 portalWindow.__OZON_PORTAL_ROOT__ = root;
+applyDocumentLocale(getCurrentLocale());
 const customerGuidePath = ["/customer-guide", "/customer-guide.html"].includes(
   window.location.pathname
 );

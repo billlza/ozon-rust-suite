@@ -2,7 +2,7 @@
 
 This line is separate from the Vercel overseas deployment. It serves the same
 portal code as static files, but it must not rely on Cloudflare Turnstile,
-direct Supabase browser auth, or Vercel edge routing.
+direct Supabase browser auth, phone/SMS auth flags, or Vercel edge routing.
 
 ## Chosen target
 
@@ -32,8 +32,8 @@ pnpm build:portal:mainland -- --env-file deploy/.env.portal-mainland
 ```
 
 The build script fails if the portal bundle contains the Cloudflare Turnstile
-script, direct SkyBridge/Supabase browser auth markers, or the compatibility
-email/phone login panel.
+script, direct SkyBridge/Supabase browser auth markers, phone/SMS auth enablement,
+or the compatibility email/phone login panel.
 
 ## Static hosting requirements
 
@@ -98,7 +98,9 @@ nebula-cn.ozon66.com   CNAME/A <Nebula/SkyBridge CN identity target>
 The portal is only an OAuth relying party. Human verification, SMS, MFA, and
 risk checks must happen inside Nebula/SkyBridge before it issues the
 authorization code. For mainland users, Nebula/SkyBridge needs a
-mainland-accessible verification provider and server-side verification.
+mainland-accessible verification provider and server-side verification; do not
+publish a portal-side "send SMS code" entry until that path has been tested end
+to end.
 
 This repository currently contains only the local development issuer under
 `apps/nebula-dev-issuer`; the production Nebula/SkyBridge identity service must

@@ -37,6 +37,16 @@ button:hover {
   background: #18bb83;
 }
 
+button:disabled {
+  background: #cfd8d2;
+  color: #7b8880;
+  cursor: not-allowed;
+}
+
+button:disabled:hover {
+  background: #cfd8d2;
+}
+
 .secondary-button {
   background: #ece8dd;
   color: #26342d;
@@ -48,6 +58,12 @@ button:hover {
   background: #ded8ca;
 }
 
+.secondary-button:disabled,
+.secondary-button:disabled:hover {
+  background: #ece8dd;
+  color: #9aa39d;
+}
+
 main {
   margin: 0 auto;
   max-width: 1280px;
@@ -57,6 +73,7 @@ main {
 nav {
   align-items: center;
   display: flex;
+  gap: 14px;
   justify-content: space-between;
   margin-bottom: 20px;
 }
@@ -75,6 +92,30 @@ nav div span {
   color: #68746d;
   font-size: 13px;
   font-weight: 800;
+}
+
+.language-switch {
+  align-items: center;
+  display: inline-flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.language-switch span {
+  color: #68746d;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.language-switch select {
+  background: #fffdf8;
+  border: 1px solid #d6d2c8;
+  border-radius: 8px;
+  color: #17201b;
+  font-size: 13px;
+  font-weight: 900;
+  min-height: 34px;
+  padding: 0 34px 0 10px;
 }
 
 nav > span {
@@ -227,6 +268,166 @@ article span {
   background: #fffefa;
   border: 1px solid #ddd8cc;
   border-radius: 8px;
+  padding: 20px;
+}
+
+.setup-guide {
+  background: #fffefa;
+  border: 1px solid #b8dfc9;
+  border-radius: 8px;
+  box-shadow: 0 18px 40px rgba(23, 32, 27, 0.06);
+  margin-bottom: 20px;
+  padding: 20px;
+}
+
+.setup-guide .section-title {
+  margin-bottom: 16px;
+}
+
+.setup-steps {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.setup-step {
+  align-items: flex-start;
+  background: #f7f5ef;
+  border: 1px solid #ddd8cc;
+  border-radius: 8px;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: auto minmax(0, 1fr);
+  min-height: 138px;
+  padding: 14px;
+}
+
+.setup-step.done {
+  background: #edf8f1;
+  border-color: #b8dfc9;
+}
+
+.setup-step.active {
+  background: #fffaf0;
+  border-color: #e8be79;
+}
+
+.setup-step.ready {
+  background: #f4fbf7;
+  border-color: #c7e7d4;
+}
+
+.setup-step.wait {
+  opacity: 0.78;
+}
+
+.step-number {
+  align-items: center;
+  background: #17201b;
+  border-radius: 999px;
+  color: #f8fff9;
+  display: inline-flex;
+  font-size: 13px;
+  font-weight: 900;
+  height: 30px;
+  justify-content: center;
+  width: 30px;
+}
+
+.setup-step.done .step-number {
+  background: #00a36c;
+}
+
+.setup-step.active .step-number {
+  background: #d18400;
+}
+
+.setup-step strong,
+.setup-step em {
+  display: block;
+}
+
+.setup-step em {
+  color: #007d57;
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 900;
+  margin-top: 4px;
+}
+
+.setup-step p {
+  color: #536059;
+  font-size: 13px;
+  font-weight: 760;
+  line-height: 1.45;
+  margin-top: 9px;
+}
+
+.setup-action-row {
+  align-items: center;
+  border-top: 1px solid #e1ddd1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 16px;
+}
+
+.setup-action-row p {
+  color: #536059;
+  flex: 1 1 280px;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.advanced-connect {
+  border-top: 1px solid #e1ddd1;
+  padding-top: 12px;
+}
+
+.advanced-connect summary,
+.advanced-local-settings summary {
+  color: #26342d;
+  cursor: pointer;
+  font-weight: 900;
+}
+
+.advanced-connect[open] summary {
+  margin-bottom: 12px;
+}
+
+.compact-tools {
+  margin-top: 10px;
+}
+
+.advanced-local-settings {
+  grid-column: 1 / -1;
+}
+
+.advanced-local-settings > summary {
+  background: #f4f2ec;
+  border: 1px solid #ddd8cc;
+  border-radius: 8px;
+  list-style: none;
+  padding: 14px 16px;
+}
+
+.advanced-local-settings > summary::-webkit-details-marker {
+  display: none;
+}
+
+.advanced-local-settings[open] > summary {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.advanced-local-grid {
+  border: 1px solid #ddd8cc;
+  border-top: 0;
+  border-radius: 0 0 8px 8px;
+  display: grid;
+  gap: 20px;
+  grid-template-columns: 0.72fr 1.28fr;
   padding: 20px;
 }
 
@@ -820,6 +1021,8 @@ footer span {
   .overview,
   .grid,
   .workspace-grid,
+  .setup-steps,
+  .advanced-local-grid,
   .status-list,
   .poster-preview-shell,
   .poster-editor,

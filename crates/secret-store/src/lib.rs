@@ -135,53 +135,75 @@ impl LayeredSecretStore {
 #[async_trait]
 impl SecretStore for LayeredSecretStore {
     async fn put(&self, name: SecretName, value: SecretString) -> Result<(), SecretStoreError> {
-        let primary_name = name.clone();
-        let primary_value = value.clone();
-        let fallback = self.fallback.put(name, value).await;
+        // The primary store (OS keyring) is authoritative. Write it first; only fall back to
+        // the on-disk store when the keyring is genuinely unavailable, so a working keyring
+        // never leaves a plaintext copy of the secret on disk.
         let primary = timeout(
             PRIMARY_SECRET_STORE_TIMEOUT,
-            self.primary.put(primary_name, primary_value),
+            self.primary.put(name.clone(), value.clone()),
         )
         .await;
-        let primary = match primary {
-            Ok(result) => result,
-            Err(_) => Err(SecretStoreError::BackendUnavailable),
-        };
-        if fallback.is_err() {
-            return fallback;
+        match primary {
+            Ok(Ok(())) => {
+                // Stored in the keyring; drop any stale plaintext copy from the fallback.
+                let _ = self.fallback.delete(&name).await;
+                Ok(())
+            }
+            Ok(Err(_)) | Err(_) => {
+                // Keyring unavailable: persist to the 0600 fallback file so the secret is not lost.
+                self.fallback.put(name, value).await
+            }
         }
-        let _ = primary;
-        Ok(())
     }
 
     async fn get(&self, name: &SecretName) -> Result<Option<SecretString>, SecretStoreError> {
-        let fallback = self.fallback.get(name).await;
-        if let Ok(Some(value)) = fallback.as_ref() {
-            return Ok(Some(value.clone()));
-        }
-
+        // Read the authoritative keyring first; consult the fallback only on a keyring miss or
+        // when the keyring is unavailable.
         let primary = timeout(PRIMARY_SECRET_STORE_TIMEOUT, self.primary.get(name)).await;
         match primary {
             Ok(Ok(Some(value))) => {
-                let _ = self.fallback.put(name.clone(), value.clone()).await;
+                // Authoritative hit; ensure no stale plaintext copy lingers in the fallback.
+                let _ = self.fallback.delete(name).await;
                 Ok(Some(value))
             }
-            Ok(Ok(None)) => fallback,
-            Ok(Err(_)) | Err(_) => fallback,
+            Ok(Ok(None)) => {
+                // Not in the keyring. A value may exist in the fallback from a legacy write or a
+                // period when the keyring was unavailable: migrate it into the keyring and drop
+                // the plaintext copy so it stops living on disk.
+                match self.fallback.get(name).await? {
+                    Some(value) => {
+                        let migrated = timeout(
+                            PRIMARY_SECRET_STORE_TIMEOUT,
+                            self.primary.put(name.clone(), value.clone()),
+                        )
+                        .await;
+                        if matches!(migrated, Ok(Ok(()))) {
+                            let _ = self.fallback.delete(name).await;
+                        }
+                        Ok(Some(value))
+                    }
+                    None => Ok(None),
+                }
+            }
+            Ok(Err(_)) | Err(_) => {
+                // Keyring errored or timed out: fall back to the on-disk store for this read.
+                self.fallback.get(name).await
+            }
         }
     }
 
     async fn delete(&self, name: &SecretName) -> Result<(), SecretStoreError> {
-        let fallback = self.fallback.delete(name).await;
+        // Revocation must be reliable: remove the secret from both layers and report failure if
+        // the authoritative keyring delete does not succeed, otherwise a revoked secret could be
+        // resurrected from the keyring on the next read.
         let primary = timeout(PRIMARY_SECRET_STORE_TIMEOUT, self.primary.delete(name)).await;
         let primary = match primary {
             Ok(result) => result,
             Err(_) => Err(SecretStoreError::BackendUnavailable),
         };
-        if fallback.is_err() {
-            return fallback;
-        }
-        let _ = primary;
+        let fallback = self.fallback.delete(name).await;
+        primary?;
+        fallback?;
         Ok(())
     }
 }
@@ -307,10 +329,13 @@ pub fn fingerprint_secret(secret: &SecretString) -> String {
 }
 
 pub fn redact(input: &str) -> String {
-    if input.len() <= 8 {
+    let chars: Vec<char> = input.chars().collect();
+    if chars.len() <= 8 {
         return "********".to_string();
     }
-    format!("{}…{}", &input[..4], &input[input.len() - 4..])
+    let prefix: String = chars[..4].iter().collect();
+    let suffix: String = chars[chars.len() - 4..].iter().collect();
+    format!("{prefix}…{suffix}")
 }
 
 fn is_safe_identifier(value: &str) -> bool {
@@ -408,6 +433,28 @@ mod tests {
 
         let value = store.get(&name).await.unwrap().unwrap();
         assert_eq!(value.expose_secret(), "lease");
+    }
+
+    #[tokio::test]
+    async fn layered_store_put_keeps_secret_out_of_fallback_when_primary_ok() {
+        let primary = Arc::new(MemorySecretStore::default());
+        let fallback = Arc::new(MemorySecretStore::default());
+        let store = LayeredSecretStore::new(primary.clone(), fallback.clone());
+        let name = SecretName::new("ozon_api_key");
+        store
+            .put(name.clone(), SecretString::from("k"))
+            .await
+            .unwrap();
+        // Authoritative keyring holds it; no plaintext copy remains in the fallback.
+        assert!(fallback.get(&name).await.unwrap().is_none());
+        assert_eq!(
+            primary.get(&name).await.unwrap().unwrap().expose_secret(),
+            "k"
+        );
+        // A delete clears both layers.
+        store.delete(&name).await.unwrap();
+        assert!(primary.get(&name).await.unwrap().is_none());
+        assert!(fallback.get(&name).await.unwrap().is_none());
     }
 
     #[test]

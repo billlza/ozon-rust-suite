@@ -15,6 +15,7 @@ use tauri_plugin_shell::{
     ShellExt,
     process::{CommandChild, CommandEvent},
 };
+use url::Url;
 
 const SKILL_API: &str = "http://127.0.0.1:8790";
 const AGENT_API: &str = "http://127.0.0.1:17870";
@@ -24,7 +25,6 @@ struct LocalNodeRuntime {
     skill_api: String,
     agent_api: String,
     local_token: String,
-    openclaw_token: String,
     connector_mode: String,
     sidecar_pid: Option<u32>,
     sidecar_status: String,
@@ -101,7 +101,6 @@ impl SidecarState {
             skill_api: self.runtime.skill_api.clone(),
             agent_api: self.runtime.agent_api.clone(),
             local_token: self.runtime.local_token.clone(),
-            openclaw_token: self.runtime.openclaw_token.clone(),
             connector_mode: self.runtime.connector_mode.clone(),
             sidecar_pid: snapshot.pid,
             sidecar_status: snapshot.status.clone(),
@@ -146,6 +145,13 @@ fn restart_local_node(app: AppHandle, state: State<'_, SidecarState>) -> LocalNo
     state.runtime()
 }
 
+#[tauri::command]
+fn open_openclaw_binding_url(bind_url: String) -> Result<(), String> {
+    validate_openclaw_binding_url(&bind_url)?;
+    tauri_plugin_opener::open_url(bind_url, None::<&str>)
+        .map_err(|error| format!("failed to open browser: {error}"))
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -178,10 +184,65 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             local_node_runtime,
-            restart_local_node
+            restart_local_node,
+            open_openclaw_binding_url
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Ozon Rust Suite local UI");
+}
+
+fn validate_openclaw_binding_url(bind_url: &str) -> Result<(), String> {
+    let parsed = Url::parse(bind_url).map_err(|_| "invalid binding URL".to_string())?;
+    if parsed.path() != "/openclaw/import" {
+        return Err("binding URL path is not allowed".to_string());
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    let origin_allowed = matches!(
+        (parsed.scheme(), host, parsed.port_or_known_default()),
+        (
+            "https",
+            "ozonclaw.jl696.cn" | "www.ozonclaw.jl696.cn",
+            Some(443)
+        ) | ("http", "127.0.0.1" | "localhost", Some(18789))
+    );
+    if !origin_allowed {
+        return Err("binding URL origin is not allowed".to_string());
+    }
+    let fragment = parsed
+        .fragment()
+        .ok_or_else(|| "binding URL is missing pairing fragment".to_string())?;
+    if !fragment
+        .split('&')
+        .any(|part| part.starts_with("ozon66_pairing_code="))
+    {
+        return Err("binding URL is missing pairing code".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod openclaw_binding_url_tests {
+    use super::validate_openclaw_binding_url;
+
+    #[test]
+    fn openclaw_binding_url_allows_expected_origin_and_fragment() {
+        assert!(
+            validate_openclaw_binding_url(
+                "https://ozonclaw.jl696.cn/openclaw/import#ozon66_pairing_code=abc"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn openclaw_binding_url_rejects_unexpected_origin() {
+        assert!(
+            validate_openclaw_binding_url(
+                "https://example.com/openclaw/import#ozon66_pairing_code=abc"
+            )
+            .is_err()
+        );
+    }
 }
 
 fn start_managed_sidecar(app: &AppHandle) {
@@ -377,14 +438,10 @@ fn probe_existing_local_node(local_token: &str) -> ExistingLocalNode {
         return ExistingLocalNode::Missing;
     }
     if !probe_health_endpoint("127.0.0.1:17870") {
-        return ExistingLocalNode::Blocked(
-            "127.0.0.1:8790 已有 Ozon 本地节点，但 17870 agent 端口未就绪".to_string(),
-        );
+        return ExistingLocalNode::Blocked("existing_node_agent_port_not_ready".to_string());
     }
-    if !probe_config_status_endpoint(local_token) {
-        return ExistingLocalNode::Blocked(
-            "检测到已有 Ozon 本地节点，但当前桌面端 token 无法访问 /config/status".to_string(),
-        );
+    if !probe_attest_endpoint(local_token) {
+        return ExistingLocalNode::Blocked("existing_node_token_rejected".to_string());
     }
     ExistingLocalNode::Ready
 }
@@ -402,9 +459,69 @@ fn probe_health_endpoint(addr: &str) -> bool {
     health.service.as_deref() == Some("ozon-local-node") && health.status.as_deref() == Some("ok")
 }
 
-fn probe_config_status_endpoint(local_token: &str) -> bool {
-    probe_http_endpoint("127.0.0.1:8790", "/config/status", Some(local_token))
-        .is_some_and(|response| response.status_code == 200)
+/// Verify a pre-existing node holds the same operator token WITHOUT transmitting the token:
+/// challenge it with a fresh nonce and accept only a correct HMAC-SHA256(local_token, nonce)
+/// proof. A port squatter that lacks the token cannot answer, so the token is never disclosed to
+/// an unauthenticated peer (and is only ever sent to a peer that has proven it already holds it).
+fn probe_attest_endpoint(local_token: &str) -> bool {
+    let nonce = generate_nonce();
+    let Some(response) =
+        probe_http_endpoint("127.0.0.1:8790", "/attest", Some(("x-attest-nonce", &nonce)))
+    else {
+        return false;
+    };
+    if response.status_code != 200 {
+        return false;
+    }
+    let Ok(parsed) = serde_json::from_str::<AttestProbe>(response.body.trim()) else {
+        return false;
+    };
+    let Some(proof) = parsed.proof else {
+        return false;
+    };
+    constant_time_eq(proof.as_bytes(), attest_proof(local_token, &nonce).as_bytes())
+}
+
+#[derive(Deserialize)]
+struct AttestProbe {
+    proof: Option<String>,
+}
+
+fn generate_nonce() -> String {
+    rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect()
+}
+
+/// HMAC-SHA256(local_token, nonce), lowercase hex. Must stay byte-for-byte identical to the
+/// `attest_proof` served by the local-node `/attest` endpoint.
+fn attest_proof(token: &str, nonce: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    use std::fmt::Write as _;
+
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(token.as_bytes()).expect("HMAC accepts a key of any size");
+    mac.update(nonce.as_bytes());
+    let bytes = mac.finalize().into_bytes();
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 struct HttpProbeResponse {
@@ -415,7 +532,7 @@ struct HttpProbeResponse {
 fn probe_http_endpoint(
     addr: &str,
     path: &str,
-    local_token: Option<&str>,
+    header: Option<(&str, &str)>,
 ) -> Option<HttpProbeResponse> {
     let Ok(mut stream) = TcpStream::connect(addr) else {
         return None;
@@ -424,9 +541,10 @@ fn probe_http_endpoint(
     let _ = stream.set_read_timeout(timeout);
     let _ = stream.set_write_timeout(timeout);
     let mut request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
-    if let Some(token) = local_token {
-        request.push_str("x-local-token: ");
-        request.push_str(token);
+    if let Some((name, value)) = header {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
         request.push_str("\r\n");
     }
     request.push_str("\r\n");
@@ -514,8 +632,18 @@ fn load_or_create_secrets<R: Runtime>(
     };
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
     }
     fs::write(&path, serde_json::to_vec_pretty(&secrets)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
     Ok(secrets)
 }
 

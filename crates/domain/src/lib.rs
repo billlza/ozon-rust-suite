@@ -33,13 +33,35 @@ id_type!(TaskId);
 id_type!(ApprovalId);
 id_type!(AuditEventId);
 
+/// Deterministic, user- and machine-bound device identity.
+///
+/// The cloud computes this at device activation and the local node recomputes it at lease
+/// validation, so a signed entitlement lease cannot be replayed on a different machine: a lease
+/// whose `device_id` does not equal `device_id_for(lease.user_id, this_machine_fingerprint)` is
+/// rejected by the node. `fingerprint` must be the exact same raw device-fingerprint string on
+/// both sides (the node sends it to the cloud at activation and keeps it for validation).
+pub fn device_id_for(user_id: UserId, fingerprint: &str) -> DeviceId {
+    // Fixed application namespace for UUIDv5 derivation. Must not change once devices are issued.
+    const DEVICE_NAMESPACE: Uuid = Uuid::from_u128(0x6f7a_6f6e_3636_5f64_6576_6963_655f_6964);
+    let name = format!("{}:{}", user_id.0, fingerprint);
+    DeviceId(Uuid::new_v5(&DEVICE_NAMESPACE, name.as_bytes()))
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Email(String);
 
 impl Email {
     pub fn parse(value: impl Into<String>) -> Result<Self, DomainError> {
         let value = value.into().trim().to_lowercase();
-        if value.len() < 5 || !value.contains('@') || value.contains(' ') {
+        if value.contains(' ') {
+            return Err(DomainError::InvalidEmail);
+        }
+        let (local, domain) = value.split_once('@').ok_or(DomainError::InvalidEmail)?;
+        if local.is_empty() || domain.contains('@') {
+            return Err(DomainError::InvalidEmail);
+        }
+        let labels: Vec<&str> = domain.split('.').collect();
+        if labels.len() < 2 || labels.iter().any(|label| label.is_empty()) {
             return Err(DomainError::InvalidEmail);
         }
         Ok(Self(value))

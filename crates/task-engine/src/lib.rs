@@ -22,6 +22,7 @@ pub struct CreateTask {
 #[derive(Clone, Debug)]
 pub struct TaskStore {
     inner: Arc<RwLock<HashMap<TaskId, Task>>>,
+    by_idempotency: Arc<RwLock<HashMap<(TenantId, String), TaskId>>>,
     audit: Arc<RwLock<Vec<AuditEvent>>>,
     events: broadcast::Sender<TaskEvent>,
 }
@@ -37,6 +38,7 @@ impl TaskStore {
         let (events, _) = broadcast::channel(256);
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
+            by_idempotency: Arc::new(RwLock::new(HashMap::new())),
             audit: Arc::new(RwLock::new(Vec::new())),
             events,
         }
@@ -53,6 +55,18 @@ impl TaskStore {
         } else {
             TaskState::Queued
         };
+        // Enforce idempotency atomically: take the same write lock used for insertion,
+        // then look up any existing non-terminal task for (tenant_id, idempotency_key).
+        let mut inner = self.inner.write().await;
+        let mut index = self.by_idempotency.write().await;
+        let idem_key = (input.tenant_id, input.idempotency_key.clone());
+        if let Some(existing_id) = index.get(&idem_key).copied() {
+            if let Some(existing) = inner.get(&existing_id) {
+                if !is_terminal(existing.state) {
+                    return Ok(existing.clone());
+                }
+            }
+        }
         let task = Task {
             id: TaskId::new(),
             tenant_id: input.tenant_id,
@@ -68,7 +82,10 @@ impl TaskStore {
             created_at: now,
             updated_at: now,
         };
-        self.inner.write().await.insert(task.id, task.clone());
+        inner.insert(task.id, task.clone());
+        index.insert(idem_key, task.id);
+        drop(index);
+        drop(inner);
         self.audit(
             Some(task.tenant_id),
             "system",
@@ -167,6 +184,24 @@ impl TaskStore {
         Ok(task)
     }
 
+    pub async fn mark_failed(
+        &self,
+        id: TaskId,
+        reason: impl Into<String>,
+    ) -> Result<Task, TaskEngineError> {
+        let mut inner = self.inner.write().await;
+        let task = inner.get_mut(&id).ok_or(TaskEngineError::TaskNotFound)?;
+        transition(task, TaskState::Failed)?;
+        task.receipt = Some(ExecutionReceipt {
+            external_request_id: None,
+            executed_at: Utc::now(),
+            result_summary: reason.into(),
+        });
+        let task = task.clone();
+        let _ = self.events.send(TaskEvent::Changed(task.clone()));
+        Ok(task)
+    }
+
     pub async fn audit_log(&self) -> Vec<AuditEvent> {
         self.audit.read().await.clone()
     }
@@ -203,6 +238,13 @@ fn transition(task: &mut Task, next: TaskState) -> Result<(), TaskEngineError> {
     task.state = next;
     task.updated_at = Utc::now();
     Ok(())
+}
+
+fn is_terminal(state: TaskState) -> bool {
+    matches!(
+        state,
+        TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled
+    )
 }
 
 #[derive(Clone, Debug)]

@@ -8,5 +8,8 @@ api-cn.ozon66.com {
   @health path /health
   header @health Cache-Control "no-store"
 
+  header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+  header X-Content-Type-Options "nosniff"
+
   reverse_proxy cloud-api:8080
 }

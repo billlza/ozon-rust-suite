@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env, fs,
     net::SocketAddr,
     path::PathBuf,
@@ -54,6 +55,8 @@ use uuid::Uuid;
 
 const DEFAULT_DEV_LOCAL_TOKEN: &str = "dev-local-token";
 const DEFAULT_DEV_OPENCLAW_TOKEN: &str = "dev-openclaw-token";
+const DEFAULT_OPENCLAW_BIND_URL: &str = "http://127.0.0.1:18789/openclaw/import";
+const OPENCLAW_PAIRING_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_OPENAI_IMAGE_MODEL: &str = "gpt-image-1";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
 const SECRET_OZON_CONFIG: &str = "ozon_config";
@@ -114,10 +117,13 @@ async fn run_server(addr: SocketAddr, router: Router) -> anyhow::Result<()> {
 fn skill_router(state: LocalState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/attest", get(attest))
         .route("/diagnostics", get(diagnostics))
         .route("/portal/status", get(portal_status))
         .route("/portal/lease", post(save_portal_lease))
         .route("/openclaw/manifest", get(openclaw_manifest))
+        .route("/openclaw/pairing/start", post(start_openclaw_pairing))
+        .route("/openclaw/pairing/claim", post(claim_openclaw_pairing))
         .route("/config/status", get(config_status))
         .route("/config/ozon", post(save_ozon_config))
         .route("/config/ozon/validate", post(validate_ozon_config))
@@ -163,8 +169,9 @@ fn agent_router(state: LocalState) -> Router {
 }
 
 fn local_cors() -> CorsLayer {
+    let extra_origins = configured_openclaw_allowed_origins();
     CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _| {
+        .allow_origin(AllowOrigin::predicate(move |origin: &HeaderValue, _| {
             origin
                 .to_str()
                 .map(|origin| {
@@ -175,6 +182,11 @@ fn local_cors() -> CorsLayer {
                         || origin == "https://ozon66.com"
                         || origin == "https://www.ozon66.com"
                         || origin == "https://cn.ozon66.com"
+                        || origin == "https://ozonclaw.jl696.cn"
+                        || origin == "https://www.ozonclaw.jl696.cn"
+                        || origin == "http://127.0.0.1:18789"
+                        || origin == "http://localhost:18789"
+                        || extra_origins.iter().any(|allowed| allowed == origin)
                         || origin.starts_with("tauri://")
                 })
                 .unwrap_or(false)
@@ -199,6 +211,7 @@ struct LocalConfig {
     lease_issuer: String,
     lease_audience: String,
     allow_unsigned_lease: bool,
+    openclaw_bind_url: String,
 }
 
 impl LocalConfig {
@@ -245,10 +258,13 @@ impl LocalConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(cfg!(debug_assertions)),
+            openclaw_bind_url: env::var("OZON_OPENCLAW_BIND_URL")
+                .unwrap_or_else(|_| DEFAULT_OPENCLAW_BIND_URL.to_string()),
         }
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        validate_openclaw_bind_url(&self.openclaw_bind_url)?;
         if self.use_real_ozon
             && (self.operator_token == DEFAULT_DEV_LOCAL_TOKEN
                 || self.openclaw_token == DEFAULT_DEV_OPENCLAW_TOKEN)
@@ -280,6 +296,7 @@ struct LocalState {
     ozon_connector: Arc<dyn OzonReadConnector>,
     http_client: reqwest::Client,
     schedules: ScheduleStore,
+    openclaw_pairings: OpenClawPairingStore,
 }
 
 impl LocalState {
@@ -322,6 +339,7 @@ impl LocalState {
                 .build()
                 .map_err(|error| anyhow::anyhow!("failed to build HTTP client: {error}"))?,
             schedules,
+            openclaw_pairings: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 }
@@ -384,6 +402,13 @@ fn default_secret_file_path() -> PathBuf {
 }
 
 type ScheduleStore = Arc<RwLock<EcommerceReadSchedule>>;
+type OpenClawPairingStore = Arc<RwLock<HashMap<String, OpenClawPairing>>>;
+
+#[derive(Debug)]
+struct OpenClawPairing {
+    expires_at: Instant,
+    expires_at_rfc3339: String,
+}
 
 #[derive(Debug)]
 struct EcommerceReadSchedule {
@@ -429,6 +454,48 @@ async fn health(State(state): State<LocalState>) -> Json<HealthResponse> {
         ],
         real_ozon_enabled: state.config.use_real_ozon,
     })
+}
+
+async fn attest(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Proof-of-possession: returns HMAC-SHA256(operator_token, nonce) so a caller can verify this
+    // node holds the shared operator token WITHOUT ever transmitting the token. The Tauri shell
+    // challenges a (possibly pre-existing) node with a fresh nonce and only trusts — and only then
+    // sends the token to — a node that returns the correct proof, so a port squatter that lacks
+    // the token cannot impersonate the node and harvest it. HMAC is a PRF, so serving proofs does
+    // not reveal the token.
+    let nonce = headers
+        .get("x-attest-nonce")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("missing x-attest-nonce"))?;
+    if nonce.len() > 256 {
+        return Err(ApiError::bad_request("attestation nonce is too long"));
+    }
+    Ok(Json(serde_json::json!({
+        "proof": attest_proof(&state.config.operator_token, nonce),
+    })))
+}
+
+/// HMAC-SHA256(operator_token, nonce), lowercase hex. Must stay byte-for-byte identical to the
+/// verifier in the Tauri shell (`attest_proof`).
+fn attest_proof(token: &str, nonce: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    use std::fmt::Write as _;
+
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(token.as_bytes()).expect("HMAC accepts a key of any size");
+    mac.update(nonce.as_bytes());
+    let bytes = mac.finalize().into_bytes();
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 async fn diagnostics(State(state): State<LocalState>) -> Json<DiagnosticsResponse> {
@@ -594,6 +661,98 @@ async fn openclaw_manifest(State(state): State<LocalState>) -> Json<OpenClawMani
     })
 }
 
+async fn start_openclaw_pairing(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+) -> Result<Json<OpenClawPairingStartResponse>, ApiError> {
+    require_operator_token(&state, &headers)?;
+    let now = Instant::now();
+    let code = Uuid::new_v4().simple().to_string();
+    let expires_at_rfc3339 = (Utc::now()
+        + chrono::Duration::seconds(OPENCLAW_PAIRING_TTL.as_secs() as i64))
+    .to_rfc3339();
+    let claim_url = format!(
+        "{}/openclaw/pairing/claim",
+        local_http_url(&state.config.skill_bind)
+    );
+    let manifest_url = format!(
+        "{}/openclaw/manifest",
+        local_http_url(&state.config.skill_bind)
+    );
+    let bind_url = build_openclaw_bind_url(
+        &state.config.openclaw_bind_url,
+        &code,
+        &claim_url,
+        &manifest_url,
+    )?;
+
+    let mut pairings = state.openclaw_pairings.write().await;
+    pairings.retain(|_, pairing| pairing.expires_at > now);
+    pairings.insert(
+        code.clone(),
+        OpenClawPairing {
+            expires_at: now + OPENCLAW_PAIRING_TTL,
+            expires_at_rfc3339: expires_at_rfc3339.clone(),
+        },
+    );
+
+    Ok(Json(OpenClawPairingStartResponse {
+        status: "pairing_started",
+        bind_url,
+        pairing_code: code,
+        claim_url,
+        manifest_url,
+        auth_header: "x-openclaw-token",
+        expires_at: expires_at_rfc3339,
+        instructions: vec![
+            "Open the bind URL in Longxia/OpenClaw.".to_string(),
+            "Longxia should read the URL fragment and POST the pairing code to claim_url."
+                .to_string(),
+            "The long-lived bridge token is never embedded in the bind URL; OpenClaw stores it only after a trusted localhost claim.".to_string(),
+        ],
+    }))
+}
+
+async fn claim_openclaw_pairing(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Json(input): Json<OpenClawPairingClaimRequest>,
+) -> Result<Json<OpenClawPairingClaimResponse>, ApiError> {
+    require_openclaw_pairing_origin(&headers)?;
+    let code = input.code.trim();
+    if code.is_empty() {
+        return Err(ApiError::bad_request("pairing code is required"));
+    }
+    let now = Instant::now();
+    let mut pairings = state.openclaw_pairings.write().await;
+    pairings.retain(|_, pairing| pairing.expires_at > now);
+    let pairing = pairings
+        .remove(code)
+        .ok_or_else(|| ApiError::unauthorized("pairing code is invalid or expired"))?;
+    let manifest_url = format!(
+        "{}/openclaw/manifest",
+        local_http_url(&state.config.skill_bind)
+    );
+
+    Ok(Json(OpenClawPairingClaimResponse {
+        status: "paired",
+        manifest_url,
+        base_url: local_http_url(&state.config.skill_bind),
+        auth_header: "x-openclaw-token",
+        auth_token: state.config.openclaw_token.clone(),
+        auth_token_fingerprint: fingerprint_secret(&SecretString::from(
+            state.config.openclaw_token.clone(),
+        )),
+        expires_at: pairing.expires_at_rfc3339,
+        safety_rules: vec![
+            "Use the token only inside Longxia/OpenClaw connector settings.".to_string(),
+            "Do not paste the token into chats, prompts, logs, or public documents.".to_string(),
+            "Bridge calls are read/proposal only; local approval is required for writes."
+                .to_string(),
+        ],
+    }))
+}
+
 async fn save_ozon_config(
     State(state): State<LocalState>,
     headers: HeaderMap,
@@ -698,6 +857,8 @@ async fn save_portal_lease(
     Json(input): Json<PortalLeaseRequest>,
 ) -> Result<Json<PortalLeaseResponse>, ApiError> {
     validate_cloud_lease_with_feature(&state, &input.lease, Feature::OzonRead)?;
+    let device_fingerprint = load_or_create_device_fingerprint(&state).await?;
+    ensure_lease_bound_to_device(&input.lease, &device_fingerprint)?;
     let lease_json = serde_json::to_string(&input.lease)
         .map_err(|_| ApiError::internal("failed to serialize lease"))?;
     state
@@ -920,14 +1081,16 @@ async fn poster_handoff(
         theme,
         locale,
     } = input;
+    let locale = locale.as_deref().unwrap_or("zh-CN");
     let poster = build_poster_brief(
         &state,
         load_product_for_lookup(&state, lookup.into_lookup()).await?,
         theme.as_deref().unwrap_or("studio"),
-        locale.as_deref().unwrap_or("zh-CN"),
+        locale,
     )?;
-    let source_images = poster_source_images(&poster.product);
-    let prompt = build_openclaw_poster_prompt(&poster.product, &poster.brief, &source_images);
+    let source_images = poster_source_images(&poster.product, locale);
+    let prompt =
+        build_openclaw_poster_prompt(&poster.product, &poster.brief, &source_images, locale);
     Ok(Json(PosterHandoffResponse {
         connector_mode: connector_mode(&state),
         generated_at: Utc::now().to_rfc3339(),
@@ -944,12 +1107,7 @@ async fn poster_handoff(
             token_policy: "Do not paste the bridge token into public prompts. Configure it only inside OpenClaw/Codex connector settings.",
             recommended_tools: vec!["ozon.products.get", "poster.handoff"],
         },
-        instructions: vec![
-            "Use the user's signed-in OpenClaw/Codex image capability when available; no OpenAI API key is required by Ozon Rust Local for this path.",
-            "Use the supplied Ozon image URLs as product references and preserve packaging, color, labels, proportions, and visible text.",
-            "Generate a finished 4:5 marketplace poster; do not invent certifications, discounts, brand partnerships, or product functions that are not present in the source facts.",
-            "If any product detail is ambiguous, keep the claim generic and ask the operator before adding stronger copy.",
-        ],
+        instructions: poster_handoff_instructions(locale),
         prompt,
     }))
 }
@@ -999,11 +1157,12 @@ async fn poster_verify(
         cta_line,
         compliance_note,
     } = input;
+    let locale = locale.as_deref().unwrap_or("zh-CN");
     let poster = build_poster_brief(
         &state,
         load_product_for_lookup(&state, lookup.into_lookup()).await?,
         theme.as_deref().unwrap_or("studio"),
-        locale.as_deref().unwrap_or("zh-CN"),
+        locale,
     )?;
     let approved_copy = PosterCopy {
         headline: poster.brief.headline.clone(),
@@ -1024,17 +1183,7 @@ async fn poster_verify(
         compliance_note: compliance_note.trim().to_string(),
     };
     let mismatches = compare_poster_copy(&approved_copy, &submitted_copy);
-    let warnings = if mismatches.is_empty() {
-        vec![
-            "校验通过：当前文案与系统生成稿一致。".to_string(),
-            "商品主体应继续使用真实主图合成，避免让图片模型重画包装和文字。".to_string(),
-        ]
-    } else {
-        vec![
-            "当前文案和系统生成稿不一致，建议回到商品属性再确认改写是否安全。".to_string(),
-            "这一步只做逐字段比对，不会帮你猜测哪些自由改写仍然安全。".to_string(),
-        ]
-    };
+    let warnings = poster_verify_warnings(locale, mismatches.is_empty());
     Ok(Json(PosterVerifyResponse {
         ok: mismatches.is_empty(),
         checked_at: Utc::now().to_rfc3339(),
@@ -1449,6 +1598,29 @@ fn require_bridge_or_operator_token(
     ))
 }
 
+fn require_openclaw_pairing_origin(headers: &HeaderMap) -> Result<(), ApiError> {
+    let origin = headers
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::forbidden("missing OpenClaw pairing origin"))?;
+    if is_allowed_openclaw_pairing_origin(origin) {
+        return Ok(());
+    }
+    Err(ApiError::forbidden(
+        "OpenClaw pairing origin is not allowed",
+    ))
+}
+
+fn is_allowed_openclaw_pairing_origin(origin: &str) -> bool {
+    origin == "https://ozonclaw.jl696.cn"
+        || origin == "https://www.ozonclaw.jl696.cn"
+        || origin == "http://127.0.0.1:18789"
+        || origin == "http://localhost:18789"
+        || configured_openclaw_allowed_origins()
+            .iter()
+            .any(|allowed| allowed == origin)
+}
+
 async fn require_valid_lease_with_feature(
     state: &LocalState,
     feature: Feature,
@@ -1457,7 +1629,9 @@ async fn require_valid_lease_with_feature(
         return Ok(());
     }
     let lease = load_cloud_lease(state).await?;
-    validate_cloud_lease_with_feature(state, &lease, feature)
+    validate_cloud_lease_with_feature(state, &lease, feature)?;
+    let device_fingerprint = load_or_create_device_fingerprint(state).await?;
+    ensure_lease_bound_to_device(&lease, &device_fingerprint)
 }
 
 async fn load_cloud_lease(state: &LocalState) -> Result<EntitlementLease, ApiError> {
@@ -1945,6 +2119,23 @@ fn validate_cloud_lease_with_feature(
     Ok(())
 }
 
+/// Reject a cloud lease that was not issued for THIS device. The signed lease carries the
+/// cloud-assigned device id, which the cloud derives deterministically from (user_id, device
+/// fingerprint); recomputing it locally and comparing prevents a validly-signed lease from being
+/// replayed or shared onto a different machine.
+fn ensure_lease_bound_to_device(
+    lease: &EntitlementLease,
+    device_fingerprint: &str,
+) -> Result<(), ApiError> {
+    let expected = ozon_domain::device_id_for(lease.user_id, device_fingerprint);
+    if lease.device_id != expected {
+        return Err(ApiError::forbidden(
+            "cloud lease is not bound to this device",
+        ));
+    }
+    Ok(())
+}
+
 fn feature_name(feature: Feature) -> &'static str {
     match feature {
         Feature::OzonRead => "Ozon read access",
@@ -2046,10 +2237,30 @@ fn normalize_openai_base_url(value: &str) -> Result<String, ApiError> {
     }
     let url = reqwest::Url::parse(trimmed)
         .map_err(|_| ApiError::bad_request("OpenAI base URL must be a valid URL"))?;
-    if !matches!(url.scheme(), "https" | "http") {
-        return Err(ApiError::bad_request(
-            "OpenAI base URL must use http or https",
-        ));
+    match url.scheme() {
+        "https" => {}
+        "http" => {
+            // The configured base URL is used to send the OpenAI/relay request with the
+            // bearer API key. Permit plaintext http only for loopback hosts so the key is
+            // never transmitted in cleartext to a remote host.
+            let host = url.host_str().unwrap_or("");
+            let host_addr = host.trim_start_matches('[').trim_end_matches(']');
+            let is_loopback = host.eq_ignore_ascii_case("localhost")
+                || host_addr
+                    .parse::<std::net::IpAddr>()
+                    .map(|ip| ip.is_loopback())
+                    .unwrap_or(false);
+            if !is_loopback {
+                return Err(ApiError::bad_request(
+                    "OpenAI base URL must use https (http is only allowed for loopback hosts)",
+                ));
+            }
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "OpenAI base URL must use http or https",
+            ));
+        }
     }
     Ok(trimmed.to_string())
 }
@@ -2076,9 +2287,9 @@ fn poster_generation_status(
         api_fallback_model: openai.configured.then(|| openai.image_model.clone()),
         api_fallback_issue: openai.issue.clone(),
         message: if openai.configured {
-            "推荐使用龙虾/Codex 登录态出图；图片 API 已配置，可作为后台自动出图兜底。"
+            "openclaw_codex_preferred_with_api_fallback"
         } else {
-            "推荐使用龙虾/Codex 登录态出图；未配置图片 API 不影响主流程。"
+            "openclaw_codex_preferred_without_api_fallback"
         },
     }
 }
@@ -2110,25 +2321,13 @@ fn build_poster_brief(
         .take(3)
         .collect::<Vec<_>>();
     let selling_points = if attribute_points.is_empty() {
-        vec![
-            "商品图来自当前 Ozon 店铺".to_string(),
-            "保留包装、颜色和标签细节".to_string(),
-            "适合先做首图和活动海报".to_string(),
-        ]
+        default_selling_points(locale)
     } else {
         attribute_points
     };
     let image_count = product.images.len();
-    let subheadline = if image_count > 0 {
-        "用真实商品图打底，背景只负责把质感和场景感补上。".to_string()
-    } else {
-        "这件商品还没带主图，先补图再出海报会更稳。".to_string()
-    };
-    let compliance_note = if state.config.use_real_ozon {
-        "不改商品外观；文案和图片按 Ozon 实时数据校验。".to_string()
-    } else {
-        "当前是本地 mock 模式，正式出图前请切到真实 Ozon API 再校验一次。".to_string()
-    };
+    let subheadline = poster_subheadline(locale, image_count > 0);
+    let compliance_note = poster_compliance_note(locale, state.config.use_real_ozon);
     let cta_line = match locale {
         "zh-CN" => "先出一版能给运营看的海报，再微调标题和卖点".to_string(),
         _ => "Lock the hero image, then tune the selling points in one pass.".to_string(),
@@ -2139,9 +2338,10 @@ fn build_poster_brief(
         "Leave the center clean for a product to be placed later."
     };
     let background_prompt = format!(
-        "Create a premium e-commerce poster background only, with no product, no packaging, no text, no logo, and no watermark. Theme: {}. Mood: confident, commercial, polished. Use light, shadow, reflections, and spatial depth to support a seller campaign poster. {} Palette should feel modern and readable behind Chinese text overlays. Keep the composition suitable for a 4:5 portrait poster.",
+        "Create a premium e-commerce poster background only, with no product, no packaging, no text, no logo, and no watermark. Theme: {}. Mood: confident, commercial, polished. Use light, shadow, reflections, and spatial depth to support a seller campaign poster. {} Palette should feel modern and readable behind {} text overlays. Keep the composition suitable for a 4:5 portrait poster.",
         normalize_theme(theme),
-        image_stage
+        image_stage,
+        poster_overlay_language(locale)
     );
     Ok(PosterContext {
         product,
@@ -2157,13 +2357,59 @@ fn build_poster_brief(
     })
 }
 
-fn poster_source_images(product: &ozon_connector::OzonProductDetail) -> Vec<PosterSourceImage> {
+fn default_selling_points(locale: &str) -> Vec<String> {
+    match locale {
+        "zh-CN" => vec![
+            "商品图来自当前 Ozon 店铺".to_string(),
+            "保留包装、颜色和标签细节".to_string(),
+            "适合先做首图和活动海报".to_string(),
+        ],
+        _ => vec![
+            "Product images come from the current Ozon shop".to_string(),
+            "Preserve packaging, color, and label details".to_string(),
+            "Suitable for hero images and campaign posters".to_string(),
+        ],
+    }
+}
+
+fn poster_subheadline(locale: &str, has_image: bool) -> String {
+    match (locale, has_image) {
+        ("zh-CN", true) => "用真实商品图打底，背景只负责把质感和场景感补上。".to_string(),
+        ("zh-CN", false) => "这件商品还没带主图，先补图再出海报会更稳。".to_string(),
+        (_, true) => "Start from the real product image; use the background only to add texture and scene depth.".to_string(),
+        (_, false) => "This product has no main image yet. Add a clear product image before poster generation.".to_string(),
+    }
+}
+
+fn poster_compliance_note(locale: &str, real_ozon: bool) -> String {
+    match (locale, real_ozon) {
+        ("zh-CN", true) => "不改商品外观；文案和图片按 Ozon 实时数据校验。".to_string(),
+        ("zh-CN", false) => "当前是本地 mock 模式，正式出图前请切到真实 Ozon API 再校验一次。".to_string(),
+        (_, true) => "Do not alter the product appearance; copy and images are checked against live Ozon data.".to_string(),
+        (_, false) => "This is local mock mode. Switch to the real Ozon API and verify again before production poster work.".to_string(),
+    }
+}
+
+fn poster_overlay_language(locale: &str) -> &'static str {
+    match locale {
+        "zh-CN" => "Chinese",
+        _ => "English",
+    }
+}
+
+fn poster_source_images(
+    product: &ozon_connector::OzonProductDetail,
+    locale: &str,
+) -> Vec<PosterSourceImage> {
     let mut images = Vec::new();
     if let Some(primary) = product.primary_image.as_deref() {
         images.push(PosterSourceImage {
             role: "primary".to_string(),
             url: primary.to_string(),
-            note: "主图，优先作为商品外观参考".to_string(),
+            note: match locale {
+                "zh-CN" => "主图，优先作为商品外观参考".to_string(),
+                _ => "Primary image; use it as the first product appearance reference".to_string(),
+            },
         });
     }
     for image in product.images.iter().take(8) {
@@ -2173,7 +2419,10 @@ fn poster_source_images(product: &ozon_connector::OzonProductDetail) -> Vec<Post
         images.push(PosterSourceImage {
             role: format!("{:?}", image.role).to_ascii_lowercase(),
             url: image.url.clone(),
-            note: format!("Ozon 图片序号 {}", image.position),
+            note: match locale {
+                "zh-CN" => format!("Ozon 图片序号 {}", image.position),
+                _ => format!("Ozon image position {}", image.position),
+            },
         });
     }
     images
@@ -2183,10 +2432,20 @@ fn build_openclaw_poster_prompt(
     product: &ozon_connector::OzonProductDetail,
     brief: &PosterBrief,
     source_images: &[PosterSourceImage],
+    locale: &str,
 ) -> String {
-    let product_name = product.name.as_deref().unwrap_or("未命名商品");
+    let product_name = product.name.as_deref().unwrap_or_else(|| {
+        if locale == "zh-CN" {
+            "未命名商品"
+        } else {
+            "Unnamed product"
+        }
+    });
     let image_lines = if source_images.is_empty() {
-        "当前商品没有可用图片 URL。先提醒运营补充商品图，不要凭空生成商品外观。".to_string()
+        match locale {
+            "zh-CN" => "当前商品没有可用图片 URL。先提醒运营补充商品图，不要凭空生成商品外观。".to_string(),
+            _ => "This product has no available image URL. Ask the operator to add product images before generating appearance.".to_string(),
+        }
     } else {
         source_images
             .iter()
@@ -2202,24 +2461,96 @@ fn build_openclaw_poster_prompt(
         .map(|point| format!("- {point}"))
         .collect::<Vec<_>>()
         .join("\n");
-    format!(
-        "你现在接手一个 Ozon 商品海报任务。请使用你当前登录的 OpenClaw/Codex 图片能力完成，不要要求用户额外提供 OpenAI API Key。\n\n商品事实：\n- 商品名：{}\n- offer_id：{}\n- product_id：{}\n- sku：{}\n- 归档状态：{}\n\n商品图片 URL：\n{}\n\n海报文案草稿：\n标题：{}\n副标题：{}\n卖点：\n{}\n收尾句：{}\n校验说明：{}\n\n设计要求：\n1. 输出 4:5 竖版电商宣传海报，适合 Ozon 店铺运营先看第一版。\n2. 商品外观必须以提供的图片为准，保留包装、颜色、标签、比例和可见文字，不要把商品改成其他款式。\n3. 可以补背景、灯光、陈列和氛围，但不要生成不存在的 Logo、认证、折扣、功效或品牌合作。\n4. 海报上只放上面给出的标题、卖点和收尾句；中文不要写错字，俄文/英文商品名不要擅自翻译成另一个意思。\n5. 完成后请顺手列出 3 条自检：商品是否一致、文案是否越界、图片是否有错字。\n\n背景方向：{}",
-        truncate_text(product_name, 120),
-        product.offer_id,
-        product.product_id,
-        product.sku.as_deref().unwrap_or("无"),
-        product
-            .archived
-            .map(|value| if value { "已归档" } else { "未归档" })
-            .unwrap_or("未知"),
-        image_lines,
-        brief.headline,
-        brief.subheadline,
-        selling_points,
-        brief.cta_line,
-        brief.compliance_note,
-        brief.background_prompt
-    )
+    let sku = product
+        .sku
+        .as_deref()
+        .unwrap_or_else(|| if locale == "zh-CN" { "无" } else { "none" });
+    let archived = product
+        .archived
+        .map(|value| match (locale, value) {
+            ("zh-CN", true) => "已归档",
+            ("zh-CN", false) => "未归档",
+            (_, true) => "archived",
+            (_, false) => "not archived",
+        })
+        .unwrap_or_else(|| {
+            if locale == "zh-CN" {
+                "未知"
+            } else {
+                "unknown"
+            }
+        });
+    if locale == "zh-CN" {
+        format!(
+            "你现在接手一个 Ozon 商品海报任务。请使用你当前登录的 OpenClaw/Codex 图片能力完成，不要要求用户额外提供 OpenAI API Key。\n\n商品事实：\n- 商品名：{}\n- offer_id：{}\n- product_id：{}\n- sku：{}\n- 归档状态：{}\n\n商品图片 URL：\n{}\n\n海报文案草稿：\n标题：{}\n副标题：{}\n卖点：\n{}\n收尾句：{}\n校验说明：{}\n\n设计要求：\n1. 输出 4:5 竖版电商宣传海报，适合 Ozon 店铺运营先看第一版。\n2. 商品外观必须以提供的图片为准，保留包装、颜色、标签、比例和可见文字，不要把商品改成其他款式。\n3. 可以补背景、灯光、陈列和氛围，但不要生成不存在的 Logo、认证、折扣、功效或品牌合作。\n4. 海报上只放上面给出的标题、卖点和收尾句；中文不要写错字，俄文/英文商品名不要擅自翻译成另一个意思。\n5. 完成后请顺手列出 3 条自检：商品是否一致、文案是否越界、图片是否有错字。\n\n背景方向：{}",
+            truncate_text(product_name, 120),
+            product.offer_id,
+            product.product_id,
+            sku,
+            archived,
+            image_lines,
+            brief.headline,
+            brief.subheadline,
+            selling_points,
+            brief.cta_line,
+            brief.compliance_note,
+            brief.background_prompt
+        )
+    } else {
+        format!(
+            "You are taking over an Ozon product poster task. Use the currently signed-in OpenClaw/Codex image capability; do not ask the user for an additional OpenAI API key.\n\nProduct facts:\n- Product name: {}\n- offer_id: {}\n- product_id: {}\n- sku: {}\n- Archive status: {}\n\nProduct image URLs:\n{}\n\nPoster copy draft:\nHeadline: {}\nSubheadline: {}\nSelling points:\n{}\nClosing line: {}\nVerification note: {}\n\nDesign requirements:\n1. Produce a finished 4:5 portrait e-commerce poster suitable for an Ozon shop operator to review as a first draft.\n2. Product appearance must follow the supplied images. Preserve packaging, color, labels, proportions, and visible text. Do not turn it into another product variant.\n3. You may add background, lighting, display setting, and mood, but do not invent logos, certifications, discounts, benefits, or brand partnerships.\n4. Put only the headline, selling points, and closing line above on the poster. Do not mistranslate Russian or English product names into a different meaning.\n5. After generation, list 3 self-checks: product consistency, copy overclaiming, and text/image errors.\n\nBackground direction: {}",
+            truncate_text(product_name, 120),
+            product.offer_id,
+            product.product_id,
+            sku,
+            archived,
+            image_lines,
+            brief.headline,
+            brief.subheadline,
+            selling_points,
+            brief.cta_line,
+            brief.compliance_note,
+            brief.background_prompt
+        )
+    }
+}
+
+fn poster_handoff_instructions(locale: &str) -> Vec<&'static str> {
+    match locale {
+        "zh-CN" => vec![
+            "优先使用用户已登录的 OpenClaw/Codex 图片能力；这条路径不要求 Ozon Rust Local 保存 OpenAI API Key。",
+            "使用提供的 Ozon 图片 URL 作为商品参考，保留包装、颜色、标签、比例和可见文字。",
+            "生成 4:5 竖版电商海报；不要编造来源事实里没有的认证、折扣、品牌合作或产品功能。",
+            "如果商品信息不明确，文案保持保守，并在加强卖点前先询问操作员。",
+        ],
+        _ => vec![
+            "Prefer the user's signed-in OpenClaw/Codex image capability; this path does not require Ozon Rust Local to save an OpenAI API key.",
+            "Use the supplied Ozon image URLs as product references and preserve packaging, color, labels, proportions, and visible text.",
+            "Generate a finished 4:5 marketplace poster; do not invent certifications, discounts, brand partnerships, or product functions that are not present in the source facts.",
+            "If any product detail is ambiguous, keep the claim conservative and ask the operator before strengthening copy.",
+        ],
+    }
+}
+
+fn poster_verify_warnings(locale: &str, ok: bool) -> Vec<String> {
+    match (locale, ok) {
+        ("zh-CN", true) => vec![
+            "校验通过：当前文案与系统生成稿一致。".to_string(),
+            "商品主体应继续使用真实主图合成，避免让图片模型重画包装和文字。".to_string(),
+        ],
+        ("zh-CN", false) => vec![
+            "当前文案和系统生成稿不一致，建议回到商品属性再确认改写是否安全。".to_string(),
+            "这一步只做逐字段比对，不会帮你猜测哪些自由改写仍然安全。".to_string(),
+        ],
+        (_, true) => vec![
+            "Check passed: the current copy matches the system brief.".to_string(),
+            "Keep the product body composited from the real main image; do not let the image model redraw packaging or text.".to_string(),
+        ],
+        (_, false) => vec![
+            "The current copy does not match the system brief. Recheck the product attributes before using this rewrite.".to_string(),
+            "This check only compares fields. It does not guess whether freeform copy changes are still safe.".to_string(),
+        ],
+    }
 }
 
 fn attribute_selling_point(attribute: &ozon_connector::OzonProductAttribute) -> Option<String> {
@@ -2299,7 +2630,7 @@ fn summarize_openai_error(body: &str) -> String {
             .unwrap_or_else(|| "upstream returned an error without a message".to_string());
         if envelope.error.code.as_deref() == Some("model_not_found") {
             return format!(
-                "当前 API Key 没有开通这个图片模型：{message}。请换成支持图片生成的 Key，或让中转商开通 gpt-image-1 / gpt-image-2 图片通道。"
+                "image model is not available for this API key: {message}. Use an API key or proxy with gpt-image-1 / gpt-image-2 enabled."
             );
         }
         if let Some(code) = envelope.error.code {
@@ -2448,6 +2779,86 @@ fn normalize_product_list_visibility(
 
 fn local_http_url(bind: &str) -> String {
     format!("http://{bind}")
+}
+
+fn build_openclaw_bind_url(
+    base_url: &str,
+    pairing_code: &str,
+    claim_url: &str,
+    manifest_url: &str,
+) -> Result<String, ApiError> {
+    let mut url = reqwest::Url::parse(base_url)
+        .map_err(|_| ApiError::bad_request("OpenClaw bind URL must be a valid URL"))?;
+    let fragment = format!(
+        "ozon66_pairing_code={}&claim_url={}&manifest_url={}",
+        percent_encode_url_component(pairing_code),
+        percent_encode_url_component(claim_url),
+        percent_encode_url_component(manifest_url)
+    );
+    url.set_fragment(Some(&fragment));
+    Ok(url.to_string())
+}
+
+fn percent_encode_url_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(nibble_to_hex(byte >> 4));
+                encoded.push(nibble_to_hex(byte & 0x0f));
+            }
+        }
+    }
+    encoded
+}
+
+fn nibble_to_hex(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'A' + (value - 10)) as char,
+        _ => '0',
+    }
+}
+
+fn validate_openclaw_bind_url(value: &str) -> anyhow::Result<()> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| anyhow::anyhow!("OZON_OPENCLAW_BIND_URL must be a valid URL"))?;
+    if url.path() != "/openclaw/import" {
+        anyhow::bail!("OZON_OPENCLAW_BIND_URL must point to /openclaw/import")
+    }
+    let host = url.host_str().unwrap_or_default();
+    let allowed = matches!(
+        (url.scheme(), host, url.port_or_known_default()),
+        (
+            "https",
+            "ozonclaw.jl696.cn" | "www.ozonclaw.jl696.cn",
+            Some(443)
+        ) | ("http", "127.0.0.1" | "localhost", Some(18789))
+    );
+    if allowed {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "OZON_OPENCLAW_BIND_URL must be https://ozonclaw.jl696.cn/openclaw/import or http://127.0.0.1:18789/openclaw/import"
+    )
+}
+
+fn configured_openclaw_allowed_origins() -> Vec<String> {
+    env::var("OZON_OPENCLAW_ALLOWED_ORIGINS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn local_port(bind: &str) -> u16 {
@@ -2609,6 +3020,35 @@ struct OpenClawTool {
     risk: &'static str,
     approval_required: bool,
     description: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenClawPairingStartResponse {
+    status: &'static str,
+    bind_url: String,
+    pairing_code: String,
+    claim_url: String,
+    manifest_url: String,
+    auth_header: &'static str,
+    expires_at: String,
+    instructions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenClawPairingClaimRequest {
+    code: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenClawPairingClaimResponse {
+    status: &'static str,
+    manifest_url: String,
+    base_url: String,
+    auth_header: &'static str,
+    auth_token: String,
+    auth_token_fingerprint: String,
+    expires_at: String,
+    safety_rules: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3114,6 +3554,7 @@ mod tests {
             lease_issuer: "ozon66-cloud".to_string(),
             lease_audience: "ozon-rust-local-node".to_string(),
             allow_unsigned_lease: true,
+            openclaw_bind_url: DEFAULT_OPENCLAW_BIND_URL.to_string(),
         }
     }
 
@@ -3137,6 +3578,135 @@ mod tests {
         let mut operator_headers = HeaderMap::new();
         operator_headers.insert("x-local-token", "operator-token".parse().unwrap());
         require_bridge_or_operator_token(&state, &operator_headers).expect("operator token");
+    }
+
+    #[tokio::test]
+    async fn openclaw_pairing_uses_one_time_code_without_token_in_url() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-local-token", "operator-token".parse().unwrap());
+
+        let start = start_openclaw_pairing(State(state.clone()), headers)
+            .await
+            .expect("start pairing")
+            .0;
+
+        assert!(start.bind_url.starts_with(DEFAULT_OPENCLAW_BIND_URL));
+        assert!(start.bind_url.contains("ozon66_pairing_code="));
+        assert!(start.bind_url.contains("claim_url="));
+        assert!(!start.bind_url.contains("bridge-token"));
+        assert!(!start.bind_url.contains("x-openclaw-token"));
+
+        let mut origin_headers = HeaderMap::new();
+        origin_headers.insert("origin", "https://ozonclaw.jl696.cn".parse().unwrap());
+        let claim = claim_openclaw_pairing(
+            State(state.clone()),
+            origin_headers.clone(),
+            Json(OpenClawPairingClaimRequest {
+                code: start.pairing_code.clone(),
+            }),
+        )
+        .await
+        .expect("claim pairing")
+        .0;
+
+        assert_eq!(claim.status, "paired");
+        assert_eq!(claim.auth_header, "x-openclaw-token");
+        assert_eq!(claim.auth_token, "bridge-token");
+        assert_eq!(
+            claim.auth_token_fingerprint,
+            fingerprint_secret(&SecretString::from("bridge-token".to_string()))
+        );
+
+        let replay = claim_openclaw_pairing(
+            State(state),
+            origin_headers,
+            Json(OpenClawPairingClaimRequest {
+                code: start.pairing_code,
+            }),
+        )
+        .await
+        .expect_err("pairing code must be one-time");
+        assert_eq!(replay.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn openclaw_pairing_claim_rejects_disallowed_origin() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-local-token", "operator-token".parse().unwrap());
+        let start = start_openclaw_pairing(State(state.clone()), headers)
+            .await
+            .expect("start pairing")
+            .0;
+        let mut bad_origin_headers = HeaderMap::new();
+        bad_origin_headers.insert("origin", "https://evil.example.com".parse().unwrap());
+
+        let error = claim_openclaw_pairing(
+            State(state),
+            bad_origin_headers,
+            Json(OpenClawPairingClaimRequest {
+                code: start.pairing_code,
+            }),
+        )
+        .await
+        .expect_err("claim must reject untrusted origin");
+
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn openclaw_pairing_claim_rejects_expired_code() {
+        let state = test_state();
+        let code = "expired-code".to_string();
+        state.openclaw_pairings.write().await.insert(
+            code.clone(),
+            OpenClawPairing {
+                expires_at: Instant::now() - Duration::from_secs(1),
+                expires_at_rfc3339: Utc::now().to_rfc3339(),
+            },
+        );
+        let mut origin_headers = HeaderMap::new();
+        origin_headers.insert("origin", "https://ozonclaw.jl696.cn".parse().unwrap());
+
+        let error = claim_openclaw_pairing(
+            State(state),
+            origin_headers,
+            Json(OpenClawPairingClaimRequest { code }),
+        )
+        .await
+        .expect_err("expired code must be rejected");
+
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn openclaw_pairing_start_requires_operator_token() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-openclaw-token", "bridge-token".parse().unwrap());
+
+        let error = start_openclaw_pairing(State(state), headers)
+            .await
+            .expect_err("bridge token cannot create pairing");
+
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn openclaw_bind_url_fragment_encodes_pairing_without_secret() {
+        let bind_url = build_openclaw_bind_url(
+            "https://ozonclaw.jl696.cn/openclaw/import",
+            "pairing-123",
+            "http://127.0.0.1:8790/openclaw/pairing/claim",
+            "http://127.0.0.1:8790/openclaw/manifest",
+        )
+        .expect("bind url");
+
+        assert!(bind_url.starts_with("https://ozonclaw.jl696.cn/openclaw/import#"));
+        assert!(bind_url.contains("pairing-123"));
+        assert!(bind_url.contains("http%3A%2F%2F127.0.0.1%3A8790"));
+        assert!(!bind_url.contains("bridge-token"));
     }
 
     #[tokio::test]
@@ -3299,8 +3869,9 @@ mod tests {
             warnings: vec![],
         };
         let context = build_poster_brief(&state, product, "studio", "zh-CN").expect("poster brief");
-        let images = poster_source_images(&context.product);
-        let prompt = build_openclaw_poster_prompt(&context.product, &context.brief, &images);
+        let images = poster_source_images(&context.product, "zh-CN");
+        let prompt =
+            build_openclaw_poster_prompt(&context.product, &context.brief, &images, "zh-CN");
 
         assert!(prompt.contains("OpenClaw/Codex"));
         assert!(prompt.contains("不要要求用户额外提供 OpenAI API Key"));
@@ -3430,7 +4001,11 @@ mod tests {
         });
 
         let client = reqwest::Client::new();
-        for origin in ["https://ozon66.com", "https://cn.ozon66.com"] {
+        for origin in [
+            "https://ozon66.com",
+            "https://cn.ozon66.com",
+            "https://ozonclaw.jl696.cn",
+        ] {
             let response = client
                 .request(reqwest::Method::OPTIONS, format!("http://{addr}/health"))
                 .header("Origin", origin)

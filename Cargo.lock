@@ -4099,6 +4099,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures-core",
+ "hmac",
  "ozon-connector",
  "ozon-domain",
  "ozon-secret-store",
@@ -4120,13 +4121,16 @@ dependencies = [
 name = "ozon-local-node-tauri"
 version = "0.1.0"
 dependencies = [
+ "hmac",
  "rand 0.9.4",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
  "tauri-plugin-shell",
+ "url",
 ]
 
 [[package]]

@@ -119,15 +119,26 @@ Production Nebula identity configuration for the portal/cloud bridge:
 VITE_CLOUD_API=https://api.ozon66.com
 OZON_SUITE_SKYBRIDGE_API_BASE_URL=https://<skybridge-project>.supabase.co/functions/v1
 VITE_SKYBRIDGE_SUPABASE_URL=https://<skybridge-project>.supabase.co
-VITE_SKYBRIDGE_SUPABASE_ANON_KEY=<supabase-anon-key>
+VITE_SKYBRIDGE_SUPABASE_PUBLISHABLE_KEY=<supabase-publishable-key>
 VITE_NEBULA_BASE_URL=https://nebula.skybridge.com
 VITE_NEBULA_CLIENT_ID=ozon_rust_suite_portal
 VITE_NEBULA_SCOPE="openid profile email offline_access"
 VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH=1
+VITE_ENABLE_SKYBRIDGE_PHONE_AUTH=0
+VITE_SKYBRIDGE_PHONE_SMS_PROVIDER_READY=0
 ```
 
-The primary portal login is email/phone through SkyBridge Auth when
-`VITE_SKYBRIDGE_SUPABASE_URL` and `VITE_SKYBRIDGE_SUPABASE_ANON_KEY` are set.
+The primary portal login can use direct SkyBridge Auth when
+`VITE_SKYBRIDGE_SUPABASE_URL` and
+`VITE_SKYBRIDGE_SUPABASE_PUBLISHABLE_KEY` are set. Email/password login is the
+default direct path only when `VITE_ENABLE_DIRECT_SKYBRIDGE_AUTH=1` is set
+explicitly. Phone/SMS login and registration stay disabled unless
+`VITE_ENABLE_SKYBRIDGE_PHONE_AUTH=1` and
+`VITE_SKYBRIDGE_PHONE_SMS_PROVIDER_READY=1` are both set after the
+SkyBridge/Supabase Auth phone provider and SMS provider have been tested end to
+end. The older `VITE_SKYBRIDGE_SUPABASE_ANON_KEY` name is accepted only as a
+migration input when `VITE_ALLOW_LEGACY_SKYBRIDGE_ANON_KEY=1` is set
+explicitly; production direct-auth builds should move to the publishable key.
 Nebula OAuth/PKCE remains available as an explicit enterprise/SSO entry; register
 the portal client in Nebula with an exact redirect URI matching the running
 portal, for example `http://127.0.0.1:5171/auth/callback` in local development.
@@ -142,18 +153,20 @@ provider in that identity service instead of placing Cloudflare Turnstile on the
 portal's primary login path.
 
 Direct SkyBridge/Supabase password exchange is allowed in production only when
-the SkyBridge Auth URL and anon key are configured explicitly.
+the SkyBridge Auth URL and publishable key are configured explicitly.
 `apps/web-portal/vercel.json` runs
 `apps/web-portal/scripts/validate-production-env.mjs` before the production
-build; if direct auth is enabled, both
-`VITE_DIRECT_AUTH_VERIFICATION_MODE` must be set to `none` or `turnstile`.
+build; if direct auth is enabled,
+`VITE_DIRECT_AUTH_VERIFICATION_MODE` must be set to `none` or `turnstile`, and
+`VITE_SKYBRIDGE_SUPABASE_PUBLISHABLE_KEY` is required.
 Use `turnstile` only for regions where Cloudflare verification is reliable; in
 that mode, `VITE_TURNSTILE_SITE_KEY` and `VITE_TURNSTILE_SCRIPT_URL` are also
 required so the browser can submit a real CAPTCHA token. Mainland-friendly
 deployments use `none`, keep both Turnstile variables empty, and must keep
 account risk controls in the identity service itself rather than relying on a
 Cloudflare widget in the portal. Mainland builds disable direct Supabase auth
-and leave both Turnstile variables empty so no Cloudflare dependency is shipped.
+and phone/SMS auth, and leave both Turnstile variables empty so no Cloudflare
+dependency is shipped.
 Do not treat SSO as an automatic fallback for mainland users; either configure
 the primary account path explicitly or fail with an actionable message.
 
@@ -342,6 +355,8 @@ API origin:
 VITE_CLOUD_API=https://api.ozon66.com \
 VITE_NEBULA_BASE_URL=https://nebula.skybridge.com \
 VITE_NEBULA_CLIENT_ID=ozon_rust_suite_portal \
+VITE_ENABLE_SKYBRIDGE_PHONE_AUTH=0 \
+VITE_SKYBRIDGE_PHONE_SMS_PROVIDER_READY=0 \
 pnpm --dir apps/web-portal build
 ```
 
