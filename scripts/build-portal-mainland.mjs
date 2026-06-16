@@ -14,6 +14,17 @@ const buildEnv = {
   ...process.env
 };
 buildEnv.VITE_ENABLE_NEBULA_OAUTH_ENTRY = buildEnv.VITE_ENABLE_NEBULA_OAUTH_ENTRY || "1";
+// Point the portal at the real, working company Nebula OAuth2 server (valid TLS + OAuth endpoints),
+// the same identity service the SkyBridge Compass apps use (unified accounts across products).
+buildEnv.VITE_NEBULA_BASE_URL = buildEnv.VITE_NEBULA_BASE_URL || "https://auth.nebula-technologies.net";
+// Fail loudly on the known-broken host: nebula.skybridge.com serves a self-signed cert and has no
+// OAuth endpoints deployed, so it locks every customer out.
+if (/nebula\.skybridge\.com/i.test(buildEnv.VITE_NEBULA_BASE_URL)) {
+  throw new Error(
+    "VITE_NEBULA_BASE_URL points at nebula.skybridge.com, which is broken (self-signed TLS cert + no OAuth endpoints). " +
+      "Use https://auth.nebula-technologies.net (the working company Nebula OAuth server)."
+  );
+}
 // Email + password login backed by cloud-api (/auth/login, /auth/register). Self-contained,
 // so customers can sign in even when the enterprise SSO identity provider is down. Requires
 // OZON_SUITE_ALLOW_LOCAL_NEBULA_REGISTRATION=true on cloud-api for new-account registration.
