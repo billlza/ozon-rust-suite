@@ -1505,7 +1505,7 @@ function App() {
           <aside className="identity-panel">
             <p className="eyebrow">{portalCopy.console.identity.eyebrow}</p>
             <h2>{displayLoginAlias(session.user)}</h2>
-            <div className="rail-status">
+            <div className="rail-status" data-state={activeEntitlement ? "ok" : order ? "pending" : "off"}>
               <span>{portalCopy.console.identity.serviceStatus}</span>
               <strong>
                 {activeEntitlement
@@ -1515,15 +1515,15 @@ function App() {
                     : portalCopy.console.identity.serviceClosed}
               </strong>
             </div>
-            <div className="rail-status">
+            <div className="rail-status" data-state={computerHelperOnline ? "ok" : "off"}>
               <span>{portalCopy.console.identity.helper}</span>
               <strong>{computerHelperOnline ? portalCopy.console.identity.helperConnected : portalCopy.console.identity.helperDisconnected}</strong>
             </div>
-            <div className="rail-status">
+            <div className="rail-status" data-state={computerAuthorized ? "ok" : "off"}>
               <span>{portalCopy.console.identity.computerAuth}</span>
               <strong>{computerAuthorized ? portalCopy.console.identity.authComplete : portalCopy.console.identity.authIncomplete}</strong>
             </div>
-            <div className="rail-status">
+            <div className="rail-status" data-state={storeCredentialsReady ? "ok" : readyForWorkspace ? "pending" : "off"}>
               <span>{portalCopy.console.identity.storeAuth}</span>
               <strong>
                 {storeCredentialsReady

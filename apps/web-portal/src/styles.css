@@ -3222,3 +3222,200 @@ input[readonly] {
     animation: none !important;
   }
 }
+
+/* ============================================================
+   Console visual refinement (2026-06 polish pass)
+   Appended so it overrides earlier rules by cascade order.
+   Purely cosmetic — no structural or behavioural changes.
+   Scoped to the logged-in console (.account-console et al.).
+   ============================================================ */
+
+.account-console {
+  gap: 24px;
+}
+
+/* --- Identity panel: premium dark-green card with depth + glow --- */
+.identity-panel {
+  background:
+    radial-gradient(135% 95% at 6% -12%, rgba(22, 219, 152, 0.24), transparent 58%),
+    linear-gradient(168deg, #123c2d 0%, #0c2018 58%, #0a1812 100%);
+  border: 1px solid rgba(22, 219, 152, 0.16);
+  border-radius: 18px;
+  box-shadow:
+    0 26px 62px rgba(6, 28, 20, 0.42),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  gap: 2px;
+  padding: 28px 26px;
+}
+
+.identity-panel .eyebrow {
+  color: rgba(170, 236, 208, 0.7);
+  letter-spacing: 0.14em;
+}
+
+.identity-panel h2 {
+  font-size: 22px;
+  letter-spacing: -0.012em;
+  line-height: 1.2;
+  margin-bottom: 16px;
+  overflow-wrap: anywhere;
+}
+
+/* Stacked status rows with a state-coloured indicator dot */
+.identity-panel .rail-status {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  gap: 6px;
+  padding: 14px 0 0;
+}
+
+.identity-panel .rail-status span {
+  color: rgba(208, 240, 226, 0.56);
+  font-size: 11.5px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+}
+
+.identity-panel .rail-status strong {
+  align-items: center;
+  color: #f3fff9;
+  display: inline-flex;
+  font-size: 14px;
+  font-weight: 850;
+  gap: 9px;
+}
+
+.identity-panel .rail-status strong::before {
+  background: #8aa39a;
+  border-radius: 999px;
+  content: "";
+  flex: 0 0 auto;
+  height: 9px;
+  width: 9px;
+}
+
+.identity-panel .rail-status[data-state="ok"] strong::before {
+  background: #1fe2a0;
+  box-shadow: 0 0 0 4px rgba(31, 226, 160, 0.18);
+}
+
+.identity-panel .rail-status[data-state="pending"] strong::before {
+  background: #f6c75a;
+  box-shadow: 0 0 0 4px rgba(246, 199, 90, 0.18);
+}
+
+.identity-panel .rail-status[data-state="off"] strong::before {
+  background: #7e958c;
+}
+
+/* --- Setup wizard cards --- */
+.setup-wizard {
+  gap: 16px;
+}
+
+.wizard-steps {
+  gap: 14px;
+}
+
+.wizard-step {
+  background: linear-gradient(180deg, #ffffff 0%, #fbfdfb 100%);
+  border: 1px solid #e3e9e3;
+  border-radius: 16px;
+  box-shadow: 0 1px 2px rgba(16, 35, 27, 0.04);
+  grid-template-columns: 38px minmax(0, 1fr);
+  padding: 20px 22px;
+}
+
+.wizard-step:hover {
+  border-color: #bfe3d2;
+  box-shadow: 0 20px 46px rgba(16, 35, 27, 0.1);
+  transform: translateY(-3px);
+}
+
+.wizard-step.current {
+  background:
+    radial-gradient(130% 150% at 0% 0%, rgba(12, 166, 120, 0.09), transparent 56%),
+    linear-gradient(180deg, #ffffff, #f5fdf9);
+  border-color: #76cfb0;
+  box-shadow:
+    0 22px 54px rgba(8, 122, 89, 0.16),
+    inset 0 0 0 1px rgba(12, 166, 120, 0.18);
+}
+
+.wizard-step.done {
+  background: linear-gradient(180deg, #f3fbf7, #ecf8f2);
+  border-color: #c2e7d5;
+}
+
+.wizard-step::before {
+  width: 5px;
+}
+
+/* Step badges: soft chip → gradient for active, check-mark for done */
+.step-number {
+  background: linear-gradient(160deg, #f1f5f1, #e4ebe4);
+  box-shadow: inset 0 0 0 1px rgba(8, 30, 22, 0.04);
+  color: #5b6962;
+  font-size: 13px;
+  height: 34px;
+  width: 34px;
+}
+
+.wizard-step.current .step-number {
+  background: linear-gradient(160deg, #1fe2a0, #0a9a6f);
+  box-shadow: 0 7px 18px rgba(12, 166, 120, 0.4);
+  color: #06241a;
+}
+
+.wizard-step.done .step-number {
+  background: linear-gradient(160deg, #1fe2a0, #0a9a6f);
+  color: transparent;
+  position: relative;
+}
+
+.wizard-step.done .step-number::after {
+  align-items: center;
+  color: #06241a;
+  content: "\2713";
+  display: flex;
+  font-size: 17px;
+  font-weight: 900;
+  inset: 0;
+  justify-content: center;
+  position: absolute;
+}
+
+.wizard-step h3 {
+  font-size: 19px;
+  letter-spacing: -0.01em;
+}
+
+/* --- "Next step" hero card at the top of the wizard --- */
+.handoff-card {
+  background:
+    radial-gradient(130% 180% at 100% -20%, rgba(12, 166, 120, 0.08), transparent 56%),
+    linear-gradient(180deg, #ffffff, #f6fdfa);
+  border: 1px solid #cce9dc;
+  border-radius: 16px;
+  box-shadow: 0 18px 44px rgba(8, 122, 89, 0.1);
+  padding: 22px 24px;
+}
+
+.inline-next-step {
+  background: rgba(12, 166, 120, 0.1);
+  border: 1px solid rgba(12, 166, 120, 0.22);
+  border-radius: 999px;
+  color: #0a7a59;
+  letter-spacing: 0.04em;
+}
+
+/* --- Brand CTA buttons: subtle gradient + lift --- */
+.download:not(.secondary) {
+  background: linear-gradient(160deg, #14c78c, #0a8e66);
+  box-shadow: 0 8px 20px rgba(10, 142, 102, 0.26);
+}
+
+.download:not(.secondary):hover {
+  background: linear-gradient(160deg, #1ad497, #0b9c71);
+  box-shadow: 0 12px 26px rgba(10, 142, 102, 0.34);
+  transform: translateY(-1px);
+}
