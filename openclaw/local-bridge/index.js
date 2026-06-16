@@ -13,7 +13,7 @@ const tools = [
   {
     name: "ozon_products_count",
     label: "Ozon Products Count",
-    description: "Count real Ozon products through the paired Ozon Rust Local node.",
+    description: "Count real Ozon products through the paired Ozon Local node.",
     method: "POST",
     path: "/tools/ozon.products.count",
     parameters: objectSchema({})
@@ -21,7 +21,7 @@ const tools = [
   {
     name: "ozon_products_list",
     label: "Ozon Products List",
-    description: "List real Ozon product summaries through the paired Ozon Rust Local node.",
+    description: "List real Ozon product summaries through the paired Ozon Local node.",
     method: "POST",
     path: "/tools/ozon.products.list",
     parameters: objectSchema({
@@ -34,7 +34,7 @@ const tools = [
   {
     name: "ozon_products_get",
     label: "Ozon Product Details",
-    description: "Read one real Ozon product detail package and image URLs through Ozon Rust Local. Pass one identifier; if a list item provides both product_id and offer_id, offer_id is preferred and the other id is verified against the returned product.",
+    description: "Read one real Ozon product detail package and image URLs through Ozon Local. Pass one identifier; if a list item provides both product_id and offer_id, offer_id is preferred and the other id is verified against the returned product.",
     method: "POST",
     path: "/tools/ozon.products.get",
     parameters: objectSchema({
@@ -193,7 +193,7 @@ p{font-size:18px;line-height:1.6;color:#4b5d53}
 .error{background:#fff4f2;border-color:#f0b4aa;color:#8d281f}
 </style>
 <main>
-  <div class="eyebrow">Ozon Rust Local</div>
+  <div class="eyebrow">Ozon Local</div>
   <h1>正在绑定这台电脑</h1>
   <p>本页只接收 5 分钟有效的一次性配对码。长期访问令牌不会出现在网址里，也不会返回给浏览器页面。</p>
   <div id="status" class="status">正在读取配对码...</div>
@@ -209,7 +209,7 @@ function requireLocalEndpoint(value, pathname, label) {
   const parsed = new URL(value);
   const localHost = parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost";
   if (parsed.protocol !== "http:" || !localHost || parsed.username || parsed.password || parsed.pathname !== pathname) {
-    throw new Error(label + " 不是本机授权地址，请回到 Ozon Rust Local 重新点击绑定。");
+    throw new Error(label + " 不是本机授权地址，请回到 Ozon Local 重新点击绑定。");
   }
   return parsed.toString().replace(/\\/$/, "");
 }
@@ -218,7 +218,7 @@ async function run() {
   const code = fragment.get("ozon66_pairing_code");
   const claimUrl = requireLocalEndpoint(fragment.get("claim_url") || "", "/openclaw/pairing/claim", "claim_url");
   const manifestUrl = requireLocalEndpoint(fragment.get("manifest_url") || "", "/openclaw/manifest", "manifest_url");
-  if (!code || !claimUrl || !manifestUrl) throw new Error("缺少配对参数，请回到 Ozon Rust Local 重新点击绑定。");
+  if (!code || !claimUrl || !manifestUrl) throw new Error("缺少配对参数，请回到 Ozon Local 重新点击绑定。");
   history.replaceState(null, "", location.pathname);
   setStatus("正在向 OpenClaw 本地服务确认授权...");
   const claimResponse = await fetch("${CLAIM_PATH}", {
@@ -337,7 +337,7 @@ function verifyLookupMatchesResult(tool, lookup, result) {
 export default definePluginEntry({
   id: "ozon66-local-bridge",
   name: "Ozon66 Local Bridge",
-  description: "One-click local bridge for Ozon Rust Local product reads and poster handoff.",
+  description: "One-click local bridge for Ozon Local product reads and poster handoff.",
   register(api) {
     api.registerHttpRoute({
       path: IMPORT_PATH,

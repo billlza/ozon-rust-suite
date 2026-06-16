@@ -153,10 +153,10 @@ const zh = {
           authorizeComputer: "授权这台电脑",
           completeComputerAuth: "完成电脑授权",
           openWorkspace: "打开工作台",
-          continueOnLocal: "去电脑上的 Ozon Rust Local 继续",
+          continueOnLocal: "去电脑上的 Ozon Local 继续",
           packagePreparing: "安装包准备中",
           refreshAfterHandled: "我已处理，刷新状态",
-          openLocalApp: "请打开电脑上的 Ozon Rust Local"
+          openLocalApp: "请打开电脑上的 Ozon Local"
         },
         step1: {
           title: "开通服务",
@@ -180,14 +180,14 @@ const zh = {
           connectTitle: "连接 Ozon 店铺",
           locked: "前面几步完成后，这里会告诉你去哪里填写店铺授权。",
           ready: "店铺授权已经保存。打开工作台读取商品，再把海报任务复制给龙虾/Codex。",
-          todo: "切到电脑上的 Ozon Rust Local，在“店铺授权”里填写 Ozon Client ID 和 API Key，保存后回这里刷新。"
+          todo: "切到电脑上的 Ozon Local，在“店铺授权”里填写 Ozon Client ID 和 API Key，保存后回这里刷新。"
         },
         handoff: {
           readyBadge: "店铺已连好",
           todoBadge: "现在去电脑助手",
           readyTitle: "可以读取真实商品了",
           todoTitle: "把 Ozon API 填到电脑助手里",
-          readyText: "下一步在 Ozon Rust Local 里读取商品，点“复制给龙虾/Codex”。图片 API 只是自动后台出图的可选项。",
+          readyText: "下一步在 Ozon Local 里读取商品，点“复制给龙虾/Codex”。图片 API 只是自动后台出图的可选项。",
           todoText: "网页已经确认这台电脑能用。接下来不是在网页里填密钥，而是在电脑助手里保存店铺授权，这样密钥只留在你的电脑上。",
           refreshCheck: "刷新检查"
         }
@@ -227,7 +227,7 @@ const zh = {
         storeReady: "已保存",
         storePending: "待填写",
         storeReadyText: "电脑助手已保存 Ozon 店铺授权，可以读取商品。",
-        storePendingText: "切到 Ozon Rust Local，在店铺授权里填写 Client ID 和 API Key。",
+        storePendingText: "切到 Ozon Local，在店铺授权里填写 Client ID 和 API Key。",
         posterApi: "API 自动出图",
         posterReady: "已配置",
         posterOptional: "可选",
@@ -480,7 +480,7 @@ const zh = {
         installHelperTitle: "安装并打开电脑助手",
         installHelperText: "下载电脑助手，打开后回到这里点“检测一下”。",
         fillStoreTitle: "去电脑助手填写店铺 API",
-        fillStoreText: "这台电脑已经授权。现在切到 Ozon Rust Local，在店铺授权里保存 Ozon Client ID 和 API Key。",
+        fillStoreText: "这台电脑已经授权。现在切到 Ozon Local，在店铺授权里保存 Ozon Client ID 和 API Key。",
         readyTitle: "可以开始了",
         readyTextBrief: "服务、电脑和店铺授权都准备好了。打开工作台读取商品，再把海报任务交给龙虾/Codex。",
         authorizeTitle: "授权这台电脑",
@@ -567,7 +567,7 @@ const zh = {
         },
         {
           title: "打开电脑助手",
-          paragraphs: ["安装完成后打开 Ozon Rust Local。第一次打开时，系统可能会询问是否允许网络访问，请选择允许。打开后回到网站，点击“检测电脑助手”。"]
+          paragraphs: ["安装完成后打开 Ozon Local。第一次打开时，系统可能会询问是否允许网络访问，请选择允许。打开后回到网站，点击“检测电脑助手”。"]
         },
         {
           title: "授权这台电脑",
@@ -575,7 +575,7 @@ const zh = {
         },
         {
           title: "填写店铺授权信息",
-          paragraphs: ["切到 Ozon Rust Local 电脑助手，在“本地密钥”或“店铺授权”里填写 Ozon Seller 的 Client ID 和 API Key，点击保存。保存后回到网站，点击刷新或重新检测。"]
+          paragraphs: ["切到 Ozon Local 电脑助手，在“本地密钥”或“店铺授权”里填写 Ozon Seller 的 Client ID 和 API Key，点击保存。保存后回到网站，点击刷新或重新检测。"]
         }
       ]
     },
@@ -611,7 +611,7 @@ const zh = {
     daily: {
       title: "日常使用",
       intro: "正常情况下，只需要三步：",
-      items: ["打开 Ozon Rust Local 电脑助手。", "打开 ozon66.com 并登录。", "进入工作台，点击读取商品，选择商品生成海报简报。"],
+      items: ["打开 Ozon Local 电脑助手。", "打开 ozon66.com 并登录。", "进入工作台，点击读取商品，选择商品生成海报简报。"],
       outro: "如果网站提示电脑未连接，先确认电脑助手已经打开，再点击“检测电脑助手”。"
     },
     faq: {
@@ -623,7 +623,7 @@ const zh = {
         },
         {
           title: "网站一直提示电脑助手未连接怎么办？",
-          text: "确认 Ozon Rust Local 已经打开。Windows 用户检查右下角托盘或开始菜单；Mac 用户检查“应用程序”里是否已经打开。如果刚安装完成，建议关闭浏览器页面后重新打开。"
+          text: "确认 Ozon Local 已经打开。Windows 用户检查右下角托盘或开始菜单；Mac 用户检查“应用程序”里是否已经打开。如果刚安装完成，建议关闭浏览器页面后重新打开。"
         },
         {
           title: "保存 Ozon 信息后，仍然读不到商品怎么办？",
@@ -799,10 +799,10 @@ const en: Messages = {
           authorizeComputer: "Authorize this computer",
           completeComputerAuth: "Finish computer authorization",
           openWorkspace: "Open workspace",
-          continueOnLocal: "Continue in Ozon Rust Local",
+          continueOnLocal: "Continue in Ozon Local",
           packagePreparing: "Installer preparing",
           refreshAfterHandled: "Done, refresh status",
-          openLocalApp: "Open Ozon Rust Local on this computer"
+          openLocalApp: "Open Ozon Local on this computer"
         },
         step1: {
           title: "Activate service",
@@ -826,14 +826,14 @@ const en: Messages = {
           connectTitle: "Connect Ozon store",
           locked: "After the previous steps, this area will show where to add store authorization.",
           ready: "Store authorization is saved. Open the workspace, read products, then copy poster tasks to OpenClaw/Codex.",
-          todo: "Open Ozon Rust Local on this computer, add Ozon Client ID and API Key under Store Authorization, save, then refresh here."
+          todo: "Open Ozon Local on this computer, add Ozon Client ID and API Key under Store Authorization, save, then refresh here."
         },
         handoff: {
           readyBadge: "Store connected",
           todoBadge: "Go to the helper",
           readyTitle: "Real product reading is ready",
           todoTitle: "Add the Ozon API keys in the helper",
-          readyText: "Next, read products in Ozon Rust Local and click Copy for OpenClaw/Codex. The image API is optional for automated background generation.",
+          readyText: "Next, read products in Ozon Local and click Copy for OpenClaw/Codex. The image API is optional for automated background generation.",
           todoText: "The portal has confirmed this computer can be used. Store keys are not entered in the web page; save them in the helper so they remain on your computer.",
           refreshCheck: "Refresh check"
         }
@@ -873,7 +873,7 @@ const en: Messages = {
         storeReady: "Saved",
         storePending: "Needs setup",
         storeReadyText: "The helper has saved Ozon store authorization and can read products.",
-        storePendingText: "Open Ozon Rust Local and enter Client ID and API Key under Store Authorization.",
+        storePendingText: "Open Ozon Local and enter Client ID and API Key under Store Authorization.",
         posterApi: "Image API",
         posterReady: "Configured",
         posterOptional: "Optional",
@@ -1126,7 +1126,7 @@ const en: Messages = {
         installHelperTitle: "Install and open the helper",
         installHelperText: "Download the helper, open it, then come back and click Check.",
         fillStoreTitle: "Add store API in the helper",
-        fillStoreText: "This computer is authorized. Open Ozon Rust Local and save Ozon Client ID and API Key under Store Authorization.",
+        fillStoreText: "This computer is authorized. Open Ozon Local and save Ozon Client ID and API Key under Store Authorization.",
         readyTitle: "Ready to start",
         readyTextBrief: "Service, computer, and store authorization are ready. Open the workspace, read products, then hand poster tasks to OpenClaw/Codex.",
         authorizeTitle: "Authorize this computer",
@@ -1213,7 +1213,7 @@ const en: Messages = {
         },
         {
           title: "Open the helper",
-          paragraphs: ["After installation, open Ozon Rust Local. The system may ask whether to allow network access the first time; choose Allow. Return to the website and click Check helper."]
+          paragraphs: ["After installation, open Ozon Local. The system may ask whether to allow network access the first time; choose Allow. Return to the website and click Check helper."]
         },
         {
           title: "Authorize this computer",
@@ -1221,7 +1221,7 @@ const en: Messages = {
         },
         {
           title: "Enter store authorization",
-          paragraphs: ["Switch to Ozon Rust Local and enter Ozon Seller Client ID and API Key under Local keys or Store authorization, then save. Return to the website and refresh or check again."]
+          paragraphs: ["Switch to Ozon Local and enter Ozon Seller Client ID and API Key under Local keys or Store authorization, then save. Return to the website and refresh or check again."]
         }
       ]
     },
@@ -1257,7 +1257,7 @@ const en: Messages = {
     daily: {
       title: "Daily use",
       intro: "Normally, only three steps are needed:",
-      items: ["Open the Ozon Rust Local helper.", "Open ozon66.com and log in.", "Enter the workspace, click Read products, choose a product, and generate a poster brief."],
+      items: ["Open the Ozon Local helper.", "Open ozon66.com and log in.", "Enter the workspace, click Read products, choose a product, and generate a poster brief."],
       outro: "If the website says the computer is not connected, confirm the helper is open, then click Check helper."
     },
     faq: {
@@ -1269,7 +1269,7 @@ const en: Messages = {
         },
         {
           title: "What if the website keeps saying the helper is not connected?",
-          text: "Confirm Ozon Rust Local is open. Windows users should check the tray or Start menu; Mac users should check Applications. If you just installed it, close the browser page and open it again."
+          text: "Confirm Ozon Local is open. Windows users should check the tray or Start menu; Mac users should check Applications. If you just installed it, close the browser page and open it again."
         },
         {
           title: "What if products still cannot be read after saving Ozon info?",

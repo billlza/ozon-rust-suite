@@ -5,7 +5,7 @@
   },
   "enabledByDefault": true,
   "name": "Ozon66 Local Bridge",
-  "description": "Imports Ozon Rust Local pairing links and exposes read-only Ozon product tools to OpenClaw.",
+  "description": "Imports Ozon Local pairing links and exposes read-only Ozon product tools to OpenClaw.",
   "contracts": {
     "tools": [
       "ozon_products_count",

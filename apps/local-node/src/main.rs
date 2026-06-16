@@ -2518,13 +2518,13 @@ fn build_openclaw_poster_prompt(
 fn poster_handoff_instructions(locale: &str) -> Vec<&'static str> {
     match locale {
         "zh-CN" => vec![
-            "优先使用用户已登录的 OpenClaw/Codex 图片能力；这条路径不要求 Ozon Rust Local 保存 OpenAI API Key。",
+            "优先使用用户已登录的 OpenClaw/Codex 图片能力；这条路径不要求 Ozon Local 保存 OpenAI API Key。",
             "使用提供的 Ozon 图片 URL 作为商品参考，保留包装、颜色、标签、比例和可见文字。",
             "生成 4:5 竖版电商海报；不要编造来源事实里没有的认证、折扣、品牌合作或产品功能。",
             "如果商品信息不明确，文案保持保守，并在加强卖点前先询问操作员。",
         ],
         _ => vec![
-            "Prefer the user's signed-in OpenClaw/Codex image capability; this path does not require Ozon Rust Local to save an OpenAI API key.",
+            "Prefer the user's signed-in OpenClaw/Codex image capability; this path does not require Ozon Local to save an OpenAI API key.",
             "Use the supplied Ozon image URLs as product references and preserve packaging, color, labels, proportions, and visible text.",
             "Generate a finished 4:5 marketplace poster; do not invent certifications, discounts, brand partnerships, or product functions that are not present in the source facts.",
             "If any product detail is ambiguous, keep the claim conservative and ask the operator before strengthening copy.",

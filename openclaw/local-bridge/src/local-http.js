@@ -15,7 +15,7 @@ export async function callOzonLocalTool(config, tool, params) {
   } catch {}
   if (!response.ok) {
     const message = (details?.error ?? text) || `HTTP ${response.status}`;
-    throw new Error(`Ozon Rust Local rejected ${tool.name}: ${message}`);
+    throw new Error(`Ozon Local rejected ${tool.name}: ${message}`);
   }
   return details ?? { text };
 }
@@ -36,7 +36,7 @@ export async function claimOzonLocalPairing(claimUrl, code, origin) {
   } catch {}
   if (!response.ok) {
     const message = (details?.error ?? text) || `HTTP ${response.status}`;
-    throw new Error(`Ozon Rust Local rejected pairing claim: ${message}`);
+    throw new Error(`Ozon Local rejected pairing claim: ${message}`);
   }
   if (!details || typeof details !== "object") {
     throw new Error("pairing claim response must be JSON");

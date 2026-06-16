@@ -10,7 +10,7 @@ const zhCN = {
     en: "English"
   },
   app: {
-    title: "Ozon Rust Local",
+    title: "Ozon Local",
     subtitle: "店铺商品与出图助手",
     ready: "ready",
     offline: "offline"
@@ -243,7 +243,7 @@ const zhCN = {
     unknown: "本地节点未确认运行",
     justNow: "刚刚",
     runningDiagnostic: (started: string, logPath: string) => `监听 127.0.0.1:8790 / 17870，启动时间 ${started}，日志 ${logPath}`,
-    externalDiagnostic: (logPath: string) => `检测到已有 Ozon Rust Local 节点正在监听 127.0.0.1:8790 / 17870，桌面端已直接连接。日志 ${logPath}`,
+    externalDiagnostic: (logPath: string) => `检测到已有 Ozon Local 节点正在监听 127.0.0.1:8790 / 17870，桌面端已直接连接。日志 ${logPath}`,
     defaultDiagnostic: "桌面端会托管 local-node；若端口被占用或 sidecar 缺失，这里会显示具体错误。",
     logUnavailable: "当前不在桌面应用内，日志不可用",
     existingAgentPortNotReady: (logPath: string) => `127.0.0.1:8790 已有本地节点，但 17870 agent 端口未就绪。日志 ${logPath}`,
@@ -348,7 +348,7 @@ const enUS: typeof zhCN = {
     en: "English"
   },
   app: {
-    title: "Ozon Rust Local",
+    title: "Ozon Local",
     subtitle: "Product and poster assistant",
     ready: "ready",
     offline: "offline"
@@ -581,7 +581,7 @@ const enUS: typeof zhCN = {
     unknown: "Local node status not confirmed",
     justNow: "just now",
     runningDiagnostic: (started: string, logPath: string) => `Listening on 127.0.0.1:8790 / 17870, started ${started}, log ${logPath}`,
-    externalDiagnostic: (logPath: string) => `An existing Ozon Rust Local node is listening on 127.0.0.1:8790 / 17870; the desktop app connected to it. Log ${logPath}`,
+    externalDiagnostic: (logPath: string) => `An existing Ozon Local node is listening on 127.0.0.1:8790 / 17870; the desktop app connected to it. Log ${logPath}`,
     defaultDiagnostic: "The desktop app manages local-node. Port conflicts or missing sidecars appear here with concrete errors.",
     logUnavailable: "Logs are unavailable outside the desktop app",
     existingAgentPortNotReady: (logPath: string) => `An existing local node is on 127.0.0.1:8790, but the 17870 agent port is not ready. Log ${logPath}`,

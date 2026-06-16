@@ -176,7 +176,7 @@ jobs:
           repository: ${{ env.DOWNLOADS_REPOSITORY }}
           token: ${{ secrets.OZON_DOWNLOADS_REPO_TOKEN || github.token }}
           tag_name: ${{ github.event_name == 'workflow_dispatch' && format('local-node-v{0}', github.event.inputs.version) || github.ref_name }}
-          name: Ozon Rust Local ${{ github.event.inputs.version || github.ref_name }}
+          name: Ozon Local ${{ github.event.inputs.version || github.ref_name }}
           make_latest: true
           overwrite_files: true
           files: dist/release/*
@@ -295,7 +295,7 @@ jobs:
           if [ -d apps/local-node/src-tauri/target ]; then
             search_roots+=(apps/local-node/src-tauri/target)
           fi
-          app_path="$(find "${search_roots[@]}" -type d -name 'Ozon Rust Local.app' | head -n 1)"
+          app_path="$(find "${search_roots[@]}" -type d -name 'Ozon Local.app' | head -n 1)"
           if [ -z "$app_path" ]; then
             echo "macOS app bundle was not produced" >&2
             exit 1
@@ -304,7 +304,7 @@ jobs:
           mkdir -p dist/macos-dmg-src
           cp -R "$app_path" dist/macos-dmg-src/
           ln -s /Applications dist/macos-dmg-src/Applications
-          hdiutil create -volname "Ozon Rust Local" -srcfolder dist/macos-dmg-src -ov -format UDZO dist/release/OzonRustLocal-aarch64.dmg
+          hdiutil create -volname "Ozon Local" -srcfolder dist/macos-dmg-src -ov -format UDZO dist/release/OzonRustLocal-aarch64.dmg
           cp dist/release/OzonRustLocal-aarch64.dmg "dist/release/OzonRustLocal-$version-aarch64.dmg"
           dmg_hash="$(shasum -a 256 dist/release/OzonRustLocal-aarch64.dmg | awk '{print $1}')"
           curl -fsSL "$release_base_url/release-manifest.json" -o dist/release/release-manifest.json
@@ -346,7 +346,7 @@ jobs:
           repository: ${{ env.DOWNLOADS_REPOSITORY }}
           token: ${{ secrets.OZON_DOWNLOADS_REPO_TOKEN || github.token }}
           tag_name: ${{ github.event_name == 'workflow_dispatch' && format('local-node-v{0}', github.event.inputs.version) || github.ref_name }}
-          name: Ozon Rust Local ${{ github.event.inputs.version || github.ref_name }}
+          name: Ozon Local ${{ github.event.inputs.version || github.ref_name }}
           make_latest: true
           overwrite_files: true
           files: dist/release/*
@@ -369,7 +369,7 @@ jobs:
           cat > dist/openclaw-plugin/INSTALL.md <<'EOF'
           # Ozon Rust Suite OpenClaw Plugin
 
-          1. Install and start Ozon Rust Local.
+          1. Install and start Ozon Local.
           2. Open the local UI and copy the OpenClaw bridge token.
           3. Add `http://127.0.0.1:8790/openclaw/manifest` to OpenClaw.
           4. Configure the auth header as `x-openclaw-token: <bridge token>`.
@@ -391,7 +391,7 @@ jobs:
           repository: ${{ env.DOWNLOADS_REPOSITORY }}
           token: ${{ secrets.OZON_DOWNLOADS_REPO_TOKEN || github.token }}
           tag_name: ${{ github.event_name == 'workflow_dispatch' && format('local-node-v{0}', github.event.inputs.version) || github.ref_name }}
-          name: Ozon Rust Local ${{ github.event.inputs.version || github.ref_name }}
+          name: Ozon Local ${{ github.event.inputs.version || github.ref_name }}
           make_latest: true
           overwrite_files: true
           files: dist/openclaw-plugin.zip
