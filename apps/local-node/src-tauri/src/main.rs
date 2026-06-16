@@ -465,9 +465,11 @@ fn probe_health_endpoint(addr: &str) -> bool {
 /// an unauthenticated peer (and is only ever sent to a peer that has proven it already holds it).
 fn probe_attest_endpoint(local_token: &str) -> bool {
     let nonce = generate_nonce();
-    let Some(response) =
-        probe_http_endpoint("127.0.0.1:8790", "/attest", Some(("x-attest-nonce", &nonce)))
-    else {
+    let Some(response) = probe_http_endpoint(
+        "127.0.0.1:8790",
+        "/attest",
+        Some(("x-attest-nonce", &nonce)),
+    ) else {
         return false;
     };
     if response.status_code != 200 {
@@ -479,7 +481,10 @@ fn probe_attest_endpoint(local_token: &str) -> bool {
     let Some(proof) = parsed.proof else {
         return false;
     };
-    constant_time_eq(proof.as_bytes(), attest_proof(local_token, &nonce).as_bytes())
+    constant_time_eq(
+        proof.as_bytes(),
+        attest_proof(local_token, &nonce).as_bytes(),
+    )
 }
 
 #[derive(Deserialize)]
