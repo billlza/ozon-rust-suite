@@ -17,7 +17,7 @@ ozon-connector = { path = "../../crates/ozon-connector" }
 ozon-domain = { path = "../../crates/domain" }
 ozon-secret-store = { path = "../../crates/secret-store" }
 ozon-task-engine = { path = "../../crates/task-engine" }
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["multipart"] }
 rsa = { version = "0.9.10", features = ["sha2", "pem"] }
 secrecy.workspace = true
 serde.workspace = true

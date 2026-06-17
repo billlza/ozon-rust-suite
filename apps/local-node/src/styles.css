@@ -1236,3 +1236,210 @@ nav > span.warn::before {
   background: #ece8dd;
   color: #5c6760;
 }
+
+/* ---- Re-listing workbench ------------------------------------------------ */
+.view-tabs {
+  display: flex;
+  gap: 8px;
+  margin: 0 0 4px;
+}
+
+.view-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgba(24, 34, 31, 0.16);
+  background: rgba(255, 255, 255, 0.55);
+  color: #46514b;
+  border-radius: 999px;
+  padding: 8px 16px;
+  font-weight: 800;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 180ms ease, color 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
+}
+
+.view-tabs button:hover {
+  border-color: rgba(24, 34, 31, 0.3);
+}
+
+.view-tabs button.active {
+  background: linear-gradient(160deg, #17201b, #29362f);
+  color: #f8fff9;
+  border-color: transparent;
+  box-shadow: 0 10px 24px rgba(24, 34, 31, 0.22);
+}
+
+.relist-grid {
+  align-items: start;
+}
+
+.relist-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 14px 0 12px;
+}
+
+.relist-list {
+  max-height: 540px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.relist-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(24, 34, 31, 0.1);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.5);
+  cursor: pointer;
+  transition: border-color 160ms ease, background 160ms ease;
+}
+
+.relist-row:hover {
+  border-color: rgba(24, 34, 31, 0.26);
+}
+
+.relist-row.picked {
+  border-color: #00a36c;
+  background: rgba(0, 163, 108, 0.08);
+}
+
+.relist-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: #00a36c;
+  flex: none;
+}
+
+.relist-row > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.relist-row strong {
+  font-size: 13px;
+}
+
+.relist-row span {
+  font-size: 12px;
+  color: #5c6760;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.relist-results {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 14px;
+  margin-top: 12px;
+}
+
+.relist-card {
+  border: 1px solid rgba(24, 34, 31, 0.12);
+  border-radius: 12px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.relist-card.failed {
+  border-color: rgba(199, 78, 70, 0.5);
+  background: rgba(255, 208, 205, 0.22);
+}
+
+.relist-card-head {
+  display: grid;
+  gap: 2px;
+  margin-bottom: 10px;
+}
+
+.relist-card-head strong {
+  font-size: 13px;
+}
+
+.relist-card-head span {
+  font-size: 12px;
+  color: #5c6760;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.relist-ba {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.relist-ba figure {
+  margin: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.relist-ba img {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  border-radius: 8px;
+  background: #fff;
+  border: 1px solid rgba(24, 34, 31, 0.1);
+}
+
+.relist-ba figcaption {
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #5c6760;
+  text-align: center;
+}
+
+.relist-adopt {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.relist-adopt input[type="checkbox"] {
+  width: 17px;
+  height: 17px;
+  accent-color: #00a36c;
+}
+
+.relist-push-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(24, 34, 31, 0.12);
+}
+
+.relist-warn {
+  flex: 1 1 260px;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #946000;
+  background: rgba(224, 160, 42, 0.12);
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+.relist-push-results {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}

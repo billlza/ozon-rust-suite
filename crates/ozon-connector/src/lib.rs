@@ -143,6 +143,36 @@ pub trait OzonReadConnector: Send + Sync {
     ) -> Result<OzonProductDetail, OzonConnectorError>;
 }
 
+/// Write-side Ozon operations. Kept as a separate trait from the read connector
+/// so read-only callers cannot accidentally mutate a live store. v1 covers
+/// image replacement only — the proven-reliable write path (Ozon fetches each
+/// URL we pass and re-hosts it on its own CDN, with `images[0]` as the primary).
+#[async_trait]
+pub trait OzonWriteConnector: Send + Sync {
+    /// Replace a product's image list. `images[0]` becomes the primary image.
+    async fn pictures_import(
+        &self,
+        credentials: &OzonCredentials,
+        product_id: &str,
+        images: Vec<String>,
+    ) -> Result<OzonPicturesImport, OzonConnectorError>;
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct OzonPicturesImport {
+    pub product_id: String,
+    pub pictures: Vec<OzonPictureState>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct OzonPictureState {
+    pub url: String,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub is_primary: Option<bool>,
+}
+
 #[derive(Clone)]
 pub struct OzonHttpClient {
     client: reqwest::Client,
@@ -407,6 +437,99 @@ impl OzonHttpClient {
     }
 }
 
+#[async_trait]
+impl OzonWriteConnector for OzonHttpClient {
+    async fn pictures_import(
+        &self,
+        credentials: &OzonCredentials,
+        product_id: &str,
+        images: Vec<String>,
+    ) -> Result<OzonPicturesImport, OzonConnectorError> {
+        let product_number: i64 = product_id.trim().parse().map_err(|_| {
+            OzonConnectorError::InvalidProductLookup(format!(
+                "product_id must be numeric to import pictures, got {product_id:?}"
+            ))
+        })?;
+        if images.is_empty() {
+            return Err(OzonConnectorError::InvalidProductLookup(
+                "pictures_import requires at least one image URL".to_string(),
+            ));
+        }
+        let url = self
+            .base_url
+            .join("/v1/product/pictures/import")
+            .map_err(|error| OzonConnectorError::InvalidBaseUrl(error.to_string()))?;
+        let response = self
+            .client
+            .post(url)
+            .header("Client-Id", &credentials.client_id)
+            .header("Api-Key", credentials.api_key.expose_secret())
+            .json(&PicturesImportRequest {
+                product_id: product_number,
+                images: images.clone(),
+                color_image: String::new(),
+                images360: Vec::new(),
+            })
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "failed to read Ozon error body".to_string());
+            return Err(OzonConnectorError::ApiStatus {
+                status,
+                body: sanitize_api_error_body(&body),
+            });
+        }
+
+        let body: Value = response.json().await?;
+        Ok(OzonPicturesImport {
+            product_id: product_id.to_string(),
+            pictures: parse_picture_states(&body, &images),
+        })
+    }
+}
+
+/// Parse `result.pictures[]` from a pictures/import response, falling back to
+/// echoing the URLs we submitted (first = primary) when the body is sparse.
+fn parse_picture_states(body: &Value, submitted: &[String]) -> Vec<OzonPictureState> {
+    if let Some(items) = body
+        .get("result")
+        .and_then(|result| result.get("pictures"))
+        .and_then(|pictures| pictures.as_array())
+    {
+        let parsed: Vec<OzonPictureState> = items
+            .iter()
+            .filter_map(|item| {
+                let url = item.get("url").and_then(Value::as_str)?.to_string();
+                Some(OzonPictureState {
+                    url,
+                    state: item
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    is_primary: item.get("is_primary").and_then(Value::as_bool),
+                })
+            })
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    submitted
+        .iter()
+        .enumerate()
+        .map(|(index, url)| OzonPictureState {
+            url: url.clone(),
+            state: Some("pending".to_string()),
+            is_primary: Some(index == 0),
+        })
+        .collect()
+}
+
 #[derive(Clone, Default)]
 pub struct MockOzonConnector;
 
@@ -550,6 +673,35 @@ impl OzonReadConnector for MockOzonConnector {
     }
 }
 
+#[async_trait]
+impl OzonWriteConnector for MockOzonConnector {
+    async fn pictures_import(
+        &self,
+        _credentials: &OzonCredentials,
+        product_id: &str,
+        images: Vec<String>,
+    ) -> Result<OzonPicturesImport, OzonConnectorError> {
+        if images.is_empty() {
+            return Err(OzonConnectorError::InvalidProductLookup(
+                "pictures_import requires at least one image URL".to_string(),
+            ));
+        }
+        let pictures = images
+            .iter()
+            .enumerate()
+            .map(|(index, url)| OzonPictureState {
+                url: url.clone(),
+                state: Some("imported".to_string()),
+                is_primary: Some(index == 0),
+            })
+            .collect();
+        Ok(OzonPicturesImport {
+            product_id: product_id.to_string(),
+            pictures,
+        })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum OzonConnectorError {
     #[error("invalid Ozon API base URL: {0}")]
@@ -571,6 +723,14 @@ struct ProductListRequest {
     filter: ProductListFilter,
     limit: u16,
     last_id: String,
+}
+
+#[derive(Serialize)]
+struct PicturesImportRequest {
+    product_id: i64,
+    images: Vec<String>,
+    color_image: String,
+    images360: Vec<String>,
 }
 
 #[derive(Serialize)]

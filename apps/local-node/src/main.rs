@@ -22,6 +22,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use ozon_connector::{
     MockOzonConnector, OzonCredentials, OzonProductListPage, OzonProductLookup, OzonReadConnector,
+    OzonWriteConnector,
 };
 use ozon_domain::{
     DryRunDiff, EntitlementLease, ExecutionReceipt, Feature, FieldChange, OperationKind, RiskLevel,
@@ -59,6 +60,13 @@ const DEFAULT_OPENCLAW_BIND_URL: &str = "http://127.0.0.1:18789/openclaw/import"
 const OPENCLAW_PAIRING_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_OPENAI_IMAGE_MODEL: &str = "gpt-image-1";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
+// Re-listing workbench: hero white-studio restyle prompt + temp public host.
+// The prompt extracts ONE clean primary product on seamless white (proven on a
+// real Ozon shop); the host gives Ozon a public URL it fetches and re-hosts.
+const RELIST_HERO_PROMPT: &str = "Create a clean professional e-commerce MAIN listing image. Show ONLY a single primary product: pick the one most prominent item from this image and present just that one, centered and filling most of the frame. Remove any duplicate items, colour variants, extra angles, thumbnails or collage panels, and remove all overlay text, badges, logos, watermarks and borders. Pure seamless white studio background, soft even lighting, subtle floor reflection, sharp focus, square 1:1. Keep the chosen product's exact shape, colours, materials and any text printed on the product itself.";
+const RELIST_IMAGE_SIZE: &str = "1024x1024";
+const LITTERBOX_ENDPOINT: &str = "https://litterbox.catbox.moe/resources/internals/api.php";
+const RELIST_MAX_BATCH: usize = 12;
 const SECRET_OZON_CONFIG: &str = "ozon_config";
 const SECRET_OPENAI_CONFIG: &str = "openai_config";
 const SECRET_CLOUD_LEASE: &str = "cloud_lease";
@@ -131,6 +139,8 @@ fn skill_router(state: LocalState) -> Router {
         .route("/tools/ozon.products.count", post(ozon_products_count))
         .route("/tools/ozon.products.list", post(ozon_products_list))
         .route("/tools/ozon.products.get", post(ozon_products_get))
+        .route("/tools/ozon.relist.generate", post(relist_generate))
+        .route("/tools/ozon.relist.push", post(relist_push))
         .route("/poster/brief", post(poster_brief))
         .route("/poster/handoff", post(poster_handoff))
         .route("/poster/generate", post(poster_generate))
@@ -294,6 +304,7 @@ struct LocalState {
     openai_config_cache: Arc<RwLock<Option<StoredOpenAiConfig>>>,
     cloud_lease_cache: Arc<RwLock<Option<EntitlementLease>>>,
     ozon_connector: Arc<dyn OzonReadConnector>,
+    ozon_writer: Arc<dyn OzonWriteConnector>,
     http_client: reqwest::Client,
     schedules: ScheduleStore,
     openclaw_pairings: OpenClawPairingStore,
@@ -308,15 +319,23 @@ impl LocalState {
         config: LocalConfig,
         secrets: Arc<dyn SecretStore>,
     ) -> anyhow::Result<Self> {
-        let ozon_connector: Arc<dyn OzonReadConnector> = if config.use_real_ozon {
-            Arc::new(ozon_connector::OzonHttpClient::new())
+        // Build the read + write connectors from one concrete instance so the
+        // relist workbench can push images through the same client the read
+        // tools use (real Ozon HTTP client, or the in-process mock in debug).
+        let (ozon_connector, ozon_writer): (
+            Arc<dyn OzonReadConnector>,
+            Arc<dyn OzonWriteConnector>,
+        ) = if config.use_real_ozon {
+            let client = Arc::new(ozon_connector::OzonHttpClient::new());
+            (client.clone(), client)
         } else {
             if !cfg!(debug_assertions) {
                 anyhow::bail!(
                     "mock Ozon connector is disabled in non-debug builds; set OZON_CONNECTOR_MODE=real"
                 );
             }
-            Arc::new(MockOzonConnector)
+            let mock = Arc::new(MockOzonConnector);
+            (mock.clone(), mock)
         };
         let schedules = Arc::new(RwLock::new(EcommerceReadSchedule {
             interval_secs: config
@@ -333,9 +352,12 @@ impl LocalState {
             openai_config_cache: Arc::new(RwLock::new(None)),
             cloud_lease_cache: Arc::new(RwLock::new(None)),
             ozon_connector,
+            ozon_writer,
             http_client: reqwest::Client::builder()
                 .user_agent("ozon-rust-suite-local/0.1")
-                .timeout(Duration::from_secs(90))
+                // Image-edit (gpt-image-2) can take a couple of minutes per image,
+                // so allow a generous ceiling; normal calls still return fast.
+                .timeout(Duration::from_secs(300))
                 .build()
                 .map_err(|error| anyhow::anyhow!("failed to build HTTP client: {error}"))?,
             schedules,
@@ -2274,6 +2296,15 @@ fn openai_images_endpoint(base_url: &str) -> String {
     }
 }
 
+fn openai_images_edit_endpoint(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/images/edits")
+    } else {
+        format!("{base}/v1/images/edits")
+    }
+}
+
 fn poster_generation_status(
     openai: &OpenAiCredentialStatus,
     manifest_url: String,
@@ -2620,6 +2651,386 @@ async fn generate_poster_background(
         revised_prompt: image.revised_prompt,
         background_data_url: format!("data:image/png;base64,{}", BASE64_STANDARD.encode(bytes)),
     })
+}
+
+// ------------------------------------------------------------------------- //
+// Re-listing workbench: restyle a product's primary image (GPT image-edit),
+// host it publicly, and push it back to Ozon as the new primary image.
+// Images go through the API (proven-reliable). Title/listing are intentionally
+// NOT pushed here — they belong on the Excel-upload route per the category
+// title-template gotcha.
+// ------------------------------------------------------------------------- //
+
+#[derive(Debug, Deserialize)]
+struct RelistGenerateRequest {
+    #[serde(default)]
+    targets: Vec<RelistTarget>,
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RelistTarget {
+    #[serde(default)]
+    product_id: Option<String>,
+    #[serde(default)]
+    offer_id: Option<String>,
+}
+
+impl RelistTarget {
+    fn label(&self) -> String {
+        self.offer_id
+            .clone()
+            .or_else(|| self.product_id.clone())
+            .unwrap_or_else(|| "(unknown)".to_string())
+    }
+
+    fn into_lookup(self) -> OzonProductLookup {
+        OzonProductLookup {
+            product_id: self.product_id,
+            offer_id: self.offer_id,
+            sku: None,
+        }
+        .normalized()
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RelistGenerateResponse {
+    connector_mode: &'static str,
+    prompt: String,
+    items: Vec<RelistItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct RelistItem {
+    product_id: String,
+    offer_id: String,
+    name: Option<String>,
+    original_url: Option<String>,
+    new_url: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RelistPushRequest {
+    #[serde(default)]
+    items: Vec<RelistPushTarget>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct RelistPushTarget {
+    product_id: String,
+    new_primary_url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RelistPushResponse {
+    connector_mode: &'static str,
+    items: Vec<RelistPushResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct RelistPushResult {
+    product_id: String,
+    primary_url: String,
+    image_count: u32,
+    ok: bool,
+    error: Option<String>,
+}
+
+async fn relist_generate(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Json(input): Json<RelistGenerateRequest>,
+) -> Result<Json<RelistGenerateResponse>, ApiError> {
+    require_bridge_or_operator_token(&state, &headers)?;
+    require_valid_lease_with_feature(&state, Feature::OzonRead).await?;
+    if input.targets.is_empty() {
+        return Err(ApiError::bad_request(
+            "select at least one product to restyle",
+        ));
+    }
+    if input.targets.len() > RELIST_MAX_BATCH {
+        return Err(ApiError::bad_request(format!(
+            "restyle at most {RELIST_MAX_BATCH} products per batch"
+        )));
+    }
+    let credentials = load_ozon_credentials(&state).await?;
+    let prompt = input
+        .prompt
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| RELIST_HERO_PROMPT.to_string());
+
+    let mut items = Vec::with_capacity(input.targets.len());
+    for target in input.targets {
+        let label = target.label();
+        match relist_generate_one(&state, &credentials, target.into_lookup(), &prompt).await {
+            Ok(item) => items.push(item),
+            Err(error) => items.push(RelistItem {
+                product_id: String::new(),
+                offer_id: label,
+                name: None,
+                original_url: None,
+                new_url: None,
+                error: Some(error),
+            }),
+        }
+    }
+
+    Ok(Json(RelistGenerateResponse {
+        connector_mode: connector_mode(&state),
+        prompt,
+        items,
+    }))
+}
+
+async fn relist_generate_one(
+    state: &LocalState,
+    credentials: &OzonCredentials,
+    lookup: OzonProductLookup,
+    prompt: &str,
+) -> Result<RelistItem, String> {
+    let product = state
+        .ozon_connector
+        .product_get(credentials, lookup)
+        .await
+        .map_err(|error| format!("read product failed: {error}"))?;
+    let original = product
+        .primary_image
+        .clone()
+        .or_else(|| product.images.first().map(|image| image.url.clone()))
+        .ok_or_else(|| "product has no image to restyle".to_string())?;
+
+    let source = relist_download(state, &original)
+        .await
+        .map_err(|error| error.message)?;
+    let edited = relist_edit_image(state, source, prompt)
+        .await
+        .map_err(|error| error.message)?;
+    let filename = format!("relist-{}-{}.png", product.product_id, Uuid::new_v4().simple());
+    let new_url = relist_host_litterbox(state, &filename, edited)
+        .await
+        .map_err(|error| error.message)?;
+
+    Ok(RelistItem {
+        product_id: product.product_id,
+        offer_id: product.offer_id,
+        name: product.name,
+        original_url: Some(original),
+        new_url: Some(new_url),
+        error: None,
+    })
+}
+
+async fn relist_push(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Json(input): Json<RelistPushRequest>,
+) -> Result<Json<RelistPushResponse>, ApiError> {
+    require_bridge_or_operator_token(&state, &headers)?;
+    require_valid_lease_with_feature(&state, Feature::OzonRead).await?;
+    if input.items.is_empty() {
+        return Err(ApiError::bad_request("nothing to push"));
+    }
+    if input.items.len() > RELIST_MAX_BATCH {
+        return Err(ApiError::bad_request(format!(
+            "push at most {RELIST_MAX_BATCH} products per batch"
+        )));
+    }
+    let credentials = load_ozon_credentials(&state).await?;
+
+    let mut results = Vec::with_capacity(input.items.len());
+    for target in input.items {
+        match relist_push_one(&state, &credentials, &target).await {
+            Ok(result) => results.push(result),
+            Err(error) => results.push(RelistPushResult {
+                product_id: target.product_id.clone(),
+                primary_url: target.new_primary_url.clone(),
+                image_count: 0,
+                ok: false,
+                error: Some(error),
+            }),
+        }
+    }
+
+    Ok(Json(RelistPushResponse {
+        connector_mode: connector_mode(&state),
+        items: results,
+    }))
+}
+
+async fn relist_push_one(
+    state: &LocalState,
+    credentials: &OzonCredentials,
+    target: &RelistPushTarget,
+) -> Result<RelistPushResult, String> {
+    let new_primary = target.new_primary_url.trim().to_string();
+    if !new_primary.starts_with("http") {
+        return Err("new primary URL is not a valid http(s) URL".to_string());
+    }
+
+    // Recompute the live image list at push time so we never set a stale or
+    // wrong gallery: AI primary first, then the product's current images as
+    // gallery (skipping any duplicate of the new primary).
+    let lookup = OzonProductLookup {
+        product_id: Some(target.product_id.clone()),
+        offer_id: None,
+        sku: None,
+    }
+    .normalized();
+    let product = state
+        .ozon_connector
+        .product_get(credentials, lookup)
+        .await
+        .map_err(|error| format!("read product failed: {error}"))?;
+
+    let mut images = vec![new_primary.clone()];
+    for image in &product.images {
+        if image.url != new_primary && !images.contains(&image.url) {
+            images.push(image.url.clone());
+        }
+    }
+
+    let result = state
+        .ozon_writer
+        .pictures_import(credentials, &product.product_id, images)
+        .await
+        .map_err(|error| format!("pictures import failed: {error}"))?;
+
+    Ok(RelistPushResult {
+        product_id: product.product_id,
+        primary_url: new_primary,
+        image_count: result.pictures.len() as u32,
+        ok: true,
+        error: None,
+    })
+}
+
+/// Download an image URL into memory (used for the restyle source and the
+/// optional image-edit URL fallback).
+async fn relist_download(state: &LocalState, url: &str) -> Result<Vec<u8>, ApiError> {
+    let response = state
+        .http_client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("failed to download image: {error}")))?;
+    if !response.status().is_success() {
+        return Err(ApiError::bad_gateway(format!(
+            "image download returned HTTP {}",
+            response.status().as_u16()
+        )));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("failed to read image bytes: {error}")))?;
+    Ok(bytes.to_vec())
+}
+
+/// Run one image through the GPT image-edit endpoint and return PNG bytes.
+async fn relist_edit_image(
+    state: &LocalState,
+    source_bytes: Vec<u8>,
+    prompt: &str,
+) -> Result<Vec<u8>, ApiError> {
+    let openai = load_openai_config(state).await?;
+    let part = reqwest::multipart::Part::bytes(source_bytes)
+        .file_name("source.png")
+        .mime_str("image/png")
+        .map_err(|error| ApiError::internal(format!("failed to build image part: {error}")))?;
+    let form = reqwest::multipart::Form::new()
+        .text("model", openai.image_model.clone())
+        .text("prompt", prompt.to_string())
+        .text("size", RELIST_IMAGE_SIZE.to_string())
+        .text("n", "1")
+        .part("image", part);
+
+    let response = state
+        .http_client
+        .post(openai_images_edit_endpoint(&openai.base_url))
+        .bearer_auth(openai.api_key)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("image edit request failed: {error}")))?;
+    if !response.status().is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "unknown error".to_string());
+        return Err(ApiError::bad_gateway(format!(
+            "image edit failed: {}",
+            summarize_openai_error(&body)
+        )));
+    }
+    let payload: OpenAiImageGenerationResponse = response
+        .json()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("invalid image edit response: {error}")))?;
+    let image = payload
+        .data
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::bad_gateway("image edit response returned no images"))?;
+    if let Some(b64) = image.b64_json {
+        return BASE64_STANDARD.decode(b64.as_bytes()).map_err(|_| {
+            ApiError::bad_gateway("image edit response returned invalid base64 data")
+        });
+    }
+    if let Some(url) = image.url {
+        return relist_download(state, &url).await;
+    }
+    Err(ApiError::bad_gateway(
+        "image edit response did not include image data",
+    ))
+}
+
+/// Upload PNG bytes to litterbox (temporary public host) and return the URL.
+/// Ozon fetches this URL on pictures/import and re-hosts the image on its CDN,
+/// so a 72h temporary host is enough to complete a push.
+async fn relist_host_litterbox(
+    state: &LocalState,
+    filename: &str,
+    bytes: Vec<u8>,
+) -> Result<String, ApiError> {
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(filename.to_string())
+        .mime_str("image/png")
+        .map_err(|error| ApiError::internal(format!("failed to build upload part: {error}")))?;
+    let form = reqwest::multipart::Form::new()
+        .text("reqtype", "fileupload")
+        .text("time", "72h")
+        .part("fileToUpload", part);
+
+    let response = state
+        .http_client
+        .post(LITTERBOX_ENDPOINT)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("image host upload failed: {error}")))?;
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(ApiError::bad_gateway(format!(
+            "image host returned HTTP error: {}",
+            truncate_text(body.trim(), 200)
+        )));
+    }
+    let url = response
+        .text()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("image host response unreadable: {error}")))?;
+    let url = url.trim().to_string();
+    if !url.starts_with("http") {
+        return Err(ApiError::bad_gateway(format!(
+            "image host did not return a URL: {}",
+            truncate_text(&url, 200)
+        )));
+    }
+    Ok(url)
 }
 
 fn summarize_openai_error(body: &str) -> String {
@@ -3371,6 +3782,8 @@ struct OpenAiImageGenerationResponse {
 #[derive(Debug, Deserialize)]
 struct OpenAiImageData {
     b64_json: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
     revised_prompt: Option<String>,
 }
 

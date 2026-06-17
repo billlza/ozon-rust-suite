@@ -121,6 +121,23 @@ type ProductDetailResult = {
   product: ProductDetail;
 };
 
+type RelistItem = {
+  product_id: string;
+  offer_id: string;
+  name: string | null;
+  original_url: string | null;
+  new_url: string | null;
+  error: string | null;
+};
+
+type RelistPushResult = {
+  product_id: string;
+  primary_url: string;
+  image_count: number;
+  ok: boolean;
+  error: string | null;
+};
+
 type PosterBrief = {
   theme: string;
   headline: string;
@@ -355,6 +372,14 @@ function App() {
   const [schedule, setSchedule] = useState<ScheduleStatus | null>(null);
   const [scheduleInterval, setScheduleInterval] = useState(900);
   const [scheduleLimit, setScheduleLimit] = useState(20);
+  const [view, setView] = useState<"workbench" | "console">("workbench");
+  const [relistProducts, setRelistProducts] = useState<Product[]>([]);
+  const [relistSelected, setRelistSelected] = useState<Record<string, boolean>>({});
+  const [relistResults, setRelistResults] = useState<RelistItem[] | null>(null);
+  const [relistAdopt, setRelistAdopt] = useState<Record<string, boolean>>({});
+  const [relistBusy, setRelistBusy] = useState(false);
+  const [relistPushing, setRelistPushing] = useState(false);
+  const [relistPushResults, setRelistPushResults] = useState<RelistPushResult[] | null>(null);
   const realModeRequiresLease = configStatus?.real_ozon_enabled ?? true;
   const ozonConfigReady = configStatus?.ozon.configured === true;
   const openAiConfigReady = configStatus?.openai.configured === true;
@@ -363,6 +388,10 @@ function App() {
   const canGeneratePosterBackground = canUseOzonReadTools && openAiConfigReady && !imageGenerationIssue;
   const localServiceReady = Boolean(health && isConnectedRuntime(runtime));
   const openClawBridgeReady = localServiceReady && Boolean(manifest?.tools?.length);
+  const relistSelectedCount = relistProducts.filter((product) => relistSelected[product.product_id]).length;
+  const relistAdoptCount = relistResults
+    ? relistResults.filter((item) => item.new_url && !item.error && relistAdopt[item.product_id]).length
+    : 0;
   const setupSteps = [
     {
       number: "1",
@@ -659,6 +688,107 @@ function App() {
     } catch {
       setProductDetail(null);
       setMessage(c.messages.productDetailFailed(c.messages.localServiceUnreachable));
+    }
+  }
+
+  async function loadRelistProducts() {
+    if (!ensureOzonReadAccess(c.relist.loadProducts)) return;
+    try {
+      const response = await api("/tools/ozon.products.list", {
+        method: "POST",
+        body: JSON.stringify({ limit: 50, visibility: "VISIBLE" })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage(c.relist.msgLoadFailed(userFacingError(data.error)));
+        return;
+      }
+      const list = data as ProductListResult;
+      setRelistProducts(list.products);
+      setRelistSelected({});
+      setRelistResults(null);
+      setRelistPushResults(null);
+      setMessage(c.relist.msgLoaded(list.products.length));
+    } catch {
+      setMessage(c.relist.msgLoadFailed(c.messages.localServiceUnreachable));
+    }
+  }
+
+  function toggleRelistSelect(productId: string) {
+    setRelistSelected((prev) => ({ ...prev, [productId]: !prev[productId] }));
+  }
+
+  function toggleRelistAdopt(productId: string) {
+    setRelistAdopt((prev) => ({ ...prev, [productId]: !prev[productId] }));
+  }
+
+  async function generateRelist() {
+    const targets = relistProducts
+      .filter((product) => relistSelected[product.product_id])
+      .map((product) => ({ product_id: product.product_id, offer_id: product.offer_id }));
+    if (targets.length === 0) {
+      setMessage(c.relist.msgSelectFirst);
+      return;
+    }
+    setRelistBusy(true);
+    setRelistResults(null);
+    setRelistPushResults(null);
+    setMessage(c.relist.msgGenerating(targets.length));
+    try {
+      const response = await api("/tools/ozon.relist.generate", {
+        method: "POST",
+        body: JSON.stringify({ targets })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage(c.relist.msgGenFailed(userFacingError(data.error)));
+        return;
+      }
+      const items = (data.items ?? []) as RelistItem[];
+      setRelistResults(items);
+      const adopt: Record<string, boolean> = {};
+      items.forEach((item) => {
+        if (item.new_url && !item.error) adopt[item.product_id] = true;
+      });
+      setRelistAdopt(adopt);
+      const ok = items.filter((item) => item.new_url && !item.error).length;
+      setMessage(c.relist.msgGenerated(ok, items.length));
+    } catch {
+      setMessage(c.relist.msgGenFailed(c.messages.localServiceUnreachable));
+    } finally {
+      setRelistBusy(false);
+    }
+  }
+
+  async function pushRelist() {
+    if (!relistResults) return;
+    const items = relistResults
+      .filter((item) => item.new_url && !item.error && relistAdopt[item.product_id])
+      .map((item) => ({ product_id: item.product_id, new_primary_url: item.new_url as string }));
+    if (items.length === 0) {
+      setMessage(c.relist.msgAdoptFirst);
+      return;
+    }
+    setRelistPushing(true);
+    setMessage(c.relist.msgPushing(items.length));
+    try {
+      const response = await api("/tools/ozon.relist.push", {
+        method: "POST",
+        body: JSON.stringify({ items })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage(c.relist.msgPushFailed(userFacingError(data.error)));
+        return;
+      }
+      const results = (data.items ?? []) as RelistPushResult[];
+      setRelistPushResults(results);
+      const ok = results.filter((result) => result.ok).length;
+      setMessage(c.relist.msgPushed(ok, results.length));
+    } catch {
+      setMessage(c.relist.msgPushFailed(c.messages.localServiceUnreachable));
+    } finally {
+      setRelistPushing(false);
     }
   }
 
@@ -1155,6 +1285,15 @@ function App() {
         <span className={health ? "ok" : "warn"}>{health ? c.app.ready : c.app.offline}</span>
       </nav>
 
+      <div className="view-tabs">
+        <button className={view === "workbench" ? "active" : ""} onClick={() => setView("workbench")}>
+          <Sparkles size={16} /> {c.relist.tab}
+        </button>
+        <button className={view === "console" ? "active" : ""} onClick={() => setView("console")}>
+          <SlidersHorizontal size={16} /> {c.relist.tabConsole}
+        </button>
+      </div>
+
       <section className="overview">
         <div>
           <Activity />
@@ -1207,6 +1346,126 @@ function App() {
         </button>
       </section>
 
+      {view === "workbench" && (
+        <section className="workspace-grid relist-grid" id="relist-workbench">
+          <div className="panel relist-pick">
+            <div className="section-title">
+              <Sparkles />
+              <div>
+                <h2>{c.relist.title}</h2>
+                <p>{c.relist.description}</p>
+              </div>
+            </div>
+            {!canUseOzonReadTools && <p className="notice">{ozonReadGateMessage || c.gates.connectLocalFirst}</p>}
+            {canUseOzonReadTools && !openAiConfigReady && (
+              <p className="notice">{c.gates.useOpenClawWithoutImageApi}</p>
+            )}
+            <div className="relist-toolbar">
+              <button onClick={loadRelistProducts} disabled={!canUseOzonReadTools}>
+                <DatabaseZap size={16} /> {c.relist.loadProducts}
+              </button>
+              <button
+                className="secondary-button"
+                onClick={generateRelist}
+                disabled={relistBusy || !canGeneratePosterBackground || relistSelectedCount === 0}
+              >
+                <Sparkles size={16} /> {relistBusy ? c.relist.generating : c.relist.generate(relistSelectedCount)}
+              </button>
+            </div>
+            <div className="product-list relist-list">
+              {relistProducts.length === 0 && <p className="empty">{c.relist.emptyProducts}</p>}
+              {relistProducts.map((product) => (
+                <label
+                  key={product.product_id}
+                  className={`relist-row ${relistSelected[product.product_id] ? "picked" : ""}`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={Boolean(relistSelected[product.product_id])}
+                    onChange={() => toggleRelistSelect(product.product_id)}
+                  />
+                  <div>
+                    <strong>{product.offer_id}</strong>
+                    <span>{product.name ?? c.read.productFallback(product.product_id)}</span>
+                  </div>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <div className="panel relist-output">
+            <div className="section-title compact-title">
+              <ImageIcon />
+              <div>
+                <h2>{c.relist.previewTitle}</h2>
+                <p>{c.relist.previewDescription}</p>
+              </div>
+            </div>
+            {!relistResults && <p className="empty">{c.relist.previewEmpty}</p>}
+            {relistResults && (
+              <>
+                <div className="relist-results">
+                  {relistResults.map((item) => (
+                    <div
+                      className={`relist-card ${item.error ? "failed" : ""}`}
+                      key={`${item.product_id}-${item.offer_id}`}
+                    >
+                      <div className="relist-card-head">
+                        <strong>{item.offer_id || item.product_id}</strong>
+                        {item.name && <span>{item.name}</span>}
+                      </div>
+                      {item.error ? (
+                        <p className="notice error">{userFacingError(item.error)}</p>
+                      ) : (
+                        <>
+                          <div className="relist-ba">
+                            <figure>
+                              {item.original_url && <img src={item.original_url} alt="before" />}
+                              <figcaption>{c.relist.before}</figcaption>
+                            </figure>
+                            <figure>
+                              {item.new_url && <img src={item.new_url} alt="after" />}
+                              <figcaption>{c.relist.after}</figcaption>
+                            </figure>
+                          </div>
+                          <label className="relist-adopt">
+                            <input
+                              type="checkbox"
+                              checked={Boolean(relistAdopt[item.product_id])}
+                              onChange={() => toggleRelistAdopt(item.product_id)}
+                            />
+                            {c.relist.adopt}
+                          </label>
+                        </>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                <div className="relist-push-row">
+                  <p className="relist-warn">{c.relist.pushWarning}</p>
+                  <button onClick={pushRelist} disabled={relistPushing || relistAdoptCount === 0}>
+                    <Play size={16} /> {relistPushing ? c.relist.pushing : c.relist.push(relistAdoptCount)}
+                  </button>
+                </div>
+                {relistPushResults && (
+                  <div className="relist-push-results">
+                    {relistPushResults.map((result) => (
+                      <div className={`badge ${result.ok ? "ok" : "error"}`} key={result.product_id}>
+                        {result.ok
+                          ? c.relist.pushedOne(result.product_id, result.image_count)
+                          : c.relist.pushFailedOne(result.product_id, userFacingError(result.error ?? ""))}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </section>
+      )}
+
+      {view === "console" && (
+        <>
       <section className="runtime-strip runtime-ok">
         <div>
           <strong>{c.protocol.title(health?.protocol_version ?? c.protocol.waiting)}</strong>
@@ -1814,6 +2073,9 @@ function App() {
           </div>
         </div>
       </section>
+
+        </>
+      )}
 
       <footer>
         <TerminalSquare size={18} />
