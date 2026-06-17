@@ -424,7 +424,7 @@ def test_ozon_client_push_methods_post_correct_bodies():
                                              "state": "imported", "is_primary": True}]}}
         if path == "/v4/product/info/attributes":
             return {"result": {"items": [{"offer_id": "X", "category_id": 1}]}}
-        if path == "/v1/product/import":
+        if path == "/v3/product/import":
             return {"result": {"task_id": 7}}
         if path == "/v1/product/import/info":
             return {"result": {"status": "imported"}}
@@ -446,7 +446,7 @@ def test_ozon_client_push_methods_post_correct_bodies():
     assert attrs["offer_id"] == "X"
 
     tid = client.product_import([{"offer_id": "X"}])
-    assert tid == 7 and posted[-1][0] == "/v1/product/import"
+    assert tid == 7 and posted[-1][0] == "/v3/product/import"
 
     info = client.product_import_info(7)
     assert info["status"] == "imported"

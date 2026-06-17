@@ -311,13 +311,13 @@ def plan_product(client, row, resolved, *, keep_existing, push_title):
     return plan
 
 
-def apply_product(client, plan, *, poll):
+def apply_product(client, plan, *, poll, no_images=False):
     """Execute the writes described by a plan. Returns a result dict."""
     res = {"offer_id": plan["offer_id"], "product_id": plan["product_id"]}
     pid = plan["product_id"]
 
-    # 1. images
-    if plan["images_to_set"]:
+    # 1. images (skipped entirely with --no-images, e.g. for a title-only push)
+    if plan["images_to_set"] and not no_images:
         result = client.pictures_import(pid, plan["images_to_set"])
         pics = result.get("pictures") or []
         res["pictures"] = [
@@ -407,6 +407,7 @@ def run_push(
     limit,
     keep_existing,
     push_title,
+    no_images=False,
     poll=1,
     out=print,
 ):
@@ -424,9 +425,11 @@ def run_push(
     out("=== push-ozon ===")
     out(f"mode: {mode}   products: {len(touched)} (limit={limit})   "
         f"keep_existing={keep_existing}   push_title={push_title}")
+    if no_images:
+        out("note: --no-images set; image columns will NOT be pushed (title-only).")
     if push_title:
         out("WARNING: --push-title re-submits the whole product via "
-            "/v1/product/import (changing only the name). Other attributes are "
+            "/v3/product/import (changing only the name). Other attributes are "
             "preserved as fetched; products with thin attribute data are skipped.")
     out("")
 
@@ -446,7 +449,7 @@ def run_push(
         for plan in plans:
             if not plan["resolved"]:
                 continue
-            result = apply_product(client, plan, poll=poll)
+            result = apply_product(client, plan, poll=poll, no_images=no_images)
             results.append(result)
             print_result(result, out=out)
         out("")
@@ -495,6 +498,8 @@ def build_arg_parser():
                     help="append the product's current images AFTER the new ones")
     ap.add_argument("--push-title", action="store_true",
                     help="ALSO push the title (re-submits the product; off by default)")
+    ap.add_argument("--no-images", action="store_true",
+                    help="do NOT push images (e.g. title-only with --push-title)")
     grp = ap.add_mutually_exclusive_group()
     grp.add_argument("--dry-run", dest="apply", action="store_false", default=False,
                      help="(default) print the plan, make NO API writes")
@@ -536,6 +541,7 @@ def main(argv=None) -> int:
         limit=args.limit,
         keep_existing=args.keep_existing,
         push_title=args.push_title,
+        no_images=args.no_images,
         poll=args.poll,
     )
     return 0

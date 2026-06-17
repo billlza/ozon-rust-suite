@@ -162,7 +162,7 @@ class OzonClient:
 
     def product_import(self, items: list) -> Optional[int]:
         """Queue a product create/update. Returns the task_id (or None)."""
-        payload = self._post("/v1/product/import", {"items": list(items)})
+        payload = self._post("/v3/product/import", {"items": list(items)})
         result = payload.get("result")
         if isinstance(result, dict):
             return result.get("task_id")
