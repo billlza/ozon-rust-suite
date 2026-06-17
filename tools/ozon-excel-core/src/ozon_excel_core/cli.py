@@ -59,6 +59,21 @@ def main(argv=None) -> int:
                            help="write a representative Ozon-style .xlsx")
     p_gen.add_argument("--out", dest="out_path", required=True)
 
+    p_push = sub.add_parser(
+        "push-ozon", parents=[common],
+        help="push a relisted .xlsx back to Ozon (images, optional title)")
+    p_push.add_argument("--in", dest="in_path", required=True)
+    p_push.add_argument("--config", required=True)
+    p_push.add_argument("--sheet", default=None)
+    p_push.add_argument("--offer-col", dest="offer_col", default=None)
+    p_push.add_argument("--keep-existing", dest="keep_existing", action="store_true")
+    p_push.add_argument("--push-title", dest="push_title", action="store_true")
+    push_grp = p_push.add_mutually_exclusive_group()
+    push_grp.add_argument("--dry-run", dest="apply", action="store_false", default=False)
+    push_grp.add_argument("--apply", dest="apply", action="store_true")
+    p_push.add_argument("--limit", type=int, default=1)
+    p_push.add_argument("--poll", type=int, default=1)
+
     args = parser.parse_args(argv)
 
     try:
@@ -68,6 +83,8 @@ def main(argv=None) -> int:
             return _cmd_verify(args)
         if args.command == "gen-sample":
             return _cmd_gen_sample(args)
+        if args.command == "push-ozon":
+            return _cmd_push_ozon(args)
     except (ConfigError, MappingError, TransformError) as exc:
         print(f"ERROR (config/mapping): {exc}", file=sys.stderr)
         return 2
@@ -144,6 +161,35 @@ def _cmd_gen_sample(args) -> int:
     if not args.quiet:
         print(f"wrote sample workbook: {_abs(args.out_path)}")
     return 0
+
+
+def _load_push_module():
+    """Load scripts/push_ozon.py (it lives outside the package, alongside the
+    other scripts) so the `push-ozon` subcommand shares its logic."""
+    import importlib.util
+
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    path = os.path.join(here, "scripts", "push_ozon.py")
+    spec = importlib.util.spec_from_file_location("push_ozon", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _cmd_push_ozon(args) -> int:
+    push = _load_push_module()
+    argv = ["--in", args.in_path, "--config", args.config, "--limit", str(args.limit),
+            "--poll", str(args.poll)]
+    if args.sheet:
+        argv += ["--sheet", args.sheet]
+    if args.offer_col:
+        argv += ["--offer-col", args.offer_col]
+    if args.keep_existing:
+        argv.append("--keep-existing")
+    if args.push_title:
+        argv.append("--push-title")
+    argv.append("--apply" if args.apply else "--dry-run")
+    return push.main(argv)
 
 
 if __name__ == "__main__":

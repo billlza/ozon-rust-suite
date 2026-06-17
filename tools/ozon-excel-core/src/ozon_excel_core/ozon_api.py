@@ -6,9 +6,16 @@ core never imports this; the demo wires it explicitly and tests substitute fake
 data so nothing here is exercised offline.
 
 Verified endpoints (base https://api-seller.ozon.ru):
-  POST /v3/product/list           -> items[].product_id / offer_id
-  POST /v3/product/info/list      -> items[] with name, primary_image, images[]
+  POST /v3/product/list             -> items[].product_id / offer_id
+  POST /v3/product/info/list        -> items[] with id, offer_id, name, images[],
+                                       primary_image (queryable by product_id OR offer_id)
   POST /v1/product/info/description -> description text
+  POST /v1/product/pictures/import  -> set/append a product's image list (images[0]
+                                       becomes the primary)
+  POST /v4/product/info/attributes  -> a product's full attributes (needed to safely
+                                       re-submit a name change)
+  POST /v1/product/import           -> queue a product create/update -> task_id
+  POST /v1/product/import/info      -> poll an import task's status
 Headers on every call: Client-Id, Api-Key, Content-Type: application/json.
 """
 
@@ -97,11 +104,75 @@ class OzonClient:
         """Return info items (name, primary_image, images[]) for the given ids."""
         ids = [int(p) for p in product_ids]
         payload = self._post("/v3/product/info/list", {"product_id": ids})
+        return self._info_items(payload)
+
+    def product_info_by_offer(self, offer_ids: list) -> list:
+        """Return info items (id, offer_id, name, primary_image, images[]) for the
+        given offer_ids, batched in one /v3/product/info/list call."""
+        offers = [str(o) for o in offer_ids]
+        payload = self._post("/v3/product/info/list", {"offer_id": offers})
+        return self._info_items(payload)
+
+    @staticmethod
+    def _info_items(payload: dict) -> list:
         result = payload.get("result")
         if isinstance(result, dict):
             return result.get("items") or []
         # Some API variants return items at the top level.
         return payload.get("items") or []
+
+    # ------------------------------------------------------------------ #
+    # Write side (push) — used by scripts/push_ozon.py under --apply only.
+    # ------------------------------------------------------------------ #
+    def pictures_import(
+        self,
+        product_id: int,
+        images: list,
+        *,
+        color_image: str = "",
+        images360: Optional[list] = None,
+    ) -> dict:
+        """Set a product's image list. ``images[0]`` becomes the primary image.
+
+        Returns ``result`` -> {"pictures": [{"url", "state", "is_primary"}, ...]}.
+        """
+        body = {
+            "product_id": int(product_id),
+            "images": [str(u) for u in images],
+            "color_image": color_image,
+            "images360": list(images360) if images360 else [],
+        }
+        payload = self._post("/v1/product/pictures/import", body)
+        result = payload.get("result")
+        return result if isinstance(result, dict) else payload
+
+    def product_attributes(self, product_id: int, *, visibility: str = "ALL") -> dict:
+        """Return the full attributes record for one product, or {} if absent."""
+        body = {
+            "filter": {"product_id": [int(product_id)], "visibility": visibility},
+            "limit": 1,
+        }
+        payload = self._post("/v4/product/info/attributes", body)
+        result = payload.get("result")
+        items = result if isinstance(result, list) else payload.get("result", {})
+        if isinstance(items, dict):
+            items = items.get("items") or []
+        items = items or payload.get("items") or []
+        return items[0] if items else {}
+
+    def product_import(self, items: list) -> Optional[int]:
+        """Queue a product create/update. Returns the task_id (or None)."""
+        payload = self._post("/v1/product/import", {"items": list(items)})
+        result = payload.get("result")
+        if isinstance(result, dict):
+            return result.get("task_id")
+        return payload.get("task_id")
+
+    def product_import_info(self, task_id) -> dict:
+        """Poll the status of a /v1/product/import task."""
+        payload = self._post("/v1/product/import/info", {"task_id": task_id})
+        result = payload.get("result")
+        return result if isinstance(result, dict) else payload
 
     def product_description(
         self,
