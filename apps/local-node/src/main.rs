@@ -60,11 +60,15 @@ const DEFAULT_OPENCLAW_BIND_URL: &str = "http://127.0.0.1:18789/openclaw/import"
 const OPENCLAW_PAIRING_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_OPENAI_IMAGE_MODEL: &str = "gpt-image-1";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
-// Re-listing workbench: hero white-studio restyle prompt + temp public host.
-// The prompt extracts ONE clean primary product on seamless white (proven on a
-// real Ozon shop); the host gives Ozon a public URL it fetches and re-hosts.
-const RELIST_HERO_PROMPT: &str = "Create a clean professional e-commerce MAIN listing image. Show ONLY a single primary product: pick the one most prominent item from this image and present just that one, centered and filling most of the frame. Remove any duplicate items, colour variants, extra angles, thumbnails or collage panels, and remove all overlay text, badges, logos, watermarks and borders. Pure seamless white studio background, soft even lighting, subtle floor reflection, sharp focus, square 1:1. Keep the chosen product's exact shape, colours, materials and any text printed on the product itself.";
-const RELIST_IMAGE_SIZE: &str = "1024x1024";
+// Re-listing workbench: Russian-market Ozon promo restyle + temp public host.
+// The product name (+ a few attributes) is injected per-product so the model
+// writes correct, relevant Russian copy. Rules: keep the product & its layout
+// untouched, restyle ONLY the background to fit the product, add a Russian
+// headline + selling-point badges (may overlap the product), and never draw an
+// Ozon logo or a QR code. Validated on real test-shop products 2026-06.
+const RELIST_OZON_RULES: &str = "\nRULE 1 - Keep the product unchanged: reproduce the product from the source photo EXACTLY, like a fixed cut-out pasted onto a new background - identical shape, colours, materials, proportions, fine details and markings, and the SAME camera angle, pose, size and position. Do NOT re-pose, re-angle, rotate, shift, rescale, redraw or restyle the product, and do NOT crop or hide its main body. Keep the ENTIRE product visible; build everything else around it.\nRULE 2 - New background + Russian sales copy: replace ONLY the background with an attractive, modern, themed promotional background whose colours and mood fit this specific product. Lay it out cleanly: keep the product fully visible (usually lower-centre), put ONE large bold Russian HEADLINE in the empty background space ABOVE the product, and 2-3 short Russian selling-point captions in rounded pill badges down one side; badges may overlap only the product's outer edges, never crop its centre. Use clean modern e-commerce typography and write correct, natural, persuasive Russian that matches the product named above.\nRULE 3 - Strictly forbidden: no Ozon logo, no \"Ozon\" text, no marketplace logos or branding, no QR codes, no barcodes, no watermarks.\nOutput one clean, high-contrast, ready-to-publish vertical Russian listing image.";
+// Portrait 2:3 — room for the headline + badges above/over the product.
+const RELIST_IMAGE_SIZE: &str = "1024x1536";
 const LITTERBOX_ENDPOINT: &str = "https://litterbox.catbox.moe/resources/internals/api.php";
 const RELIST_MAX_BATCH: usize = 12;
 const SECRET_OZON_CONFIG: &str = "ozon_config";
@@ -2757,16 +2761,24 @@ async fn relist_generate(
         )));
     }
     let credentials = load_ozon_credentials(&state).await?;
-    let prompt = input
+    // No override -> compose a per-product Russian-Ozon prompt (injects the
+    // product name so the headline/selling points are accurate).
+    let prompt_override = input
         .prompt
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| RELIST_HERO_PROMPT.to_string());
+        .filter(|value| !value.is_empty());
 
     let mut items = Vec::with_capacity(input.targets.len());
     for target in input.targets {
         let label = target.label();
-        match relist_generate_one(&state, &credentials, target.into_lookup(), &prompt).await {
+        match relist_generate_one(
+            &state,
+            &credentials,
+            target.into_lookup(),
+            prompt_override.as_deref(),
+        )
+        .await
+        {
             Ok(item) => items.push(item),
             Err(error) => items.push(RelistItem {
                 product_id: String::new(),
@@ -2781,16 +2793,50 @@ async fn relist_generate(
 
     Ok(Json(RelistGenerateResponse {
         connector_mode: connector_mode(&state),
-        prompt,
+        prompt: prompt_override
+            .unwrap_or_else(|| "auto (per-product Russian Ozon template)".to_string()),
         items,
     }))
+}
+
+/// Build the per-product Russian-Ozon prompt: the product name (+ a few real
+/// attributes) up front so the model's headline & selling points are accurate,
+/// followed by the fixed rules.
+fn compose_relist_prompt(product: &ozon_connector::OzonProductDetail) -> String {
+    let name = product
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("the product shown in the photo");
+    let mut attrs: Vec<String> = Vec::new();
+    for attr in &product.attributes {
+        if attrs.len() >= 6 {
+            break;
+        }
+        if let (Some(attr_name), Some(value)) = (attr.name.as_deref(), attr.values.first()) {
+            let attr_name = attr_name.trim();
+            let value = value.trim();
+            if !attr_name.is_empty() && !value.is_empty() {
+                attrs.push(format!("{attr_name}: {value}"));
+            }
+        }
+    }
+    let facts = if attrs.is_empty() {
+        String::new()
+    } else {
+        format!(" Key facts: {}.", attrs.join("; "))
+    };
+    format!(
+        "You are creating a professional Russian-language e-commerce product image for the Ozon marketplace.\nSOURCE PRODUCT (this is what the photo shows, keep it exactly): \"{name}\".{facts}{RELIST_OZON_RULES}"
+    )
 }
 
 async fn relist_generate_one(
     state: &LocalState,
     credentials: &OzonCredentials,
     lookup: OzonProductLookup,
-    prompt: &str,
+    prompt_override: Option<&str>,
 ) -> Result<RelistItem, String> {
     let product = state
         .ozon_connector
@@ -2803,10 +2849,14 @@ async fn relist_generate_one(
         .or_else(|| product.images.first().map(|image| image.url.clone()))
         .ok_or_else(|| "product has no image to restyle".to_string())?;
 
+    let prompt = match prompt_override {
+        Some(value) => value.to_string(),
+        None => compose_relist_prompt(&product),
+    };
     let source = relist_download(state, &original)
         .await
         .map_err(|error| error.message)?;
-    let edited = relist_edit_image(state, source, prompt)
+    let edited = relist_edit_image(state, source, &prompt)
         .await
         .map_err(|error| error.message)?;
     let filename = format!("relist-{}-{}.png", product.product_id, Uuid::new_v4().simple());
