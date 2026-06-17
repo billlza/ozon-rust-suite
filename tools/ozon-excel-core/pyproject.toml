@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ozon-excel-core"
+version = "0.1.0"
+description = "Pure-core Python CLI for the Ozon re-listing pipeline: surgical xlsx content rewrite + verifier."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "ozon-rust-suite" }]
+dependencies = [
+    "openpyxl==3.1.5",
+    "PyYAML==6.0.2",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+# Permanent image host on Cloudflare R2 (S3-compatible). Optional: the relist
+# pipeline defaults to litterbox and only needs boto3 when OZON_RELIST_HOST=r2.
+r2 = ["boto3>=1.34"]
+
+[project.scripts]
+ozon-excel-core = "ozon_excel_core.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ozon_excel_core = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
