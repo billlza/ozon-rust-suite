@@ -69,7 +69,6 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
 const RELIST_OZON_RULES: &str = "\nRULE 1 - Keep the product unchanged: reproduce the product from the source photo EXACTLY, like a fixed cut-out pasted onto a new background - identical shape, colours, materials, proportions, fine details and markings, and the SAME camera angle, pose, size and position. Do NOT re-pose, re-angle, rotate, shift, rescale, redraw or restyle the product, and do NOT crop or hide its main body. Keep the ENTIRE product visible; build everything else around it.\nRULE 2 - New background + Russian sales copy: replace ONLY the background with an attractive, modern, themed promotional background whose colours and mood fit this specific product. Lay it out cleanly: keep the product fully visible (usually lower-centre), put ONE large bold Russian HEADLINE in the empty background space ABOVE the product, and 2-3 short Russian selling-point captions in rounded pill badges down one side; badges may overlap only the product's outer edges, never crop its centre. Use clean modern e-commerce typography and write correct, natural, persuasive Russian that matches the product named above.\nRULE 3 - Strictly forbidden: no Ozon logo, no \"Ozon\" text, no marketplace logos or branding, no QR codes, no barcodes, no watermarks.\nOutput one clean, high-contrast, ready-to-publish vertical Russian listing image.";
 // Portrait 2:3 — room for the headline + badges above/over the product.
 const RELIST_IMAGE_SIZE: &str = "1024x1536";
-const LITTERBOX_ENDPOINT: &str = "https://litterbox.catbox.moe/resources/internals/api.php";
 const RELIST_MAX_BATCH: usize = 12;
 const SECRET_OZON_CONFIG: &str = "ozon_config";
 const SECRET_OPENAI_CONFIG: &str = "openai_config";
@@ -2860,7 +2859,7 @@ async fn relist_generate_one(
         .await
         .map_err(|error| error.message)?;
     let filename = format!("relist-{}-{}.png", product.product_id, Uuid::new_v4().simple());
-    let new_url = relist_host_litterbox(state, &filename, edited)
+    let new_url = relist_host_image(state, &filename, edited)
         .await
         .map_err(|error| error.message)?;
 
@@ -3038,46 +3037,113 @@ async fn relist_edit_image(
     ))
 }
 
-/// Upload PNG bytes to litterbox (temporary public host) and return the URL.
-/// Ozon fetches this URL on pictures/import and re-hosts the image on its CDN,
-/// so a 72h temporary host is enough to complete a push.
-async fn relist_host_litterbox(
+/// Public image hosts, tried in order. Ozon fetches the URL on pictures/import
+/// and re-hosts the image on its own CDN, so a temporary host is enough. We try
+/// several because any single one can be down or blocked by a local proxy
+/// (observed: litterbox/catbox time out behind some proxies, uguu works).
+struct ImageHost {
+    name: &'static str,
+    url: &'static str,
+    fields: &'static [(&'static str, &'static str)],
+    file_field: &'static str,
+    json_url: bool,
+}
+
+const IMAGE_HOSTS: &[ImageHost] = &[
+    ImageHost {
+        name: "litterbox",
+        url: "https://litterbox.catbox.moe/resources/internals/api.php",
+        fields: &[("reqtype", "fileupload"), ("time", "72h")],
+        file_field: "fileToUpload",
+        json_url: false,
+    },
+    ImageHost {
+        name: "catbox",
+        url: "https://catbox.moe/user/api.php",
+        fields: &[("reqtype", "fileupload")],
+        file_field: "fileToUpload",
+        json_url: false,
+    },
+    ImageHost {
+        name: "uguu",
+        url: "https://uguu.se/upload.php",
+        fields: &[],
+        file_field: "files[]",
+        json_url: true,
+    },
+];
+
+/// Upload PNG bytes to the first reachable public host and return its URL.
+async fn relist_host_image(
     state: &LocalState,
     filename: &str,
     bytes: Vec<u8>,
 ) -> Result<String, ApiError> {
-    let part = reqwest::multipart::Part::bytes(bytes)
+    let mut last_error = "no image host was reachable".to_string();
+    for host in IMAGE_HOSTS {
+        match relist_upload_to_host(state, host, filename, &bytes).await {
+            Ok(url) => return Ok(url),
+            Err(error) => last_error = format!("{}: {}", host.name, error.message),
+        }
+    }
+    Err(ApiError::bad_gateway(format!(
+        "all image hosts failed (last {last_error})"
+    )))
+}
+
+async fn relist_upload_to_host(
+    state: &LocalState,
+    host: &ImageHost,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<String, ApiError> {
+    let part = reqwest::multipart::Part::bytes(bytes.to_vec())
         .file_name(filename.to_string())
         .mime_str("image/png")
         .map_err(|error| ApiError::internal(format!("failed to build upload part: {error}")))?;
-    let form = reqwest::multipart::Form::new()
-        .text("reqtype", "fileupload")
-        .text("time", "72h")
-        .part("fileToUpload", part);
+    let mut form = reqwest::multipart::Form::new();
+    for (key, value) in host.fields {
+        form = form.text(*key, *value);
+    }
+    form = form.part(host.file_field, part);
 
     let response = state
         .http_client
-        .post(LITTERBOX_ENDPOINT)
+        .post(host.url)
         .multipart(form)
         .send()
         .await
-        .map_err(|error| ApiError::bad_gateway(format!("image host upload failed: {error}")))?;
+        .map_err(|error| ApiError::bad_gateway(format!("upload failed: {error}")))?;
     if !response.status().is_success() {
         let body = response.text().await.unwrap_or_default();
         return Err(ApiError::bad_gateway(format!(
-            "image host returned HTTP error: {}",
-            truncate_text(body.trim(), 200)
+            "HTTP error: {}",
+            truncate_text(body.trim(), 160)
         )));
     }
-    let url = response
+    let body = response
         .text()
         .await
-        .map_err(|error| ApiError::bad_gateway(format!("image host response unreadable: {error}")))?;
-    let url = url.trim().to_string();
+        .map_err(|error| ApiError::bad_gateway(format!("response unreadable: {error}")))?;
+    let url = if host.json_url {
+        serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("files")
+                    .and_then(|files| files.get(0))
+                    .and_then(|first| first.get("url"))
+                    .and_then(|url| url.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+    } else {
+        body.trim().to_string()
+    };
     if !url.starts_with("http") {
         return Err(ApiError::bad_gateway(format!(
-            "image host did not return a URL: {}",
-            truncate_text(&url, 200)
+            "no URL in response: {}",
+            truncate_text(body.trim(), 160)
         )));
     }
     Ok(url)
