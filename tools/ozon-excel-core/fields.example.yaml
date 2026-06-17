@@ -1,0 +1,74 @@
+version: 1
+
+# Which sheet(s) hold product rows. "*" or omitted = every visible, non-hidden
+# sheet. Sheets named here are processed; all others are fully frozen.
+sheets:
+  - name: "Шаблон для поставщика"
+    aliases: ["Шаблон", "Sheet1", "Template"]
+
+# Multi-row header handling. The mapper scans header.scan_rows from the top,
+# matches column keywords against match_row, and product data begins at
+# data_start.
+header:
+  scan_rows: 3
+  match_row: auto      # "auto" = row with most keyword hits; or an int (1-based)
+  data_start: auto     # "auto" = first data row after header; or an int (1-based)
+
+# Matching is case-insensitive, trimmed, ё-normalized, whitespace-collapsed.
+match:
+  normalize: true
+  case_insensitive: true
+  strip_required_marker: true   # "Артикул*" == "Артикул"
+  mode: contains                # contains | equals | regex
+
+# Target columns. Resolve by keywords OR pin by letter/index.
+# Explicit letter/index wins over keywords. Unmapped => frozen.
+columns:
+  title:
+    keywords:
+      ru: ["Название товара", "Название", "Наименование"]
+      en: ["Title", "Product name", "Name"]
+      zh: ["商品名称", "标题", "名称"]
+    required: true
+
+  listing:
+    keywords:
+      ru: ["Описание", "Аннотация", "Текст описания"]
+      en: ["Description", "Listing", "Annotation"]
+      zh: ["商品描述", "描述", "详情"]
+    required: false
+
+  images_main:
+    keywords:
+      ru: ["Ссылка на главное фото", "Главное фото"]
+      en: ["Main photo", "Main image link", "Primary image"]
+      zh: ["主图", "主图片链接"]
+    form: auto       # auto | plain_url | hyperlink_formula | real_hyperlink | multi_url
+    required: false
+
+  images_additional:
+    - keywords:
+        ru: ["Ссылки на дополнительные фото", "Дополнительные фото", "Ссылки на фото"]
+        en: ["Additional photos", "Extra images", "Gallery"]
+        zh: ["附加图片", "更多图片", "图片链接"]
+      form: multi_url
+      multi:
+        read_delimiters: ["\n", ",", " "]
+        write_delimiter: "\n"
+    - keywords:
+        ru: ["Ссылка на фото 2"]
+        en: ["Photo 2", "Image 2"]
+        zh: ["图片2"]
+      form: plain_url
+
+# Column used only as a row key/label in logs. Never written (frozen).
+key_column:
+  keywords:
+    ru: ["Артикул"]
+    en: ["SKU", "Article", "Offer ID"]
+    zh: ["货号", "商品编号"]
+
+policy:
+  on_missing_required: error    # error | warn
+  on_preflight_risk: error      # error | warn
+  freeze_unmapped: true         # MUST stay true; documents the contract

@@ -1,0 +1,16 @@
+# local scratch artifacts
+# relist pipeline secrets + scratch
+*.egg-info/
+*.out.xlsx
+*.pyc
+.env
+.pytest_cache/
+.venv/
+__pycache__/
+out.xlsx
+real_input.xlsx
+real_output.xlsx
+relist_cache/
+relist_demo/
+relist_local/
+sample.xlsx

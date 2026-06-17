@@ -1,0 +1,7 @@
+openpyxl==3.1.5          # surgical xlsx edit; the whole preservation contract is built on it
+PyYAML==6.0.2            # config parsing
+requests>=2.31           # relist pipeline: image-edit, hosting, Ozon Seller API (network only)
+
+# Optional extra (NOT a hard dep). Only needed for the permanent R2 image host
+# (OZON_RELIST_HOST=r2). Enable with:  .venv/bin/pip install boto3
+# boto3>=1.34
