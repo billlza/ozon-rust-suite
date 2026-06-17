@@ -2689,12 +2689,25 @@ impl RelistTarget {
     }
 
     fn into_lookup(self) -> OzonProductLookup {
-        OzonProductLookup {
+        let normalized = OzonProductLookup {
             product_id: self.product_id,
             offer_id: self.offer_id,
             sku: None,
         }
-        .normalized()
+        .normalized();
+        // The connector requires EXACTLY one identifier, but the workbench sends
+        // both product_id + offer_id for every selected row (the product list
+        // carries both). Prefer the canonical numeric product_id; fall back to
+        // offer_id only when product_id is absent.
+        if normalized.product_id.is_some() {
+            OzonProductLookup {
+                product_id: normalized.product_id,
+                offer_id: None,
+                sku: None,
+            }
+        } else {
+            normalized
+        }
     }
 }
 
