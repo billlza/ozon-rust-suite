@@ -85,7 +85,11 @@ const zhCN = {
     mockModeNotice: "当前是开发演示模式：只适合本机演示，上线必须切到真实读取。",
     clientIdPlaceholder: "从 Ozon Seller 后台复制",
     apiKeyPlaceholder: "保存后只显示指纹",
-    saveAndValidate: "保存并检测店铺"
+    saveAndValidate: "保存并检测店铺",
+    saving: "正在保存并校验店铺…",
+    revealKey: "显示密钥",
+    hideKey: "隐藏密钥",
+    savedFingerprint: (fingerprint: string) => `已保存 · 指纹 ${fingerprint}`
   },
   advanced: {
     summary: "高级设置与诊断",
@@ -456,7 +460,11 @@ const enUS: typeof zhCN = {
     mockModeNotice: "Demo mode: local demos only. Production must use real read mode.",
     clientIdPlaceholder: "Copy from Ozon Seller",
     apiKeyPlaceholder: "Only a fingerprint is shown after saving",
-    saveAndValidate: "Save and test shop"
+    saveAndValidate: "Save and test shop",
+    saving: "Saving and validating shop…",
+    revealKey: "Show key",
+    hideKey: "Hide key",
+    savedFingerprint: (fingerprint: string) => `Saved · fingerprint ${fingerprint}`
   },
   advanced: {
     summary: "Advanced settings and diagnostics",

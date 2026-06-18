@@ -5,6 +5,8 @@ import {
   CheckCircle2,
   Clipboard,
   DatabaseZap,
+  Eye,
+  EyeOff,
   Image as ImageIcon,
   KeyRound,
   ListChecks,
@@ -345,6 +347,10 @@ function App() {
   const [configStatus, setConfigStatus] = useState<ConfigStatus | null>(null);
   const [clientId, setClientId] = useState("");
   const [apiKey, setApiKey] = useState("");
+  const [showApiKey, setShowApiKey] = useState(false);
+  // Inline result shown right at the Ozon save form, so feedback is visible
+  // without scrolling to the bottom status bar.
+  const [saveNotice, setSaveNotice] = useState<{ tone: "ok" | "warn" | "info"; text: string } | null>(null);
   const [openAiBaseUrl, setOpenAiBaseUrl] = useState("https://api.openai.com");
   const [openAiImageModel, setOpenAiImageModel] = useState("gpt-image-1");
   const [openAiApiKey, setOpenAiApiKey] = useState("");
@@ -539,8 +545,10 @@ function App() {
   async function saveConfig() {
     if (!clientId.trim() || !apiKey.trim()) {
       setMessage(c.messages.fillOzonCredentials);
+      setSaveNotice({ tone: "warn", text: c.messages.fillOzonCredentials });
       return;
     }
+    setSaveNotice({ tone: "info", text: c.config.saving });
     try {
       const response = await api("/config/ozon", {
         method: "POST",
@@ -549,6 +557,7 @@ function App() {
       const data = await response.json();
       if (!response.ok) {
         setMessage(c.messages.saveFailed(userFacingError(data.error)));
+        setSaveNotice({ tone: "warn", text: c.messages.saveFailed(userFacingError(data.error)) });
         return;
       }
       setApiKey("");
@@ -559,12 +568,19 @@ function App() {
       if (!validationResponse.ok) {
         setValidation(null);
         setMessage(c.messages.ozonSavedValidationFailed(userFacingError(validationData.error)));
+        setSaveNotice({
+          tone: "warn",
+          text: c.messages.ozonSavedValidationFailed(userFacingError(validationData.error))
+        });
         return;
       }
       setValidation(validationData);
-      setMessage(c.messages.ozonSavedValidated(data.client_id, refreshedConfig?.ozon.api_key_fingerprint ?? c.advanced.notSaved));
+      const fingerprint = refreshedConfig?.ozon.api_key_fingerprint ?? c.advanced.notSaved;
+      setMessage(c.messages.ozonSavedValidated(data.client_id, fingerprint));
+      setSaveNotice({ tone: "ok", text: c.messages.ozonSavedValidated(data.client_id, fingerprint) });
     } catch {
       setMessage(c.messages.saveFailed(c.messages.localServiceUnreachable));
+      setSaveNotice({ tone: "warn", text: c.messages.saveFailed(c.messages.localServiceUnreachable) });
     }
   }
 
@@ -1569,18 +1585,35 @@ function App() {
             </label>
             <label>
               Ozon API Key
-              <input
-                autoComplete="off"
-                placeholder={c.config.apiKeyPlaceholder}
-                value={apiKey}
-                onChange={(event) => setApiKey(event.target.value)}
-                type="password"
-              />
+              <div className="input-with-reveal">
+                <input
+                  autoComplete="off"
+                  placeholder={c.config.apiKeyPlaceholder}
+                  value={apiKey}
+                  onChange={(event) => setApiKey(event.target.value)}
+                  type={showApiKey ? "text" : "password"}
+                />
+                <button
+                  type="button"
+                  className="reveal-toggle"
+                  onClick={() => setShowApiKey((value) => !value)}
+                  title={showApiKey ? c.config.hideKey : c.config.revealKey}
+                  aria-label={showApiKey ? c.config.hideKey : c.config.revealKey}
+                >
+                  {showApiKey ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
             </label>
           </div>
           <button onClick={saveConfig}>
             <CheckCircle2 size={18} /> {c.config.saveAndValidate}
           </button>
+          {saveNotice && <p className={`notice save-notice ${saveNotice.tone}`}>{saveNotice.text}</p>}
+          {configStatus?.ozon.configured && !saveNotice && (
+            <p className="notice save-notice ok">
+              {c.config.savedFingerprint(configStatus.ozon.api_key_fingerprint ?? c.advanced.notSaved)}
+            </p>
+          )}
         </div>
 
         <details className="advanced-local-settings">

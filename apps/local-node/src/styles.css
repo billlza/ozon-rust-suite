@@ -1443,3 +1443,50 @@ nav > span.warn::before {
   gap: 8px;
   margin-top: 12px;
 }
+
+/* Ozon API Key reveal toggle + inline save feedback (paste-and-save UX fix) */
+.input-with-reveal {
+  align-items: center;
+  display: flex;
+  position: relative;
+}
+.input-with-reveal input {
+  flex: 1;
+  padding-right: 38px;
+  width: 100%;
+}
+.reveal-toggle {
+  align-items: center;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: #6b7770;
+  cursor: pointer;
+  display: inline-flex;
+  height: 30px;
+  justify-content: center;
+  min-height: 0;
+  padding: 0;
+  position: absolute;
+  right: 5px;
+  width: 30px;
+}
+.reveal-toggle:hover {
+  background: rgba(0, 0, 0, 0.06);
+  color: #2f3a34;
+}
+.save-notice {
+  margin-top: 10px;
+}
+.notice.ok {
+  background: #e7f5ec;
+  color: #1f7a44;
+}
+.notice.warn {
+  background: #fbeceb;
+  color: #b23b32;
+}
+.notice.info {
+  background: #eef3fb;
+  color: #2f5fa6;
+}
