@@ -60,12 +60,15 @@ const DEFAULT_OPENCLAW_BIND_URL: &str = "http://127.0.0.1:18789/openclaw/import"
 const OPENCLAW_PAIRING_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_OPENAI_IMAGE_MODEL: &str = "gpt-image-1";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
-// Re-listing workbench: hero white-studio restyle prompt + temp public host.
-// The prompt extracts ONE clean primary product on seamless white (proven on a
-// real Ozon shop); the host gives Ozon a public URL it fetches and re-hosts.
-const RELIST_HERO_PROMPT: &str = "Create a clean professional e-commerce MAIN listing image. Show ONLY a single primary product: pick the one most prominent item from this image and present just that one, centered and filling most of the frame. Remove any duplicate items, colour variants, extra angles, thumbnails or collage panels, and remove all overlay text, badges, logos, watermarks and borders. Pure seamless white studio background, soft even lighting, subtle floor reflection, sharp focus, square 1:1. Keep the chosen product's exact shape, colours, materials and any text printed on the product itself.";
-const RELIST_IMAGE_SIZE: &str = "1024x1024";
-const LITTERBOX_ENDPOINT: &str = "https://litterbox.catbox.moe/resources/internals/api.php";
+// Re-listing workbench: Russian-market Ozon promo restyle + temp public host.
+// The product name (+ a few attributes) is injected per-product so the model
+// writes correct, relevant Russian copy. Rules: keep the product & its layout
+// untouched, restyle ONLY the background to fit the product, add a Russian
+// headline + selling-point badges (may overlap the product), and never draw an
+// Ozon logo or a QR code. Validated on real test-shop products 2026-06.
+const RELIST_OZON_RULES: &str = "\nRULE 1 - Keep the product unchanged: reproduce the product from the source photo EXACTLY, like a fixed cut-out pasted onto a new background - identical shape, colours, materials, proportions, fine details and markings, and the SAME camera angle, pose, size and position. Do NOT re-pose, re-angle, rotate, shift, rescale, redraw or restyle the product, and do NOT crop or hide its main body. Keep the ENTIRE product visible; build everything else around it.\nRULE 2 - New background + Russian sales copy: replace ONLY the background with an attractive, modern, themed promotional background whose colours and mood fit this specific product. Lay it out cleanly: keep the product fully visible (usually lower-centre), put ONE large bold Russian HEADLINE in the empty background space ABOVE the product, and 2-3 short Russian selling-point captions in rounded pill badges down one side; badges may overlap only the product's outer edges, never crop its centre. Use clean modern e-commerce typography and write correct, natural, persuasive Russian that matches the product named above.\nRULE 3 - Strictly forbidden: no Ozon logo, no \"Ozon\" text, no marketplace logos or branding, no QR codes, no barcodes, no watermarks.\nOutput one clean, high-contrast, ready-to-publish vertical Russian listing image.";
+// Portrait 2:3 — room for the headline + badges above/over the product.
+const RELIST_IMAGE_SIZE: &str = "1024x1536";
 const RELIST_MAX_BATCH: usize = 12;
 const SECRET_OZON_CONFIG: &str = "ozon_config";
 const SECRET_OPENAI_CONFIG: &str = "openai_config";
@@ -1898,7 +1901,59 @@ fn load_ozon_env_credentials() -> Result<Option<OzonCredentials>, ApiError> {
     }
 }
 
+/// A STABLE, machine-derived device fingerprint, computed deterministically from
+/// the macOS hardware UUID and cached for the process lifetime. This is immune to
+/// the secret-store/keyring flakiness that previously re-minted a random
+/// fingerprint whenever the keyring was momentarily unavailable at sidecar boot —
+/// which silently broke the lease's device binding (the lease is bound to
+/// `device_id_for(user, fingerprint)`, so a changed fingerprint => "cloud lease is
+/// not bound to this device"). Returns `None` on non-macOS or if the hardware id
+/// cannot be read, in which case the caller falls back to the stored/random value.
+fn stable_machine_fingerprint() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(compute_stable_machine_fingerprint).clone()
+}
+
+fn compute_stable_machine_fingerprint() -> Option<String> {
+    use sha2::Digest;
+    // `ioreg` exposes IOPlatformUUID, a per-machine identifier stable across
+    // reboots and reinstalls. Hash it (with a domain-separating prefix) so the
+    // raw hardware id never leaves the device.
+    let output = std::process::Command::new("/usr/sbin/ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let uuid = text
+        .lines()
+        .find(|line| line.contains("IOPlatformUUID"))
+        .and_then(|line| line.split('"').nth(3))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"ozon-rust-local-device-v1:");
+    hasher.update(uuid.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Some(format!("ors-local-{hex}"))
+}
+
 async fn load_or_create_device_fingerprint(state: &LocalState) -> Result<String, ApiError> {
+    // Prefer the stable machine-derived fingerprint so restarts and keyring
+    // flakiness can never change it. It is deterministic, so no storage is needed.
+    if let Some(stable) = stable_machine_fingerprint() {
+        return Ok(stable);
+    }
+
+    // Fallback (non-macOS / hardware probe failure): the original
+    // stored-or-create-random behavior.
     if let Some(existing) = state
         .secrets
         .get(&SecretName::new(SECRET_DEVICE_FINGERPRINT))
@@ -2686,12 +2741,25 @@ impl RelistTarget {
     }
 
     fn into_lookup(self) -> OzonProductLookup {
-        OzonProductLookup {
+        let normalized = OzonProductLookup {
             product_id: self.product_id,
             offer_id: self.offer_id,
             sku: None,
         }
-        .normalized()
+        .normalized();
+        // The connector requires EXACTLY one identifier, but the workbench sends
+        // both product_id + offer_id for every selected row (the product list
+        // carries both). Prefer the canonical numeric product_id; fall back to
+        // offer_id only when product_id is absent.
+        if normalized.product_id.is_some() {
+            OzonProductLookup {
+                product_id: normalized.product_id,
+                offer_id: None,
+                sku: None,
+            }
+        } else {
+            normalized
+        }
     }
 }
 
@@ -2757,16 +2825,24 @@ async fn relist_generate(
         )));
     }
     let credentials = load_ozon_credentials(&state).await?;
-    let prompt = input
+    // No override -> compose a per-product Russian-Ozon prompt (injects the
+    // product name so the headline/selling points are accurate).
+    let prompt_override = input
         .prompt
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| RELIST_HERO_PROMPT.to_string());
+        .filter(|value| !value.is_empty());
 
     let mut items = Vec::with_capacity(input.targets.len());
     for target in input.targets {
         let label = target.label();
-        match relist_generate_one(&state, &credentials, target.into_lookup(), &prompt).await {
+        match relist_generate_one(
+            &state,
+            &credentials,
+            target.into_lookup(),
+            prompt_override.as_deref(),
+        )
+        .await
+        {
             Ok(item) => items.push(item),
             Err(error) => items.push(RelistItem {
                 product_id: String::new(),
@@ -2781,16 +2857,50 @@ async fn relist_generate(
 
     Ok(Json(RelistGenerateResponse {
         connector_mode: connector_mode(&state),
-        prompt,
+        prompt: prompt_override
+            .unwrap_or_else(|| "auto (per-product Russian Ozon template)".to_string()),
         items,
     }))
+}
+
+/// Build the per-product Russian-Ozon prompt: the product name (+ a few real
+/// attributes) up front so the model's headline & selling points are accurate,
+/// followed by the fixed rules.
+fn compose_relist_prompt(product: &ozon_connector::OzonProductDetail) -> String {
+    let name = product
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("the product shown in the photo");
+    let mut attrs: Vec<String> = Vec::new();
+    for attr in &product.attributes {
+        if attrs.len() >= 6 {
+            break;
+        }
+        if let (Some(attr_name), Some(value)) = (attr.name.as_deref(), attr.values.first()) {
+            let attr_name = attr_name.trim();
+            let value = value.trim();
+            if !attr_name.is_empty() && !value.is_empty() {
+                attrs.push(format!("{attr_name}: {value}"));
+            }
+        }
+    }
+    let facts = if attrs.is_empty() {
+        String::new()
+    } else {
+        format!(" Key facts: {}.", attrs.join("; "))
+    };
+    format!(
+        "You are creating a professional Russian-language e-commerce product image for the Ozon marketplace.\nSOURCE PRODUCT (this is what the photo shows, keep it exactly): \"{name}\".{facts}{RELIST_OZON_RULES}"
+    )
 }
 
 async fn relist_generate_one(
     state: &LocalState,
     credentials: &OzonCredentials,
     lookup: OzonProductLookup,
-    prompt: &str,
+    prompt_override: Option<&str>,
 ) -> Result<RelistItem, String> {
     let product = state
         .ozon_connector
@@ -2803,14 +2913,18 @@ async fn relist_generate_one(
         .or_else(|| product.images.first().map(|image| image.url.clone()))
         .ok_or_else(|| "product has no image to restyle".to_string())?;
 
+    let prompt = match prompt_override {
+        Some(value) => value.to_string(),
+        None => compose_relist_prompt(&product),
+    };
     let source = relist_download(state, &original)
         .await
         .map_err(|error| error.message)?;
-    let edited = relist_edit_image(state, source, prompt)
+    let edited = relist_edit_image(state, source, &prompt)
         .await
         .map_err(|error| error.message)?;
     let filename = format!("relist-{}-{}.png", product.product_id, Uuid::new_v4().simple());
-    let new_url = relist_host_litterbox(state, &filename, edited)
+    let new_url = relist_host_image(state, &filename, edited)
         .await
         .map_err(|error| error.message)?;
 
@@ -2988,46 +3102,113 @@ async fn relist_edit_image(
     ))
 }
 
-/// Upload PNG bytes to litterbox (temporary public host) and return the URL.
-/// Ozon fetches this URL on pictures/import and re-hosts the image on its CDN,
-/// so a 72h temporary host is enough to complete a push.
-async fn relist_host_litterbox(
+/// Public image hosts, tried in order. Ozon fetches the URL on pictures/import
+/// and re-hosts the image on its own CDN, so a temporary host is enough. We try
+/// several because any single one can be down or blocked by a local proxy
+/// (observed: litterbox/catbox time out behind some proxies, uguu works).
+struct ImageHost {
+    name: &'static str,
+    url: &'static str,
+    fields: &'static [(&'static str, &'static str)],
+    file_field: &'static str,
+    json_url: bool,
+}
+
+const IMAGE_HOSTS: &[ImageHost] = &[
+    ImageHost {
+        name: "litterbox",
+        url: "https://litterbox.catbox.moe/resources/internals/api.php",
+        fields: &[("reqtype", "fileupload"), ("time", "72h")],
+        file_field: "fileToUpload",
+        json_url: false,
+    },
+    ImageHost {
+        name: "catbox",
+        url: "https://catbox.moe/user/api.php",
+        fields: &[("reqtype", "fileupload")],
+        file_field: "fileToUpload",
+        json_url: false,
+    },
+    ImageHost {
+        name: "uguu",
+        url: "https://uguu.se/upload.php",
+        fields: &[],
+        file_field: "files[]",
+        json_url: true,
+    },
+];
+
+/// Upload PNG bytes to the first reachable public host and return its URL.
+async fn relist_host_image(
     state: &LocalState,
     filename: &str,
     bytes: Vec<u8>,
 ) -> Result<String, ApiError> {
-    let part = reqwest::multipart::Part::bytes(bytes)
+    let mut last_error = "no image host was reachable".to_string();
+    for host in IMAGE_HOSTS {
+        match relist_upload_to_host(state, host, filename, &bytes).await {
+            Ok(url) => return Ok(url),
+            Err(error) => last_error = format!("{}: {}", host.name, error.message),
+        }
+    }
+    Err(ApiError::bad_gateway(format!(
+        "all image hosts failed (last {last_error})"
+    )))
+}
+
+async fn relist_upload_to_host(
+    state: &LocalState,
+    host: &ImageHost,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<String, ApiError> {
+    let part = reqwest::multipart::Part::bytes(bytes.to_vec())
         .file_name(filename.to_string())
         .mime_str("image/png")
         .map_err(|error| ApiError::internal(format!("failed to build upload part: {error}")))?;
-    let form = reqwest::multipart::Form::new()
-        .text("reqtype", "fileupload")
-        .text("time", "72h")
-        .part("fileToUpload", part);
+    let mut form = reqwest::multipart::Form::new();
+    for (key, value) in host.fields {
+        form = form.text(*key, *value);
+    }
+    form = form.part(host.file_field, part);
 
     let response = state
         .http_client
-        .post(LITTERBOX_ENDPOINT)
+        .post(host.url)
         .multipart(form)
         .send()
         .await
-        .map_err(|error| ApiError::bad_gateway(format!("image host upload failed: {error}")))?;
+        .map_err(|error| ApiError::bad_gateway(format!("upload failed: {error}")))?;
     if !response.status().is_success() {
         let body = response.text().await.unwrap_or_default();
         return Err(ApiError::bad_gateway(format!(
-            "image host returned HTTP error: {}",
-            truncate_text(body.trim(), 200)
+            "HTTP error: {}",
+            truncate_text(body.trim(), 160)
         )));
     }
-    let url = response
+    let body = response
         .text()
         .await
-        .map_err(|error| ApiError::bad_gateway(format!("image host response unreadable: {error}")))?;
-    let url = url.trim().to_string();
+        .map_err(|error| ApiError::bad_gateway(format!("response unreadable: {error}")))?;
+    let url = if host.json_url {
+        serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("files")
+                    .and_then(|files| files.get(0))
+                    .and_then(|first| first.get("url"))
+                    .and_then(|url| url.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+    } else {
+        body.trim().to_string()
+    };
     if !url.starts_with("http") {
         return Err(ApiError::bad_gateway(format!(
-            "image host did not return a URL: {}",
-            truncate_text(&url, 200)
+            "no URL in response: {}",
+            truncate_text(body.trim(), 160)
         )));
     }
     Ok(url)

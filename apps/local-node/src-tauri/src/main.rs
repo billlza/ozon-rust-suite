@@ -55,7 +55,23 @@ struct SidecarSnapshot {
     last_exit: Option<String>,
     last_error: Option<String>,
     desired_running: bool,
+    /// Consecutive *rapid* exits (sidecar died < RAPID_FAILURE_UPTIME_MS after
+    /// start). A clean long-lived run resets this to 0. Used to back off instead
+    /// of hammer-restarting every 2s — the bug that produced "已自恢复 805 次"
+    /// when a second app instance already held 127.0.0.1:8790.
+    #[serde(default)]
+    consecutive_failures: u32,
 }
+
+/// A sidecar that exits sooner than this after starting is treated as a rapid
+/// failure (port already bound, immediate panic) rather than a healthy run.
+const RAPID_FAILURE_UPTIME_MS: u64 = 8_000;
+/// After this many consecutive rapid failures, stop auto-restarting and surface
+/// a "blocked" status so the user sees a real error instead of a silent loop.
+const MAX_RAPID_FAILURES: u32 = 6;
+/// Base restart delay; the effective delay grows 2s → 4s → 8s → … capped at 30s.
+const RESTART_BASE_DELAY_SECS: u64 = 2;
+const RESTART_MAX_DELAY_SECS: u64 = 30;
 
 #[derive(Deserialize)]
 struct HealthProbe {
@@ -88,6 +104,7 @@ impl SidecarState {
                 last_exit: None,
                 last_error: None,
                 desired_running: true,
+                consecutive_failures: 0,
             }),
         }
     }
@@ -392,6 +409,9 @@ fn stop_current_sidecar(state: &SidecarState, reason: &str) {
         snapshot.last_exit = Some(reason.to_string());
         snapshot.last_error = None;
         snapshot.desired_running = true;
+        // A manual restart is an explicit "try again from scratch": clear the
+        // backoff streak so a previously-"blocked" node will attempt to start.
+        snapshot.consecutive_failures = 0;
     }
     if let Some(child) = child {
         let _ = child.kill();
@@ -400,7 +420,7 @@ fn stop_current_sidecar(state: &SidecarState, reason: &str) {
 
 fn handle_sidecar_exit(app: &AppHandle, pid: u32, reason: String) {
     let state = app.state::<SidecarState>();
-    let should_restart = {
+    let decision = {
         let mut snapshot = state
             .snapshot
             .lock()
@@ -409,10 +429,42 @@ fn handle_sidecar_exit(app: &AppHandle, pid: u32, reason: String) {
             return;
         }
         snapshot.pid = None;
-        snapshot.status = "restarting".to_string();
-        snapshot.last_exit = Some(reason);
+
+        // A run that stayed up past the rapid-failure window counts as healthy:
+        // reset the backoff so a later crash restarts promptly. A run that died
+        // immediately (port already bound, panic on boot) increments the streak.
+        let uptime_ms = snapshot
+            .last_started_at_ms
+            .map(|started| now_ms().saturating_sub(started));
+        let rapid = uptime_ms.map(|ms| ms < RAPID_FAILURE_UPTIME_MS).unwrap_or(true);
+        if rapid {
+            snapshot.consecutive_failures = snapshot.consecutive_failures.saturating_add(1);
+        } else {
+            snapshot.consecutive_failures = 0;
+        }
+
+        snapshot.last_exit = Some(reason.clone());
         snapshot.last_error = None;
-        snapshot.desired_running
+
+        if !snapshot.desired_running {
+            snapshot.status = "stopped".to_string();
+            SidecarExit::Stop
+        } else if snapshot.consecutive_failures >= MAX_RAPID_FAILURES {
+            // Give up the tight loop. Almost always: another ozon-local-node (a
+            // second app copy) already owns 127.0.0.1:8790. Surface it instead of
+            // restarting forever.
+            snapshot.status = "blocked".to_string();
+            let blocked = if reason.contains("os error 48") || reason.contains("Address already in use") {
+                "另一个 Ozon 本地节点已占用 127.0.0.1:8790（多半是开了两份 App）。请只保留一份后点重启节点。".to_string()
+            } else {
+                format!("本地节点连续 {} 次快速退出，已停止自动重启。最后退出：{reason}", snapshot.consecutive_failures)
+            };
+            snapshot.last_error = Some(blocked);
+            SidecarExit::GiveUp
+        } else {
+            snapshot.status = "restarting".to_string();
+            SidecarExit::Restart(restart_delay_secs(snapshot.consecutive_failures))
+        }
     };
 
     let _ = state
@@ -421,14 +473,28 @@ fn handle_sidecar_exit(app: &AppHandle, pid: u32, reason: String) {
         .expect("sidecar child lock poisoned")
         .take();
 
-    if should_restart {
-        schedule_sidecar_restart(app.clone());
+    if let SidecarExit::Restart(delay) = decision {
+        schedule_sidecar_restart(app.clone(), delay);
     }
 }
 
-fn schedule_sidecar_restart(app: AppHandle) {
+enum SidecarExit {
+    Restart(u64),
+    GiveUp,
+    Stop,
+}
+
+/// Exponential backoff capped at RESTART_MAX_DELAY_SECS: 2s, 4s, 8s, 16s, 30s, 30s…
+/// `failures` is 1-based (first failure → index 0 → base delay).
+fn restart_delay_secs(failures: u32) -> u64 {
+    let shift = failures.saturating_sub(1).min(8);
+    let delay = RESTART_BASE_DELAY_SECS.saturating_mul(1u64 << shift);
+    delay.min(RESTART_MAX_DELAY_SECS)
+}
+
+fn schedule_sidecar_restart(app: AppHandle, delay_secs: u64) {
     thread::spawn(move || {
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(Duration::from_secs(delay_secs));
         start_managed_sidecar(&app);
     });
 }
