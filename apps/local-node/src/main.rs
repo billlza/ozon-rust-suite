@@ -1901,7 +1901,59 @@ fn load_ozon_env_credentials() -> Result<Option<OzonCredentials>, ApiError> {
     }
 }
 
+/// A STABLE, machine-derived device fingerprint, computed deterministically from
+/// the macOS hardware UUID and cached for the process lifetime. This is immune to
+/// the secret-store/keyring flakiness that previously re-minted a random
+/// fingerprint whenever the keyring was momentarily unavailable at sidecar boot —
+/// which silently broke the lease's device binding (the lease is bound to
+/// `device_id_for(user, fingerprint)`, so a changed fingerprint => "cloud lease is
+/// not bound to this device"). Returns `None` on non-macOS or if the hardware id
+/// cannot be read, in which case the caller falls back to the stored/random value.
+fn stable_machine_fingerprint() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(compute_stable_machine_fingerprint).clone()
+}
+
+fn compute_stable_machine_fingerprint() -> Option<String> {
+    use sha2::Digest;
+    // `ioreg` exposes IOPlatformUUID, a per-machine identifier stable across
+    // reboots and reinstalls. Hash it (with a domain-separating prefix) so the
+    // raw hardware id never leaves the device.
+    let output = std::process::Command::new("/usr/sbin/ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let uuid = text
+        .lines()
+        .find(|line| line.contains("IOPlatformUUID"))
+        .and_then(|line| line.split('"').nth(3))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"ozon-rust-local-device-v1:");
+    hasher.update(uuid.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Some(format!("ors-local-{hex}"))
+}
+
 async fn load_or_create_device_fingerprint(state: &LocalState) -> Result<String, ApiError> {
+    // Prefer the stable machine-derived fingerprint so restarts and keyring
+    // flakiness can never change it. It is deterministic, so no storage is needed.
+    if let Some(stable) = stable_machine_fingerprint() {
+        return Ok(stable);
+    }
+
+    // Fallback (non-macOS / hardware probe failure): the original
+    // stored-or-create-random behavior.
     if let Some(existing) = state
         .secrets
         .get(&SecretName::new(SECRET_DEVICE_FINGERPRINT))
