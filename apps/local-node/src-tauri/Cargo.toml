@@ -1,6 +1,6 @@
 [package]
 name = "ozon-local-node-tauri"
-version = "0.1.0"
+version = "0.1.15"
 description = "Ozon Rust Suite local configuration center"
 edition.workspace = true
 license.workspace = true
