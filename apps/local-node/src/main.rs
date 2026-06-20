@@ -94,7 +94,19 @@ fn package_version() -> &'static str {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    if let Err(err) = run().await {
+        // Print the real cause as a plain, flushed stderr line so the Tauri
+        // supervisor always captures it. The default `Result` Termination impl
+        // can race the Terminated event and lose the message on Windows, which
+        // is exactly how "sidecar exits code 1" became invisible in the logs.
+        eprintln!("local-node fatal: {err:#}");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -120,7 +132,11 @@ async fn run_server(addr: SocketAddr, router: Router) -> anyhow::Result<()> {
     if !addr.ip().is_loopback() {
         anyhow::bail!("local-node refuses to bind non-loopback address: {addr}");
     }
-    let listener = TcpListener::bind(addr).await?;
+    // Name the address + raw OS error so a port conflict (Windows WSAEADDRINUSE
+    // 10048 / Unix 48) is obvious in the log instead of a bare "exit code 1".
+    let listener = TcpListener::bind(addr).await.map_err(|e| {
+        anyhow::anyhow!("failed to bind {addr}: {e} (os error {:?})", e.raw_os_error())
+    })?;
     axum::serve(listener, router).await?;
     Ok(())
 }
