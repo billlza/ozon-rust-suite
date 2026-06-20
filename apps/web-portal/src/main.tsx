@@ -1145,6 +1145,8 @@ function App() {
       phase: "checking",
       message: portalCopy.messages.checkingLocalNode
     });
+    // Immediate feedback in the main status banner so a click is never silent.
+    setOperationStatus(portalCopy.messages.checkingLocalNode);
     try {
       const health = await localNodeJson<LocalNodeHealth>("/health").catch((error) => {
         throw new Error(`health: ${errorMessage(error)}`);
@@ -1159,21 +1161,32 @@ function App() {
       if (portal?.device_fingerprint) {
         setDeviceFingerprint(portal.device_fingerprint);
       }
+      const onlineMessage = localNodeOnlineMessage(health, portalResult.ok ? null : portalResult.error);
       setLocalNode({
         phase: "online",
-        message: localNodeOnlineMessage(health, portalResult.ok ? null : portalResult.error),
+        message: onlineMessage,
         checkedAt: new Date().toISOString(),
         health,
         manifest,
         portal: portal ?? undefined
       });
+      setOperationStatus(onlineMessage);
     } catch (error) {
       const endpoint = localNodeFailedEndpoint(error);
-      setLocalNode({
-        phase: endpoint === "manifest" ? "degraded" : isLocalNodeBrowserBlock(error) ? "blocked" : "offline",
-        message: localNodeFailureMessage(error, endpoint),
-        checkedAt: new Date().toISOString()
-      });
+      if (endpoint === "manifest") {
+        const message = localNodeFailureMessage(error, endpoint);
+        setLocalNode({ phase: "degraded", message, checkedAt: new Date().toISOString() });
+        setOperationStatus(message);
+        return;
+      }
+      // /health failed. fetch() throws the SAME "Failed to fetch" for "node not
+      // running" and "browser blocked it" — so probe the port positively to tell
+      // them apart instead of guessing from the error string.
+      const live = await localNodeLiveness();
+      const phase: LocalNodePhase = live ? "blocked" : "offline";
+      const message = live ? portalCopy.messages.localNodeBlocked : portalCopy.messages.localNodeNotDetected;
+      setLocalNode({ phase, message, checkedAt: new Date().toISOString() });
+      setOperationStatus(message);
     }
   }
 
@@ -1515,9 +1528,15 @@ function App() {
                     : portalCopy.console.identity.serviceClosed}
               </strong>
             </div>
-            <div className="rail-status" data-state={computerHelperOnline ? "ok" : "off"}>
+            <div className="rail-status" data-state={computerHelperOnline ? "ok" : localNode.phase === "checking" ? "checking" : "off"}>
               <span>{portalCopy.console.identity.helper}</span>
-              <strong>{computerHelperOnline ? portalCopy.console.identity.helperConnected : portalCopy.console.identity.helperDisconnected}</strong>
+              <strong>
+                {computerHelperOnline
+                  ? portalCopy.console.identity.helperConnected
+                  : localNode.phase === "idle"
+                    ? portalCopy.console.identity.helperDisconnected
+                    : localNodeStatusLabel(localNode.phase)}
+              </strong>
             </div>
             <div className="rail-status" data-state={computerAuthorized ? "ok" : "off"}>
               <span>{portalCopy.console.identity.computerAuth}</span>
@@ -1751,6 +1770,12 @@ function App() {
                         ? portalCopy.console.setup.step2.todo
                         : portalCopy.console.setup.step2.locked}
                   </p>
+                  {activeEntitlement &&
+                    !computerHelperOnline &&
+                    localNode.phase !== "idle" &&
+                    localNode.message && (
+                      <p className={`local-node-inline ${localNode.phase}`}>{localNode.message}</p>
+                    )}
                   {activeEntitlement && !computerHelperOnline && (
                     <div className="step-actions">
                       {primaryDownloadOption ? (
@@ -2472,8 +2497,14 @@ async function copyText(value: string) {
   }
 }
 
+// Chrome/Edge 142+ "Local Network Access": hint that these requests target the
+// loopback address space so the browser classifies them correctly (and shows the
+// permission prompt instead of silently failing). Not in the DOM RequestInit type
+// yet, and ignored by browsers that don't support it — harmless.
+const LOOPBACK_FETCH_INIT = { targetAddressSpace: "loopback" } as unknown as RequestInit;
+
 async function localNodeJson<T>(path: string): Promise<T> {
-  const response = await fetchWithTimeout(`${LOCAL_NODE_API}${path}`, {}, 4_000);
+  const response = await fetchWithTimeout(`${LOCAL_NODE_API}${path}`, { ...LOOPBACK_FETCH_INIT }, 4_000);
   return parseResponse<T>(response);
 }
 
@@ -2481,6 +2512,7 @@ async function localNodePost<T>(path: string, body: unknown): Promise<T> {
   const response = await fetchWithTimeout(
     `${LOCAL_NODE_API}${path}`,
     {
+      ...LOOPBACK_FETCH_INIT,
       method: "POST",
       headers: {
         "Content-Type": "application/json"
@@ -2490,6 +2522,20 @@ async function localNodePost<T>(path: string, body: unknown): Promise<T> {
     4_000
   );
   return parseResponse<T>(response);
+}
+
+// Best-effort positive liveness check. A no-cors request resolves (opaque) when
+// the port is actually listening even if CORS would block a normal read — so it
+// separates "running but CORS-blocked" from "not running". (Local Network Access
+// blocks no-cors too, so an LNA block looks like not-running; the
+// localNodeNotDetected copy covers both honestly.)
+async function localNodeLiveness(): Promise<boolean> {
+  try {
+    await fetchWithTimeout(`${LOCAL_NODE_API}/health`, { ...LOOPBACK_FETCH_INIT, mode: "no-cors" }, 3_000);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function localNodeOnlineMessage(health: LocalNodeHealth, portalError: unknown | null) {
