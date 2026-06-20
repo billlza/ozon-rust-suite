@@ -7,5 +7,16 @@
       "source": "/(.*)",
       "destination": "/"
     }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "Permissions-Policy",
+          "value": "local-network-access=(self)"
+        }
+      ]
+    }
   ]
 }

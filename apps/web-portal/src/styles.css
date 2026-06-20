@@ -3419,3 +3419,29 @@ input[readonly] {
   box-shadow: 0 12px 26px rgba(10, 142, 102, 0.34);
   transform: translateY(-1px);
 }
+
+/* Inline helper-detection status shown right at Step 2 (paste-and-detect feedback) */
+.local-node-inline {
+  border: 1px solid transparent;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  margin-top: 8px;
+  padding: 10px 12px;
+}
+.local-node-inline.checking {
+  background: #f3f6fb;
+  border-color: #cdd9ee;
+  color: #2f4d80;
+}
+.local-node-inline.blocked,
+.local-node-inline.degraded {
+  background: #fffaf0;
+  border-color: #efd4a1;
+  color: #6b4815;
+}
+.local-node-inline.offline {
+  background: #fff8f5;
+  border-color: #f0b3a4;
+  color: #7a271a;
+}
