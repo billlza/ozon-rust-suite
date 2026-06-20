@@ -36,7 +36,19 @@ import { LanguageSwitch } from "./LanguageSwitch";
 import "./styles.css";
 
 const API_BASE = normalizeBaseUrl(import.meta.env.VITE_CLOUD_API ?? defaultCloudApiBase());
-const LOCAL_NODE_API = normalizeBaseUrl(import.meta.env.VITE_LOCAL_NODE_API ?? "http://127.0.0.1:8790");
+// Loopback candidates probed in order — MUST match PORT_CANDIDATES in the sidecar
+// + supervisor (apps/local-node). An explicit VITE_LOCAL_NODE_API pins a single
+// base (no fallback). The discovered base is cached in `activeLocalNodeBase`, so
+// the helper is reachable even when 8790/17870 is taken by something else.
+const LOCAL_NODE_CANDIDATES: string[] = import.meta.env.VITE_LOCAL_NODE_API
+  ? [normalizeBaseUrl(import.meta.env.VITE_LOCAL_NODE_API)]
+  : [
+      "http://127.0.0.1:8790",
+      "http://127.0.0.1:8791",
+      "http://127.0.0.1:8890",
+      "http://127.0.0.1:18790"
+    ];
+let activeLocalNodeBase = LOCAL_NODE_CANDIDATES[0];
 const LOCAL_CONSOLE_URL = normalizeOptionalUrl(
   import.meta.env.VITE_LOCAL_CONSOLE_URL ?? (import.meta.env.DEV ? "http://127.0.0.1:5173" : "")
 );
@@ -439,7 +451,7 @@ function App() {
   const releaseCommit = releaseManifest?.commit ? shortCommit(releaseManifest.commit) : portalCopy.defaults.releasePending;
   const releaseChecksum = releaseManifest ? releaseChecksumLabel(releaseManifest) : portalCopy.defaults.releaseChecksumPending;
   const openclawPluginUrl = downloads?.openclaw_plugin ? absolutePortalUrl(downloads.openclaw_plugin) : "";
-  const localManifestUrl = localNode.portal?.manifest_url ?? `${LOCAL_NODE_API}/openclaw/manifest`;
+  const localManifestUrl = localNode.portal?.manifest_url ?? `${activeLocalNodeBase}/openclaw/manifest`;
   const canOpenLocalConsole = Boolean(LOCAL_CONSOLE_URL);
   const canCopyLocalManifest = localNode.phase === "online";
   const canDownloadOpenClawPlugin = Boolean(openclawPluginUrl);
@@ -1147,6 +1159,20 @@ function App() {
     });
     // Immediate feedback in the main status banner so a click is never silent.
     setOperationStatus(portalCopy.messages.checkingLocalNode);
+
+    // Find which candidate port the helper actually bound (it may have fallen
+    // back off a busy 8790/17870). If none answers a normal fetch, decide
+    // blocked-vs-offline with a no-cors liveness sweep across all candidates.
+    const base = await discoverLocalNodeBase();
+    if (!base) {
+      const live = await localNodeAnyLiveness();
+      const phase: LocalNodePhase = live ? "blocked" : "offline";
+      const message = live ? portalCopy.messages.localNodeBlocked : portalCopy.messages.localNodeNotDetected;
+      setLocalNode({ phase, message, checkedAt: new Date().toISOString() });
+      setOperationStatus(message);
+      return;
+    }
+
     try {
       const health = await localNodeJson<LocalNodeHealth>("/health").catch((error) => {
         throw new Error(`health: ${errorMessage(error)}`);
@@ -1179,10 +1205,9 @@ function App() {
         setOperationStatus(message);
         return;
       }
-      // /health failed. fetch() throws the SAME "Failed to fetch" for "node not
-      // running" and "browser blocked it" — so probe the port positively to tell
-      // them apart instead of guessing from the error string.
-      const live = await localNodeLiveness();
+      // A call failed after discovery (the node likely went down mid-probe).
+      // fetch() can't tell not-running from browser-blocked, so sweep liveness.
+      const live = await localNodeAnyLiveness();
       const phase: LocalNodePhase = live ? "blocked" : "offline";
       const message = live ? portalCopy.messages.localNodeBlocked : portalCopy.messages.localNodeNotDetected;
       setLocalNode({ phase, message, checkedAt: new Date().toISOString() });
@@ -2504,13 +2529,13 @@ async function copyText(value: string) {
 const LOOPBACK_FETCH_INIT = { targetAddressSpace: "loopback" } as unknown as RequestInit;
 
 async function localNodeJson<T>(path: string): Promise<T> {
-  const response = await fetchWithTimeout(`${LOCAL_NODE_API}${path}`, { ...LOOPBACK_FETCH_INIT }, 4_000);
+  const response = await fetchWithTimeout(`${activeLocalNodeBase}${path}`, { ...LOOPBACK_FETCH_INIT }, 4_000);
   return parseResponse<T>(response);
 }
 
 async function localNodePost<T>(path: string, body: unknown): Promise<T> {
   const response = await fetchWithTimeout(
-    `${LOCAL_NODE_API}${path}`,
+    `${activeLocalNodeBase}${path}`,
     {
       ...LOOPBACK_FETCH_INIT,
       method: "POST",
@@ -2524,18 +2549,38 @@ async function localNodePost<T>(path: string, body: unknown): Promise<T> {
   return parseResponse<T>(response);
 }
 
-// Best-effort positive liveness check. A no-cors request resolves (opaque) when
-// the port is actually listening even if CORS would block a normal read — so it
-// separates "running but CORS-blocked" from "not running". (Local Network Access
-// blocks no-cors too, so an LNA block looks like not-running; the
-// localNodeNotDetected copy covers both honestly.)
-async function localNodeLiveness(): Promise<boolean> {
-  try {
-    await fetchWithTimeout(`${LOCAL_NODE_API}/health`, { ...LOOPBACK_FETCH_INIT, mode: "no-cors" }, 3_000);
-    return true;
-  } catch {
-    return false;
+// Find the first candidate that answers /health with a normal (CORS-readable)
+// fetch, and remember it as the active base. Returns null if none responds.
+async function discoverLocalNodeBase(): Promise<string | null> {
+  for (const base of LOCAL_NODE_CANDIDATES) {
+    try {
+      const response = await fetchWithTimeout(`${base}/health`, { ...LOOPBACK_FETCH_INIT }, 2_500);
+      if (response.ok) {
+        activeLocalNodeBase = base;
+        return base;
+      }
+    } catch {
+      // try the next candidate
+    }
   }
+  return null;
+}
+
+// Best-effort positive liveness across all candidates. A no-cors request resolves
+// (opaque) when a port is actually listening even if CORS would block a normal
+// read — so it separates "running but CORS-blocked" from "not running". (Local
+// Network Access blocks no-cors too, so an LNA block looks like not-running; the
+// localNodeNotDetected copy covers both honestly.)
+async function localNodeAnyLiveness(): Promise<boolean> {
+  for (const base of LOCAL_NODE_CANDIDATES) {
+    try {
+      await fetchWithTimeout(`${base}/health`, { ...LOOPBACK_FETCH_INIT, mode: "no-cors" }, 2_000);
+      return true;
+    } catch {
+      // try the next candidate
+    }
+  }
+  return false;
 }
 
 function localNodeOnlineMessage(health: LocalNodeHealth, portalError: unknown | null) {

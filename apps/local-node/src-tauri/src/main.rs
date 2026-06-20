@@ -61,7 +61,26 @@ struct SidecarSnapshot {
     /// when a second app instance already held 127.0.0.1:8790.
     #[serde(default)]
     consecutive_failures: u32,
+    /// The skill/agent base URLs the sidecar actually bound, once known — it may
+    /// differ from the default port if PORT_CANDIDATES fell back. Set from the
+    /// sidecar's reported "LOCAL_NODE_PORTS" line or from adopting an existing
+    /// node, and preferred over the static defaults so the UI talks to the real
+    /// port.
+    #[serde(default)]
+    effective_skill_api: Option<String>,
+    #[serde(default)]
+    effective_agent_api: Option<String>,
 }
+
+/// Loopback (skill, agent) port pairs probed in order to find the node. MUST
+/// stay in sync with PORT_CANDIDATES in apps/local-node/src/main.rs and the
+/// portal's candidate list in apps/web-portal/src/main.tsx.
+const PORT_CANDIDATES: &[(u16, u16)] = &[
+    (8790, 17870),
+    (8791, 17871),
+    (8890, 17970),
+    (18790, 27870),
+];
 
 /// A sidecar that exits sooner than this after starting is treated as a rapid
 /// failure (port already bound, immediate panic) rather than a healthy run.
@@ -80,8 +99,12 @@ struct HealthProbe {
 }
 
 enum ExistingLocalNode {
-    Ready,
-    Blocked(String),
+    /// An adoptable node (healthy + same operator token) is already listening on
+    /// this candidate pair. Carries its base URLs so the UI uses the right port.
+    Ready {
+        skill_api: String,
+        agent_api: String,
+    },
     Missing,
 }
 
@@ -105,6 +128,8 @@ impl SidecarState {
                 last_error: None,
                 desired_running: true,
                 consecutive_failures: 0,
+                effective_skill_api: None,
+                effective_agent_api: None,
             }),
         }
     }
@@ -115,8 +140,14 @@ impl SidecarState {
             .lock()
             .expect("sidecar snapshot lock poisoned");
         LocalNodeRuntime {
-            skill_api: self.runtime.skill_api.clone(),
-            agent_api: self.runtime.agent_api.clone(),
+            skill_api: snapshot
+                .effective_skill_api
+                .clone()
+                .unwrap_or_else(|| self.runtime.skill_api.clone()),
+            agent_api: snapshot
+                .effective_agent_api
+                .clone()
+                .unwrap_or_else(|| self.runtime.agent_api.clone()),
             local_token: self.runtime.local_token.clone(),
             connector_mode: self.runtime.connector_mode.clone(),
             sidecar_pid: snapshot.pid,
@@ -282,23 +313,17 @@ fn start_managed_sidecar(app: &AppHandle) {
             return;
         }
         match probe_existing_local_node(&state.runtime.local_token) {
-            ExistingLocalNode::Ready => {
+            ExistingLocalNode::Ready { skill_api, agent_api } => {
                 snapshot.pid = None;
                 snapshot.status = "external".to_string();
                 snapshot.last_error = None;
                 snapshot.last_exit = None;
+                snapshot.effective_skill_api = Some(skill_api.clone());
+                snapshot.effective_agent_api = Some(agent_api.clone());
                 append_sidecar_log(
                     &PathBuf::from(&state.runtime.sidecar_log_path),
-                    "attached to existing ozon-local-node on 127.0.0.1:8790 / 17870",
+                    &format!("attached to existing ozon-local-node on {skill_api} / {agent_api}"),
                 );
-                return;
-            }
-            ExistingLocalNode::Blocked(reason) => {
-                snapshot.pid = None;
-                snapshot.status = "blocked".to_string();
-                snapshot.last_error = Some(reason.clone());
-                snapshot.last_exit = None;
-                append_sidecar_log(&PathBuf::from(&state.runtime.sidecar_log_path), &reason);
                 return;
             }
             ExistingLocalNode::Missing => {}
@@ -318,8 +343,10 @@ fn start_managed_sidecar(app: &AppHandle) {
                 .env("OZON_LOCAL_TOKEN", runtime.local_token)
                 .env("OZON_OPENCLAW_TOKEN", runtime.openclaw_token)
                 .env("OZON_LOCAL_SECRET_FILE", runtime.secret_store_path)
-                .env("OZON_LOCAL_SKILL_BIND", "127.0.0.1:8790")
-                .env("OZON_LOCAL_AGENT_BIND", "127.0.0.1:17870")
+                // No fixed bind: the sidecar picks the first free pair from
+                // PORT_CANDIDATES and reports it via "LOCAL_NODE_PORTS", so a
+                // busy 8790/17870 (orphan or a third-party app) no longer leaves
+                // it permanently offline.
         })
         .and_then(|command| command.spawn())
     {
@@ -360,6 +387,19 @@ fn start_managed_sidecar(app: &AppHandle) {
                         CommandEvent::Stdout(line) => {
                             tracing_line("local-node stdout", &line);
                             tracing_line_to_file(&log_path, "stdout", &line);
+                            // The sidecar reports the actual ports it bound (it may
+                            // have fallen back off a busy 8790/17870); record them so
+                            // the UI talks to the real port.
+                            if let Some((skill_api, agent_api)) = parse_reported_ports(&line) {
+                                if let Ok(mut snapshot) = app_handle
+                                    .state::<SidecarState>()
+                                    .snapshot
+                                    .lock()
+                                {
+                                    snapshot.effective_skill_api = Some(skill_api);
+                                    snapshot.effective_agent_api = Some(agent_api);
+                                }
+                            }
                         }
                         CommandEvent::Stderr(line) => {
                             tracing_line("local-node stderr", &line);
@@ -503,6 +543,26 @@ fn is_address_in_use(reason: &str) -> bool {
         || reason.contains("Only one usage of each socket address")
 }
 
+/// Parse the sidecar's `LOCAL_NODE_PORTS skill=8791 agent=17871` stdout line into
+/// the (skill_api, agent_api) base URLs. Returns None for any other line.
+fn parse_reported_ports(line: &[u8]) -> Option<(String, String)> {
+    let text = String::from_utf8_lossy(line);
+    let rest = text.trim().strip_prefix("LOCAL_NODE_PORTS")?;
+    let mut skill: Option<u16> = None;
+    let mut agent: Option<u16> = None;
+    for token in rest.split_whitespace() {
+        if let Some(value) = token.strip_prefix("skill=") {
+            skill = value.parse().ok();
+        } else if let Some(value) = token.strip_prefix("agent=") {
+            agent = value.parse().ok();
+        }
+    }
+    Some((
+        format!("http://127.0.0.1:{}", skill?),
+        format!("http://127.0.0.1:{}", agent?),
+    ))
+}
+
 /// Exponential backoff capped at RESTART_MAX_DELAY_SECS: 2s, 4s, 8s, 16s, 30s, 30s…
 /// `failures` is 1-based (first failure → index 0 → base delay).
 fn restart_delay_secs(failures: u32) -> u64 {
@@ -519,16 +579,25 @@ fn schedule_sidecar_restart(app: AppHandle, delay_secs: u64) {
 }
 
 fn probe_existing_local_node(local_token: &str) -> ExistingLocalNode {
-    if !probe_health_endpoint("127.0.0.1:8790") {
-        return ExistingLocalNode::Missing;
+    // Look across the candidate pairs for a node we can adopt (healthy on both
+    // ports + proves the same operator token). A candidate that's busy with a
+    // foreign/half-up process is simply skipped — the sidecar will skip it too
+    // and bind the next free pair. If none is adoptable, return Missing so we
+    // spawn a fresh sidecar (which picks the first free pair via PORT_CANDIDATES).
+    for (skill_port, agent_port) in PORT_CANDIDATES {
+        let skill = format!("127.0.0.1:{skill_port}");
+        let agent = format!("127.0.0.1:{agent_port}");
+        if probe_health_endpoint(&skill)
+            && probe_health_endpoint(&agent)
+            && probe_attest_endpoint(local_token, &skill)
+        {
+            return ExistingLocalNode::Ready {
+                skill_api: format!("http://{skill}"),
+                agent_api: format!("http://{agent}"),
+            };
+        }
     }
-    if !probe_health_endpoint("127.0.0.1:17870") {
-        return ExistingLocalNode::Blocked("existing_node_agent_port_not_ready".to_string());
-    }
-    if !probe_attest_endpoint(local_token) {
-        return ExistingLocalNode::Blocked("existing_node_token_rejected".to_string());
-    }
-    ExistingLocalNode::Ready
+    ExistingLocalNode::Missing
 }
 
 fn probe_health_endpoint(addr: &str) -> bool {
@@ -548,10 +617,10 @@ fn probe_health_endpoint(addr: &str) -> bool {
 /// challenge it with a fresh nonce and accept only a correct HMAC-SHA256(local_token, nonce)
 /// proof. A port squatter that lacks the token cannot answer, so the token is never disclosed to
 /// an unauthenticated peer (and is only ever sent to a peer that has proven it already holds it).
-fn probe_attest_endpoint(local_token: &str) -> bool {
+fn probe_attest_endpoint(local_token: &str, skill_addr: &str) -> bool {
     let nonce = generate_nonce();
     let Some(response) = probe_http_endpoint(
-        "127.0.0.1:8790",
+        skill_addr,
         "/attest",
         Some(("x-attest-nonce", &nonce)),
     ) else {
@@ -765,7 +834,37 @@ fn valid_secret(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_http_status;
+    use super::{is_address_in_use, parse_http_status, parse_reported_ports};
+
+    #[test]
+    fn parse_reported_ports_reads_the_sidecar_line() {
+        // Must match the exact line the sidecar prints in apps/local-node/src/main.rs.
+        assert_eq!(
+            parse_reported_ports(b"LOCAL_NODE_PORTS skill=8791 agent=17871"),
+            Some((
+                "http://127.0.0.1:8791".to_string(),
+                "http://127.0.0.1:17871".to_string()
+            ))
+        );
+        // Trailing newline / surrounding whitespace is tolerated.
+        assert_eq!(
+            parse_reported_ports(b"  LOCAL_NODE_PORTS skill=8790 agent=17870\n"),
+            Some((
+                "http://127.0.0.1:8790".to_string(),
+                "http://127.0.0.1:17870".to_string()
+            ))
+        );
+        assert_eq!(parse_reported_ports(b"starting local node services"), None);
+        assert_eq!(parse_reported_ports(b"LOCAL_NODE_PORTS skill=8791"), None);
+    }
+
+    #[test]
+    fn is_address_in_use_covers_windows_and_unix() {
+        assert!(is_address_in_use("terminated: ... os error 48"));
+        assert!(is_address_in_use("failed to bind 127.0.0.1:8790: ... os error 10048"));
+        assert!(is_address_in_use("Only one usage of each socket address"));
+        assert!(!is_address_in_use("some unrelated panic"));
+    }
 
     #[test]
     fn parse_http_status_extracts_status_code() {

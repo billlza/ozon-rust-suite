@@ -56,6 +56,18 @@ use uuid::Uuid;
 
 const DEFAULT_DEV_LOCAL_TOKEN: &str = "dev-local-token";
 const DEFAULT_DEV_OPENCLAW_TOKEN: &str = "dev-openclaw-token";
+/// Loopback (skill, agent) port pairs tried in order when no explicit bind is
+/// configured, so a port already taken by another program doesn't leave the
+/// helper permanently offline. The first pair where BOTH ports bind wins, and
+/// the chosen pair is reported on stdout. The Tauri supervisor and the web
+/// portal probe this SAME list to find the node, so it must stay in sync across
+/// `apps/local-node/src-tauri/src/main.rs` and `apps/web-portal/src/main.tsx`.
+const PORT_CANDIDATES: &[(u16, u16)] = &[
+    (8790, 17870),
+    (8791, 17871),
+    (8890, 17970),
+    (18790, 27870),
+];
 const DEFAULT_OPENCLAW_BIND_URL: &str = "http://127.0.0.1:18789/openclaw/import";
 const OPENCLAW_PAIRING_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_OPENAI_IMAGE_MODEL: &str = "gpt-image-1";
@@ -115,28 +127,82 @@ async fn run() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let config = LocalConfig::from_env();
+    let mut config = LocalConfig::from_env();
     config.validate()?;
-    let state = LocalState::new(config.clone())?;
-    let skill_addr: SocketAddr = config.skill_bind.parse()?;
-    let agent_addr: SocketAddr = config.agent_bind.parse()?;
 
-    let skill = run_server(skill_addr, skill_router(state.clone()));
-    let agent = run_server(agent_addr, agent_router(state.clone()));
+    // Bind FIRST (with port fallback), then reflect the actual chosen addresses
+    // into the config so every manifest/status URL points at the real port.
+    let (skill_listener, agent_listener) = bind_local_servers(&config).await?;
+    let skill_addr = skill_listener.local_addr()?;
+    let agent_addr = agent_listener.local_addr()?;
+    config.skill_bind = skill_addr.to_string();
+    config.agent_bind = agent_addr.to_string();
+
+    let state = LocalState::new(config.clone())?;
+
+    // Tell the supervisor (and the log) which pair we actually took, so it can
+    // attach/display the right port even when the primary was unavailable.
+    println!(
+        "LOCAL_NODE_PORTS skill={} agent={}",
+        skill_addr.port(),
+        agent_addr.port()
+    );
     tracing::info!(%skill_addr, %agent_addr, "starting local node services");
+
+    let skill = serve_on(skill_listener, skill_router(state.clone()));
+    let agent = serve_on(agent_listener, agent_router(state.clone()));
     tokio::try_join!(skill, agent)?;
     Ok(())
 }
 
-async fn run_server(addr: SocketAddr, router: Router) -> anyhow::Result<()> {
+/// Bind the skill + agent loopback listeners. With an explicit bind override
+/// (env-set) it binds exactly those; otherwise it tries PORT_CANDIDATES in order
+/// and returns the first pair where BOTH ports are free, so a single busy port
+/// no longer leaves the helper permanently offline.
+async fn bind_local_servers(config: &LocalConfig) -> anyhow::Result<(TcpListener, TcpListener)> {
+    if config.bind_override {
+        let skill_addr: SocketAddr = config.skill_bind.parse()?;
+        let agent_addr: SocketAddr = config.agent_bind.parse()?;
+        let skill = bind_loopback(skill_addr).await?;
+        let agent = bind_loopback(agent_addr).await?;
+        return Ok((skill, agent));
+    }
+
+    let mut last_err: Option<String> = None;
+    for (skill_port, agent_port) in PORT_CANDIDATES {
+        let skill_addr = SocketAddr::from(([127, 0, 0, 1], *skill_port));
+        let agent_addr = SocketAddr::from(([127, 0, 0, 1], *agent_port));
+        match bind_loopback(skill_addr).await {
+            Ok(skill) => match bind_loopback(agent_addr).await {
+                Ok(agent) => return Ok((skill, agent)),
+                Err(err) => {
+                    // Release the skill port before trying the next pair.
+                    drop(skill);
+                    last_err = Some(err.to_string());
+                }
+            },
+            Err(err) => last_err = Some(err.to_string()),
+        }
+    }
+    anyhow::bail!(
+        "no free loopback port pair (tried {} candidates): {}",
+        PORT_CANDIDATES.len(),
+        last_err.unwrap_or_else(|| "unknown".to_string())
+    )
+}
+
+async fn bind_loopback(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     if !addr.ip().is_loopback() {
         anyhow::bail!("local-node refuses to bind non-loopback address: {addr}");
     }
     // Name the address + raw OS error so a port conflict (Windows WSAEADDRINUSE
     // 10048 / Unix 48) is obvious in the log instead of a bare "exit code 1".
-    let listener = TcpListener::bind(addr).await.map_err(|e| {
+    TcpListener::bind(addr).await.map_err(|e| {
         anyhow::anyhow!("failed to bind {addr}: {e} (os error {:?})", e.raw_os_error())
-    })?;
+    })
+}
+
+async fn serve_on(listener: TcpListener, router: Router) -> anyhow::Result<()> {
     axum::serve(listener, router).await?;
     Ok(())
 }
@@ -227,8 +293,14 @@ fn local_cors() -> CorsLayer {
 
 #[derive(Clone)]
 struct LocalConfig {
+    /// Effective skill/agent bind. After dynamic binding these hold the actual
+    /// chosen address (all manifest/status URLs read them), so a fallback port
+    /// is reflected everywhere automatically.
     skill_bind: String,
     agent_bind: String,
+    /// True when BOTH bind env vars were set explicitly (tests/dev): bind those
+    /// exact ports and do NOT fall back. False => try PORT_CANDIDATES in order.
+    bind_override: bool,
     operator_token: String,
     openclaw_token: String,
     use_real_ozon: bool,
@@ -258,11 +330,16 @@ impl LocalConfig {
                 _ => !cfg!(debug_assertions),
             },
         };
+        let skill_override = env::var("OZON_LOCAL_SKILL_BIND").ok();
+        let agent_override = env::var("OZON_LOCAL_AGENT_BIND").ok();
+        let bind_override = skill_override.is_some() && agent_override.is_some();
+        let (default_skill, default_agent) = PORT_CANDIDATES[0];
         Self {
-            skill_bind: env::var("OZON_LOCAL_SKILL_BIND")
-                .unwrap_or_else(|_| "127.0.0.1:8790".to_string()),
-            agent_bind: env::var("OZON_LOCAL_AGENT_BIND")
-                .unwrap_or_else(|_| "127.0.0.1:17870".to_string()),
+            skill_bind: skill_override
+                .unwrap_or_else(|| format!("127.0.0.1:{default_skill}")),
+            agent_bind: agent_override
+                .unwrap_or_else(|| format!("127.0.0.1:{default_agent}")),
+            bind_override,
             operator_token: env::var("OZON_LOCAL_TOKEN")
                 .unwrap_or_else(|_| DEFAULT_DEV_LOCAL_TOKEN.to_string()),
             openclaw_token: env::var("OZON_OPENCLAW_TOKEN")
@@ -4153,6 +4230,7 @@ mod tests {
         LocalConfig {
             skill_bind: "127.0.0.1:8790".to_string(),
             agent_bind: "127.0.0.1:17870".to_string(),
+            bind_override: true,
             operator_token: "operator-token".to_string(),
             openclaw_token: "bridge-token".to_string(),
             use_real_ozon: false,
