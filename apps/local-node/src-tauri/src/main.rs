@@ -349,6 +349,12 @@ fn start_managed_sidecar(app: &AppHandle) {
             let app_handle = app.clone();
             append_sidecar_log(&log_path, &format!("started pid={pid}"));
             tauri::async_runtime::spawn(async move {
+                // Keep draining the event channel after Terminated/Error so the
+                // sidecar's final stderr (e.g. the real bind error) is written to
+                // the log before we react. On Windows the Terminated event can
+                // arrive before the buffered stderr is delivered, which is how the
+                // "exit code 1" cause stayed invisible in the user's log.
+                let mut pending_exit: Option<String> = None;
                 while let Some(event) = receiver.recv().await {
                     match event {
                         CommandEvent::Stdout(line) => {
@@ -363,18 +369,19 @@ fn start_managed_sidecar(app: &AppHandle) {
                             let reason = format!("terminated: {payload:?}");
                             eprintln!("local-node sidecar {reason}");
                             append_sidecar_log(&log_path, &reason);
-                            handle_sidecar_exit(&app_handle, pid, reason);
-                            break;
+                            pending_exit = Some(reason);
                         }
                         CommandEvent::Error(error) => {
                             let reason = format!("error: {error}");
                             eprintln!("local-node sidecar {reason}");
                             append_sidecar_log(&log_path, &reason);
-                            handle_sidecar_exit(&app_handle, pid, reason);
-                            break;
+                            pending_exit = Some(reason);
                         }
                         _ => {}
                     }
+                }
+                if let Some(reason) = pending_exit {
+                    handle_sidecar_exit(&app_handle, pid, reason);
                 }
             });
             eprintln!("local-node sidecar started: pid={pid}");
@@ -454,8 +461,8 @@ fn handle_sidecar_exit(app: &AppHandle, pid: u32, reason: String) {
             // second app copy) already owns 127.0.0.1:8790. Surface it instead of
             // restarting forever.
             snapshot.status = "blocked".to_string();
-            let blocked = if reason.contains("os error 48") || reason.contains("Address already in use") {
-                "另一个 Ozon 本地节点已占用 127.0.0.1:8790（多半是开了两份 App）。请只保留一份后点重启节点。".to_string()
+            let blocked = if is_address_in_use(&reason) {
+                "另一个 Ozon 本地节点已占用本机端口（多半是上次没退干净留下的残留进程，或开了两份 App）。请在任务管理器结束所有 ozon-local-node 进程后点重启节点。".to_string()
             } else {
                 format!("本地节点连续 {} 次快速退出，已停止自动重启。最后退出：{reason}", snapshot.consecutive_failures)
             };
@@ -482,6 +489,18 @@ enum SidecarExit {
     Restart(u64),
     GiveUp,
     Stop,
+}
+
+/// True when a sidecar exit reason is a "port already in use" error, across
+/// platforms: Unix EADDRINUSE (os error 48), Windows WSAEADDRINUSE (10048),
+/// Windows WSAEACCES on a reserved/excluded port (10013), and the OS strings.
+/// Windows users hit this when a prior sidecar orphaned and still holds the port.
+fn is_address_in_use(reason: &str) -> bool {
+    reason.contains("os error 48")
+        || reason.contains("os error 10048")
+        || reason.contains("os error 10013")
+        || reason.contains("Address already in use")
+        || reason.contains("Only one usage of each socket address")
 }
 
 /// Exponential backoff capped at RESTART_MAX_DELAY_SECS: 2s, 4s, 8s, 16s, 30s, 30s…
