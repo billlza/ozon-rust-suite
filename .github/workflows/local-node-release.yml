@@ -27,7 +27,7 @@ env:
 jobs:
   windows-installers:
     name: Build Windows MSI and EXE
-    runs-on: windows-2025-vs2026
+    runs-on: windows-latest
     env:
       CARGO_TERM_COLOR: always
       OZON_SUITE_LEASE_PUBLIC_KEY_PEM: ${{ vars.OZON_SUITE_LEASE_PUBLIC_KEY_PEM || secrets.OZON_SUITE_LEASE_PUBLIC_KEY_PEM }}
