@@ -25,7 +25,9 @@ echo "==> Releasing macOS DMG for ${TAG} -> ${DOWNLOADS_REPO}"
 echo "==> Building macOS app bundle (this takes a few minutes) ..."
 OZON_LOCAL_NODE_RELEASE_VERSION="${VERSION}" pnpm --dir apps/local-node tauri:build
 
-DMG_SRC="$(find apps/local-node/src-tauri/target target -path '*bundle/dmg/*.dmg' 2>/dev/null | head -n1)"
+# Search both the workspace target/ (where the Tauri DMG actually lands) and apps/.
+# `|| true` keeps a missing dir + pipefail from aborting the whole script.
+DMG_SRC="$(find target apps -path '*bundle/dmg/*.dmg' -print 2>/dev/null | head -n1 || true)"
 if [ -z "${DMG_SRC}" ]; then
   echo "ERROR: no .dmg produced under */bundle/dmg/" >&2
   exit 1
