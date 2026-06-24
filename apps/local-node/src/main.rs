@@ -54,6 +54,12 @@ use tower_http::{
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
+mod model_router;
+use model_router::{
+    Capability, CapabilityStatus, ProviderEntry, StoredModelRegistry, inspect_capabilities,
+    resolve_capability,
+};
+
 const DEFAULT_DEV_LOCAL_TOKEN: &str = "dev-local-token";
 const DEFAULT_DEV_OPENCLAW_TOKEN: &str = "dev-openclaw-token";
 /// Loopback (skill, agent) port pairs tried in order when no explicit bind is
@@ -84,6 +90,7 @@ const RELIST_IMAGE_SIZE: &str = "1024x1536";
 const RELIST_MAX_BATCH: usize = 12;
 const SECRET_OZON_CONFIG: &str = "ozon_config";
 const SECRET_OPENAI_CONFIG: &str = "openai_config";
+const SECRET_MODEL_REGISTRY: &str = "model_registry";
 const SECRET_CLOUD_LEASE: &str = "cloud_lease";
 const SECRET_DEVICE_FINGERPRINT: &str = "device_fingerprint";
 const PROTOCOL_VERSION: &str = "2026-05-13.local-node.v1";
@@ -221,6 +228,7 @@ fn skill_router(state: LocalState) -> Router {
         .route("/config/ozon", post(save_ozon_config))
         .route("/config/ozon/validate", post(validate_ozon_config))
         .route("/config/openai", post(save_openai_config))
+        .route("/config/registry", post(save_model_registry))
         .route("/tools/ozon.products.count", post(ozon_products_count))
         .route("/tools/ozon.products.list", post(ozon_products_list))
         .route("/tools/ozon.products.get", post(ozon_products_get))
@@ -398,6 +406,7 @@ struct LocalState {
     secrets: Arc<dyn SecretStore>,
     ozon_config_cache: Arc<RwLock<Option<StoredOzonConfig>>>,
     openai_config_cache: Arc<RwLock<Option<StoredOpenAiConfig>>>,
+    model_registry_cache: Arc<RwLock<Option<StoredModelRegistry>>>,
     cloud_lease_cache: Arc<RwLock<Option<EntitlementLease>>>,
     ozon_connector: Arc<dyn OzonReadConnector>,
     ozon_writer: Arc<dyn OzonWriteConnector>,
@@ -446,6 +455,7 @@ impl LocalState {
             secrets,
             ozon_config_cache: Arc::new(RwLock::new(None)),
             openai_config_cache: Arc::new(RwLock::new(None)),
+            model_registry_cache: Arc::new(RwLock::new(None)),
             cloud_lease_cache: Arc::new(RwLock::new(None)),
             ozon_connector,
             ozon_writer,
@@ -649,6 +659,7 @@ async fn diagnostics(State(state): State<LocalState>) -> Json<DiagnosticsRespons
         poster_generation: poster_generation_status(&openai, manifest_url),
         openai,
         lease,
+        capabilities: inspect_capabilities(&state).await,
     })
 }
 
@@ -970,6 +981,62 @@ async fn save_openai_config(
     }))
 }
 
+async fn save_model_registry(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Json(input): Json<StoredModelRegistry>,
+) -> Result<Json<ModelRegistryResponse>, ApiError> {
+    require_operator_token(&state, &headers)?;
+
+    // Validate + normalize every entry across all capabilities. The same
+    // loopback-only-http rule applies regardless of auth style, since
+    // Header/Query auth also transmits the key on the wire.
+    let mut validated = StoredModelRegistry::default();
+    for (entries, target) in [
+        (&input.image_gen, &mut validated.image_gen),
+        (&input.text_gen, &mut validated.text_gen),
+        (&input.video_gen, &mut validated.video_gen),
+    ] {
+        for entry in entries {
+            let secret_ref = entry.secret_ref.trim();
+            if secret_ref.is_empty() {
+                return Err(ApiError::bad_request("provider secret_ref must not be empty"));
+            }
+            // Reject a ref that does not resolve to a key right now.
+            resolve_secret_ref(&state, secret_ref).await?;
+            let base_url = normalize_provider_base_url(&entry.base_url)?;
+            target.push(ProviderEntry {
+                kind: entry.kind,
+                base_url,
+                model: entry.model.clone(),
+                secret_ref: secret_ref.to_string(),
+                auth: entry.auth.clone(),
+                enabled: entry.enabled,
+            });
+        }
+    }
+
+    let bundle_json = serde_json::to_string(&validated)
+        .map_err(|_| ApiError::internal("failed to serialize model registry"))?;
+    state
+        .secrets
+        .put(
+            SecretName::new(SECRET_MODEL_REGISTRY),
+            SecretString::from(bundle_json),
+        )
+        .await
+        .map_err(|_| ApiError::internal("failed to save model registry"))?;
+    *state.model_registry_cache.write().await = Some(validated.clone());
+
+    Ok(Json(ModelRegistryResponse {
+        ok: true,
+        image_gen_entries: validated.image_gen.len(),
+        text_gen_entries: validated.text_gen.len(),
+        video_gen_entries: validated.video_gen.len(),
+        saved_at: Utc::now().to_rfc3339(),
+    }))
+}
+
 async fn save_portal_lease(
     State(state): State<LocalState>,
     Json(input): Json<PortalLeaseRequest>,
@@ -1031,6 +1098,7 @@ async fn config_status(
             agent_api: local_http_url(&state.config.agent_bind),
             manifest_url,
         },
+        capabilities: inspect_capabilities(&state).await,
     }))
 }
 
@@ -2196,6 +2264,51 @@ async fn load_persisted_openai_config(state: &LocalState) -> Result<StoredOpenAi
         .map_err(|_| ApiError::internal("stored OpenAI config is invalid"))
 }
 
+/// Load the persisted model registry, mirroring `load_persisted_openai_config`:
+/// return the cached value, else read + deserialize `SECRET_MODEL_REGISTRY`, else
+/// the default (empty) registry. The cache is populated on every path so repeated
+/// resolves do not hit the secret store.
+async fn load_persisted_model_registry(state: &LocalState) -> StoredModelRegistry {
+    if let Some(cached) = state.model_registry_cache.read().await.clone() {
+        return cached;
+    }
+
+    let registry = match get_secret_for_status(state, SECRET_MODEL_REGISTRY).await {
+        Ok(Some(bundle)) => serde_json::from_str::<StoredModelRegistry>(bundle.expose_secret())
+            .unwrap_or_default(),
+        _ => StoredModelRegistry::default(),
+    };
+
+    *state.model_registry_cache.write().await = Some(registry.clone());
+    registry
+}
+
+/// Resolve a `secret_ref` from a registry entry to a raw API key. The registry
+/// blob never contains a key — only this reference. `"openai_config"` reuses the
+/// existing OpenAI key (with its env precedence) via `load_openai_config`; any
+/// other ref reads that exact key from the secret store and errors if absent.
+async fn resolve_secret_ref(state: &LocalState, secret_ref: &str) -> Result<String, ApiError> {
+    if secret_ref == SECRET_OPENAI_CONFIG {
+        return Ok(load_openai_config(state).await?.api_key);
+    }
+    let bundle = state
+        .secrets
+        .get(&SecretName::new(secret_ref))
+        .await
+        .map_err(|_| ApiError::internal("secret store unavailable"))?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("secret_ref '{secret_ref}' is not configured"))
+        })?;
+    Ok(bundle.expose_secret().to_string())
+}
+
+/// Validate and normalize a provider base URL for any auth style. Reuses the
+/// loopback-only-http rule from `normalize_openai_base_url`: non-loopback hosts
+/// MUST use https, since Header/Query auth also puts the key on the wire.
+fn normalize_provider_base_url(value: &str) -> Result<String, ApiError> {
+    normalize_openai_base_url(value)
+}
+
 fn load_openai_env_config() -> Result<StoredOpenAiConfig, ApiError> {
     let api_key = optional_env("OPENAI_API_KEY").ok_or_else(|| {
         ApiError::bad_request("OpenAI API key is not configured for poster generation")
@@ -2753,7 +2866,9 @@ async fn generate_poster_background(
     state: &LocalState,
     brief: &PosterBrief,
 ) -> Result<PosterGeneratedBackground, ApiError> {
-    let openai = load_openai_config(state).await?;
+    let openai = resolve_capability(state, Capability::ImageGen)
+        .await?
+        .expect_openai_image()?;
     let request = OpenAiImageGenerationRequest {
         model: openai.image_model.clone(),
         prompt: brief.background_prompt.clone(),
@@ -3143,7 +3258,9 @@ async fn relist_edit_image(
     source_bytes: Vec<u8>,
     prompt: &str,
 ) -> Result<Vec<u8>, ApiError> {
-    let openai = load_openai_config(state).await?;
+    let openai = resolve_capability(state, Capability::ImageGen)
+        .await?
+        .expect_openai_image()?;
     let part = reqwest::multipart::Part::bytes(source_bytes)
         .file_name("source.png")
         .mime_str("image/png")
@@ -3678,6 +3795,7 @@ struct DiagnosticsResponse {
     poster_generation: PosterGenerationStatus,
     openai: OpenAiCredentialStatus,
     lease: LeaseStatus,
+    capabilities: Vec<CapabilityStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3762,6 +3880,20 @@ struct StoredOpenAiConfig {
     image_model: String,
 }
 
+impl StoredOpenAiConfig {
+    /// Build an image config from a registry entry. The image call sites consume
+    /// this unchanged: they pick generations-vs-edits endpoint from `base_url`
+    /// themselves, send `image_model` as the model, and use `api_key` as a bearer
+    /// token — identical to a config produced by `load_openai_config`.
+    pub(crate) fn for_registry(api_key: String, base_url: String, image_model: String) -> Self {
+        Self {
+            api_key,
+            base_url,
+            image_model,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct OzonConfigResponse {
     client_id: String,
@@ -3774,6 +3906,15 @@ struct OpenAiConfigResponse {
     base_url: String,
     image_model: String,
     api_key_fingerprint: String,
+    saved_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelRegistryResponse {
+    ok: bool,
+    image_gen_entries: usize,
+    text_gen_entries: usize,
+    video_gen_entries: usize,
     saved_at: String,
 }
 
@@ -3811,6 +3952,7 @@ struct ConfigStatusResponse {
     openai: OpenAiCredentialStatus,
     lease: LeaseStatus,
     endpoints: LocalEndpointStatus,
+    capabilities: Vec<CapabilityStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4431,6 +4573,195 @@ mod tests {
         let stored = load_openai_config(&state).await.expect("stored config");
         assert_eq!(stored.api_key, "sk-test-openai-key");
         assert_eq!(stored.image_model, "gpt-image-1");
+    }
+
+    async fn save_registry(state: &LocalState, registry: StoredModelRegistry) {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-local-token", "operator-token".parse().unwrap());
+        let _ = save_model_registry(State(state.clone()), headers, Json(registry))
+            .await
+            .expect("save registry");
+    }
+
+    #[tokio::test]
+    async fn resolve_image_with_no_registry_matches_load_openai_config() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-local-token", "operator-token".parse().unwrap());
+        let _ = save_openai_config(
+            State(state.clone()),
+            headers,
+            Json(OpenAiConfigRequest {
+                api_key: "sk-legacy".to_string(),
+                base_url: Some("https://relay.example.com".to_string()),
+                image_model: Some("gpt-image-1".to_string()),
+            }),
+        )
+        .await
+        .expect("save openai config");
+
+        let expected = load_openai_config(&state).await.expect("legacy config");
+        let resolved = resolve_capability(&state, Capability::ImageGen)
+            .await
+            .expect("resolve image")
+            .expect_openai_image()
+            .expect("openai image");
+        assert_eq!(resolved.api_key, expected.api_key);
+        assert_eq!(resolved.base_url, expected.base_url);
+        assert_eq!(resolved.image_model, expected.image_model);
+        assert_eq!(resolved.api_key, "sk-legacy");
+    }
+
+    #[tokio::test]
+    async fn resolve_image_with_enabled_entry_uses_entry_base_url_and_model() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-local-token", "operator-token".parse().unwrap());
+        let _ = save_openai_config(
+            State(state.clone()),
+            headers,
+            Json(OpenAiConfigRequest {
+                api_key: "sk-registry-key".to_string(),
+                base_url: Some("https://default.example.com".to_string()),
+                image_model: Some("gpt-image-1".to_string()),
+            }),
+        )
+        .await
+        .expect("save openai config");
+
+        save_registry(
+            &state,
+            StoredModelRegistry {
+                image_gen: vec![ProviderEntry {
+                    kind: model_router::ProviderKind::OpenAiImages,
+                    base_url: "https://images.example.com/v1".to_string(),
+                    model: "gpt-image-2".to_string(),
+                    secret_ref: SECRET_OPENAI_CONFIG.to_string(),
+                    auth: model_router::AuthStyle::Bearer,
+                    enabled: true,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let resolved = resolve_capability(&state, Capability::ImageGen)
+            .await
+            .expect("resolve image")
+            .expect_openai_image()
+            .expect("openai image");
+        assert_eq!(resolved.base_url, "https://images.example.com/v1");
+        assert_eq!(resolved.image_model, "gpt-image-2");
+        assert_eq!(resolved.api_key, "sk-registry-key");
+    }
+
+    #[tokio::test]
+    async fn resolve_text_gen_returns_generic_or_not_configured() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-local-token", "operator-token".parse().unwrap());
+        let _ = save_openai_config(
+            State(state.clone()),
+            headers,
+            Json(OpenAiConfigRequest {
+                api_key: "sk-text-key".to_string(),
+                base_url: Some("https://default.example.com".to_string()),
+                image_model: Some("gpt-image-1".to_string()),
+            }),
+        )
+        .await
+        .expect("save openai config");
+
+        // No registry yet -> NotConfigured.
+        match resolve_capability(&state, Capability::TextGen)
+            .await
+            .expect("resolve text")
+        {
+            model_router::ResolvedProvider::NotConfigured { capability, .. } => {
+                assert_eq!(capability, "text_gen");
+            }
+            _ => panic!("expected NotConfigured for text_gen"),
+        }
+
+        save_registry(
+            &state,
+            StoredModelRegistry {
+                text_gen: vec![ProviderEntry {
+                    kind: model_router::ProviderKind::OpenAiCompatChat,
+                    base_url: "https://chat.example.com".to_string(),
+                    model: "qwen-max".to_string(),
+                    secret_ref: SECRET_OPENAI_CONFIG.to_string(),
+                    auth: model_router::AuthStyle::Header {
+                        name: "x-api-key".to_string(),
+                    },
+                    enabled: true,
+                }],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        match resolve_capability(&state, Capability::TextGen)
+            .await
+            .expect("resolve text")
+        {
+            model_router::ResolvedProvider::Generic {
+                kind,
+                base_url,
+                model,
+                api_key,
+                auth,
+            } => {
+                assert_eq!(kind, model_router::ProviderKind::OpenAiCompatChat);
+                assert_eq!(base_url, "https://chat.example.com");
+                assert_eq!(model, "qwen-max");
+                assert_eq!(api_key, "sk-text-key");
+                assert_eq!(
+                    auth,
+                    model_router::AuthStyle::Header {
+                        name: "x-api-key".to_string()
+                    }
+                );
+            }
+            _ => panic!("expected Generic for text_gen"),
+        }
+    }
+
+    #[tokio::test]
+    async fn save_model_registry_rejects_non_loopback_http() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-local-token", "operator-token".parse().unwrap());
+        let _ = save_openai_config(
+            State(state.clone()),
+            headers.clone(),
+            Json(OpenAiConfigRequest {
+                api_key: "sk-key".to_string(),
+                base_url: Some("https://default.example.com".to_string()),
+                image_model: Some("gpt-image-1".to_string()),
+            }),
+        )
+        .await
+        .expect("save openai config");
+
+        let error = save_model_registry(
+            State(state.clone()),
+            headers,
+            Json(StoredModelRegistry {
+                image_gen: vec![ProviderEntry {
+                    kind: model_router::ProviderKind::OpenAiImages,
+                    base_url: "http://images.example.com".to_string(),
+                    model: "gpt-image-1".to_string(),
+                    secret_ref: SECRET_OPENAI_CONFIG.to_string(),
+                    auth: model_router::AuthStyle::Bearer,
+                    enabled: true,
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("non-loopback http must be rejected");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
