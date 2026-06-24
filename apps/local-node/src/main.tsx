@@ -12,6 +12,7 @@ import {
   Eye,
   EyeOff,
   FileSpreadsheet,
+  FileText,
   Image as ImageIcon,
   KeyRound,
   Languages,
@@ -140,11 +141,64 @@ type RelistItem = {
   error: string | null;
 };
 
+type Module3Attribute = {
+  name: string;
+  values: string[];
+};
+
+type Module3Fields = {
+  title: string;
+  description: string;
+  attributes: Module3Attribute[];
+  type_category: string;
+};
+
+type Module3Item = {
+  product_id: string;
+  offer_id: string;
+  source: Module3Fields;
+  proposal: Module3Fields | null;
+  error: string | null;
+};
+
 type RelistPushResult = {
   product_id: string;
   primary_url: string;
   image_count: number;
   ok: boolean;
+  error: string | null;
+};
+
+type Module3FieldChange = {
+  before: string;
+  after: string;
+};
+
+type Module3MatchedAttribute = {
+  attribute_id: number;
+  name: string;
+  values: string[];
+};
+
+type Module3DroppedItem = {
+  name: string;
+  value: string | null;
+  reason: string;
+};
+
+type Module3PushPreview = {
+  title: Module3FieldChange;
+  description: Module3FieldChange;
+  attributes_to_write: Module3MatchedAttribute[];
+  dropped: Module3DroppedItem[];
+};
+
+type Module3PushItem = {
+  product_id: string;
+  offer_id: string;
+  preview: Module3PushPreview | null;
+  written: boolean;
+  task_id: string | null;
   error: string | null;
 };
 
@@ -395,7 +449,7 @@ function App() {
   const [schedule, setSchedule] = useState<ScheduleStatus | null>(null);
   const [scheduleInterval, setScheduleInterval] = useState(900);
   const [scheduleLimit, setScheduleLimit] = useState(20);
-  const [view, setView] = useState<"workbench" | "console">("workbench");
+  const [view, setView] = useState<"workbench" | "copy" | "console">("workbench");
   const [cockpitOpen, setCockpitOpen] = useState(false);
   const [cockpitRefreshing, setCockpitRefreshing] = useState(false);
   const [relistProducts, setRelistProducts] = useState<Product[]>([]);
@@ -405,6 +459,17 @@ function App() {
   const [relistBusy, setRelistBusy] = useState(false);
   const [relistPushing, setRelistPushing] = useState(false);
   const [relistPushResults, setRelistPushResults] = useState<RelistPushResult[] | null>(null);
+  const [module3Products, setModule3Products] = useState<Product[]>([]);
+  const [module3Selected, setModule3Selected] = useState<Record<string, boolean>>({});
+  const [module3Results, setModule3Results] = useState<Module3Item[] | null>(null);
+  const [module3Busy, setModule3Busy] = useState(false);
+  // Per-product reviewed/edited proposal (keyed by product_id), the adopt set,
+  // the dry-run preview, and the executed-write results.
+  const [module3Adopt, setModule3Adopt] = useState<Record<string, boolean>>({});
+  const [module3Edited, setModule3Edited] = useState<Record<string, Module3Fields>>({});
+  const [module3Previews, setModule3Previews] = useState<Module3PushItem[] | null>(null);
+  const [module3Pushing, setModule3Pushing] = useState(false);
+  const [module3PushResults, setModule3PushResults] = useState<Module3PushItem[] | null>(null);
   const realModeRequiresLease = configStatus?.real_ozon_enabled ?? true;
   const ozonConfigReady = configStatus?.ozon.configured === true;
   const openAiConfigReady = configStatus?.openai.configured === true;
@@ -414,9 +479,16 @@ function App() {
   const localServiceReady = Boolean(health && isConnectedRuntime(runtime));
   const openClawBridgeReady = localServiceReady && Boolean(manifest?.tools?.length);
   const relistSelectedCount = relistProducts.filter((product) => relistSelected[product.product_id]).length;
+  const module3SelectedCount = module3Products.filter((product) => module3Selected[product.product_id]).length;
   const relistAdoptCount = relistResults
     ? relistResults.filter((item) => item.new_url && !item.error && relistAdopt[item.product_id]).length
     : 0;
+  const module3AdoptCount = module3Results
+    ? module3Results.filter((item) => item.proposal && !item.error && module3Adopt[item.product_id]).length
+    : 0;
+  // The live-write button stays disabled until a dry-run preview has been run
+  // for the currently-adopted set (no one-click unconfirmed writes).
+  const module3PreviewReady = Boolean(module3Previews && module3Previews.some((item) => item.preview));
   const setupSteps = [
     {
       number: "1",
@@ -906,6 +978,181 @@ function App() {
       setMessage(c.relist.msgGenFailed(c.messages.localServiceUnreachable));
     } finally {
       setRelistBusy(false);
+    }
+  }
+
+  async function loadModule3Products() {
+    if (!ensureOzonReadAccess(c.module3.loadProducts)) return;
+    try {
+      const response = await api("/tools/ozon.products.list", {
+        method: "POST",
+        body: JSON.stringify({ limit: 50, visibility: "VISIBLE" })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage(c.module3.msgLoadFailed(userFacingError(data.error)));
+        return;
+      }
+      const list = data as ProductListResult;
+      setModule3Products(list.products);
+      setModule3Selected({});
+      setModule3Results(null);
+      setMessage(c.module3.msgLoaded(list.products.length));
+    } catch {
+      setMessage(c.module3.msgLoadFailed(c.messages.localServiceUnreachable));
+    }
+  }
+
+  function toggleModule3Select(productId: string) {
+    setModule3Selected((prev) => ({ ...prev, [productId]: !prev[productId] }));
+  }
+
+  async function module3Recognize() {
+    if (!ensureOzonReadAccess(c.module3.recognize(0))) return;
+    const targets = module3Products
+      .filter((product) => module3Selected[product.product_id])
+      .map((product) => ({ product_id: product.product_id, offer_id: product.offer_id }));
+    if (targets.length === 0) {
+      setMessage(c.module3.msgSelectFirst);
+      return;
+    }
+    setModule3Busy(true);
+    setModule3Results(null);
+    setMessage(c.module3.msgRecognizing(targets.length));
+    try {
+      const response = await api("/tools/ozon.module3.recognize", {
+        method: "POST",
+        body: JSON.stringify({ targets, target_language: "ru" })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage(c.module3.msgRecognizeFailed(userFacingError(data.error)));
+        return;
+      }
+      const items = (data.items ?? []) as Module3Item[];
+      setModule3Results(items);
+      const adopt: Record<string, boolean> = {};
+      const edited: Record<string, Module3Fields> = {};
+      for (const item of items) {
+        if (item.proposal && !item.error) {
+          adopt[item.product_id] = true;
+          // Seed the editable buffer from the proposal so the operator edits a copy.
+          edited[item.product_id] = {
+            title: item.proposal.title,
+            description: item.proposal.description,
+            attributes: item.proposal.attributes.map((attr) => ({
+              name: attr.name,
+              values: [...attr.values]
+            })),
+            type_category: item.proposal.type_category
+          };
+        }
+      }
+      setModule3Adopt(adopt);
+      setModule3Edited(edited);
+      setModule3Previews(null);
+      setModule3PushResults(null);
+      const ok = items.filter((item) => item.proposal && !item.error).length;
+      setMessage(c.module3.msgRecognized(ok, items.length));
+    } catch {
+      setMessage(c.module3.msgRecognizeFailed(c.messages.localServiceUnreachable));
+    } finally {
+      setModule3Busy(false);
+    }
+  }
+
+  function toggleModule3Adopt(productId: string) {
+    setModule3Adopt((prev) => ({ ...prev, [productId]: !prev[productId] }));
+    // Editing the adopt set invalidates any prior dry-run preview.
+    setModule3Previews(null);
+    setModule3PushResults(null);
+  }
+
+  function editModule3Field(productId: string, field: "title" | "description", value: string) {
+    setModule3Edited((prev) => {
+      const current = prev[productId];
+      if (!current) return prev;
+      return { ...prev, [productId]: { ...current, [field]: value } };
+    });
+    setModule3Previews(null);
+    setModule3PushResults(null);
+  }
+
+  function module3AdoptedTargets() {
+    if (!module3Results) return [];
+    return module3Results
+      .filter((item) => item.proposal && !item.error && module3Adopt[item.product_id])
+      .map((item) => ({
+        product_id: item.product_id,
+        proposal: module3Edited[item.product_id] ?? (item.proposal as Module3Fields)
+      }));
+  }
+
+  async function previewModule3Push() {
+    const items = module3AdoptedTargets();
+    if (items.length === 0) {
+      setMessage(c.module3.msgAdoptFirst);
+      return;
+    }
+    setModule3Pushing(true);
+    setModule3PushResults(null);
+    setMessage(c.module3.msgPreviewing(items.length));
+    try {
+      // confirm omitted -> server returns dry-run previews and writes NOTHING.
+      const response = await api("/tools/ozon.module3.push", {
+        method: "POST",
+        body: JSON.stringify({ items })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage(c.module3.msgPushFailed(userFacingError(data.error)));
+        return;
+      }
+      const previews = (data.items ?? []) as Module3PushItem[];
+      setModule3Previews(previews);
+      const ok = previews.filter((item) => item.preview && !item.error).length;
+      setMessage(c.module3.msgPreviewed(ok, previews.length));
+    } catch {
+      setMessage(c.module3.msgPushFailed(c.messages.localServiceUnreachable));
+    } finally {
+      setModule3Pushing(false);
+    }
+  }
+
+  async function pushModule3() {
+    const items = module3AdoptedTargets();
+    if (items.length === 0) {
+      setMessage(c.module3.msgAdoptFirst);
+      return;
+    }
+    if (!module3PreviewReady) {
+      setMessage(c.module3.msgPreviewFirst);
+      return;
+    }
+    if (!window.confirm(c.module3.pushConfirm)) {
+      return;
+    }
+    setModule3Pushing(true);
+    setMessage(c.module3.msgPushing(items.length));
+    try {
+      // confirm=true -> server executes the live write after our explicit gate.
+      const response = await api("/tools/ozon.module3.push", {
+        method: "POST",
+        body: JSON.stringify({ items, confirm: true })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setMessage(c.module3.msgPushFailed(userFacingError(data.error)));
+        return;
+      }
+      const results = (data.items ?? []) as Module3PushItem[];
+      setModule3PushResults(results);
+      const ok = results.filter((item) => item.written && !item.error).length;
+      setMessage(c.module3.msgPushed(ok, results.length));
+    } catch {
+      setMessage(c.module3.msgPushFailed(c.messages.localServiceUnreachable));
+    } finally {
+      setModule3Pushing(false);
     }
   }
 
@@ -1441,6 +1688,9 @@ function App() {
         <button className={view === "workbench" ? "active" : ""} onClick={() => setView("workbench")}>
           <Sparkles size={16} /> {c.relist.tab}
         </button>
+        <button className={view === "copy" ? "active" : ""} onClick={() => setView("copy")}>
+          <FileText size={16} /> {c.module3.tab}
+        </button>
         <button className={view === "console" ? "active" : ""} onClick={() => setView("console")}>
           <SlidersHorizontal size={16} /> {c.relist.tabConsole}
         </button>
@@ -1610,6 +1860,200 @@ function App() {
                     ))}
                   </div>
                 )}
+              </>
+            )}
+          </div>
+        </section>
+      )}
+
+      {view === "copy" && (
+        <section className="workspace-grid relist-grid" id="module3-workbench">
+          <div className="panel relist-pick">
+            <div className="section-title">
+              <FileText />
+              <div>
+                <h2>{c.module3.title}</h2>
+                <p>{c.module3.description}</p>
+              </div>
+            </div>
+            {!canUseOzonReadTools && <p className="notice">{ozonReadGateMessage || c.gates.connectLocalFirst}</p>}
+            <div className="relist-toolbar">
+              <button onClick={loadModule3Products} disabled={!canUseOzonReadTools}>
+                <DatabaseZap size={16} /> {c.module3.loadProducts}
+              </button>
+              <button
+                className="secondary-button"
+                onClick={module3Recognize}
+                disabled={module3Busy || !canUseOzonReadTools || module3SelectedCount === 0}
+              >
+                <FileText size={16} /> {module3Busy ? c.module3.recognizing : c.module3.recognize(module3SelectedCount)}
+              </button>
+            </div>
+            <div className="product-list relist-list">
+              {module3Products.length === 0 && <p className="empty">{c.module3.emptyProducts}</p>}
+              {module3Products.map((product) => (
+                <label
+                  key={product.product_id}
+                  className={`relist-row ${module3Selected[product.product_id] ? "picked" : ""}`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={Boolean(module3Selected[product.product_id])}
+                    onChange={() => toggleModule3Select(product.product_id)}
+                  />
+                  <div>
+                    <strong>{product.offer_id}</strong>
+                    <span>{product.name ?? c.read.productFallback(product.product_id)}</span>
+                  </div>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <div className="panel relist-output">
+            <div className="section-title compact-title">
+              <Languages />
+              <div>
+                <h2>{c.module3.previewTitle}</h2>
+                <p>{c.module3.previewDescription}</p>
+              </div>
+            </div>
+            {!module3Results && <p className="empty">{c.module3.previewEmpty}</p>}
+            {module3Results && (
+              <>
+                <div className="relist-results">
+                  {module3Results.map((item) => {
+                    const edited = module3Edited[item.product_id];
+                    const previewItem = module3Previews?.find((entry) => entry.product_id === item.product_id);
+                    const writeResult = module3PushResults?.find((entry) => entry.product_id === item.product_id);
+                    return (
+                      <div
+                        className={`relist-card ${item.error ? "failed" : ""}`}
+                        key={`${item.product_id}-${item.offer_id}`}
+                      >
+                        <div className="relist-card-head">
+                          <strong>{item.offer_id || item.product_id}</strong>
+                        </div>
+                        {item.error && <p className="notice error">{userFacingError(item.error)}</p>}
+                        <div className="module3-ba">
+                          <div className="module3-col">
+                            <h4>{c.module3.before}</h4>
+                            {renderModule3Fields(item.source, c)}
+                          </div>
+                          <div className="module3-col">
+                            <h4>{c.module3.after}</h4>
+                            {item.proposal && edited ? (
+                              <div className="module3-edit">
+                                <label>
+                                  <span>{c.module3.fieldTitle}</span>
+                                  <input
+                                    type="text"
+                                    value={edited.title}
+                                    onChange={(event) => editModule3Field(item.product_id, "title", event.target.value)}
+                                  />
+                                </label>
+                                <label>
+                                  <span>{c.module3.fieldDescription}</span>
+                                  <textarea
+                                    rows={4}
+                                    value={edited.description}
+                                    onChange={(event) => editModule3Field(item.product_id, "description", event.target.value)}
+                                  />
+                                </label>
+                                {renderModule3Fields(
+                                  { ...item.proposal, title: edited.title, description: edited.description },
+                                  c
+                                )}
+                              </div>
+                            ) : (
+                              <p className="empty">{c.module3.noProposal}</p>
+                            )}
+                          </div>
+                        </div>
+                        {item.proposal && !item.error && (
+                          <label className="relist-adopt">
+                            <input
+                              type="checkbox"
+                              checked={Boolean(module3Adopt[item.product_id])}
+                              onChange={() => toggleModule3Adopt(item.product_id)}
+                            />
+                            {c.module3.adopt}
+                          </label>
+                        )}
+                        {previewItem?.preview && (
+                          <div className="module3-preview">
+                            <h5>{c.module3.previewHeading}</h5>
+                            <dl className="module3-fields">
+                              <dt>{c.module3.fieldTitle}</dt>
+                              <dd>
+                                <span className="module3-before">{previewItem.preview.title.before || "—"}</span>
+                                {" → "}
+                                <span className="module3-after">{previewItem.preview.title.after || "—"}</span>
+                              </dd>
+                              <dt>{c.module3.fieldDescription}</dt>
+                              <dd>
+                                <span className="module3-before">{previewItem.preview.description.before || "—"}</span>
+                                {" → "}
+                                <span className="module3-after">{previewItem.preview.description.after || "—"}</span>
+                              </dd>
+                            </dl>
+                            <p className="module3-matched-head">{c.module3.attributesToWrite(previewItem.preview.attributes_to_write.length)}</p>
+                            {previewItem.preview.attributes_to_write.length > 0 ? (
+                              <ul className="module3-attrs">
+                                {previewItem.preview.attributes_to_write.map((attr) => (
+                                  <li key={attr.attribute_id}>
+                                    <strong>{attr.name}</strong> (#{attr.attribute_id}): {attr.values.join(", ")}
+                                  </li>
+                                ))}
+                              </ul>
+                            ) : (
+                              <p className="empty">{c.module3.noneToWrite}</p>
+                            )}
+                            {previewItem.preview.dropped.length > 0 && (
+                              <>
+                                <p className="module3-dropped-head">{c.module3.droppedHeading(previewItem.preview.dropped.length)}</p>
+                                <ul className="module3-dropped">
+                                  {previewItem.preview.dropped.map((dropped, index) => (
+                                    <li key={`${dropped.name}-${dropped.value ?? ""}-${index}`}>
+                                      <strong>{dropped.name || "—"}</strong>
+                                      {dropped.value ? ` = ${dropped.value}` : ""} — {dropped.reason}
+                                    </li>
+                                  ))}
+                                </ul>
+                              </>
+                            )}
+                          </div>
+                        )}
+                        {writeResult && (
+                          <div className={`badge ${writeResult.written && !writeResult.error ? "ok" : "error"}`}>
+                            {writeResult.written && !writeResult.error
+                              ? c.module3.pushedOne(writeResult.offer_id || writeResult.product_id)
+                              : c.module3.pushFailedOne(writeResult.offer_id || writeResult.product_id, userFacingError(writeResult.error ?? ""))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="relist-push-row">
+                  <p className="relist-warn">{c.module3.pushWarning}</p>
+                  <div className="module3-actions">
+                    <button
+                      className="secondary-button"
+                      onClick={previewModule3Push}
+                      disabled={module3Pushing || module3AdoptCount === 0}
+                    >
+                      {module3Pushing && !module3PreviewReady ? c.module3.previewing : c.module3.previewPush(module3AdoptCount)}
+                    </button>
+                    <button
+                      onClick={pushModule3}
+                      disabled={module3Pushing || module3AdoptCount === 0 || !module3PreviewReady}
+                    >
+                      <Play size={16} /> {module3Pushing && module3PreviewReady ? c.module3.pushing : c.module3.push(module3AdoptCount)}
+                    </button>
+                  </div>
+                  {!module3PreviewReady && <p className="hint">{c.module3.previewFirstHint}</p>}
+                </div>
               </>
             )}
           </div>
@@ -2833,6 +3277,33 @@ async function restartRuntimeConfig(): Promise<RuntimeConfig> {
 }
 
 type LocalNodeCopy = ReturnType<typeof copyFor>;
+
+function renderModule3Fields(fields: Module3Fields, c: LocalNodeCopy) {
+  return (
+    <dl className="module3-fields">
+      <dt>{c.module3.fieldTitle}</dt>
+      <dd>{fields.title || <span className="empty">—</span>}</dd>
+      <dt>{c.module3.fieldDescription}</dt>
+      <dd>{fields.description || <span className="empty">—</span>}</dd>
+      <dt>{c.module3.fieldAttributes}</dt>
+      <dd>
+        {fields.attributes.length === 0 ? (
+          <span className="empty">—</span>
+        ) : (
+          <ul className="module3-attrs">
+            {fields.attributes.map((attribute, index) => (
+              <li key={`${attribute.name}-${index}`}>
+                <strong>{attribute.name || "—"}:</strong> {attribute.values.join("; ")}
+              </li>
+            ))}
+          </ul>
+        )}
+      </dd>
+      <dt>{c.module3.fieldTypeCategory}</dt>
+      <dd>{fields.type_category || <span className="empty">—</span>}</dd>
+    </dl>
+  );
+}
 
 function sidecarSummary(runtime: RuntimeConfig, c: LocalNodeCopy) {
   if (runtime.sidecar_status === "running" && runtime.sidecar_pid) {

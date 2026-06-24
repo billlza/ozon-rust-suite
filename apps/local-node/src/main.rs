@@ -21,8 +21,9 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use ozon_connector::{
-    MockOzonConnector, OzonCredentials, OzonProductListPage, OzonProductLookup, OzonReadConnector,
-    OzonWriteConnector,
+    MockOzonConnector, OzonCategoryAttribute, OzonCategoryAttributeValue, OzonCredentials,
+    OzonProductCopyUpdate, OzonProductListPage, OzonProductLookup, OzonReadConnector,
+    OzonResolvedAttribute, OzonResolvedValue, OzonWriteConnector,
 };
 use ozon_domain::{
     DryRunDiff, EntitlementLease, ExecutionReceipt, Feature, FieldChange, OperationKind, RiskLevel,
@@ -56,8 +57,8 @@ use uuid::Uuid;
 
 mod model_router;
 use model_router::{
-    Capability, CapabilityStatus, ProviderEntry, StoredModelRegistry, inspect_capabilities,
-    resolve_capability,
+    Capability, CapabilityStatus, ProviderEntry, ProviderKind, ResolvedProvider,
+    StoredModelRegistry, apply_auth, endpoint_for, inspect_capabilities, resolve_capability,
 };
 
 const DEFAULT_DEV_LOCAL_TOKEN: &str = "dev-local-token";
@@ -234,6 +235,11 @@ fn skill_router(state: LocalState) -> Router {
         .route("/tools/ozon.products.get", post(ozon_products_get))
         .route("/tools/ozon.relist.generate", post(relist_generate))
         .route("/tools/ozon.relist.push", post(relist_push))
+        .route(
+            "/tools/ozon.module3.recognize",
+            post(module3_recognize),
+        )
+        .route("/tools/ozon.module3.push", post(module3_push))
         .route("/poster/brief", post(poster_brief))
         .route("/poster/handoff", post(poster_handoff))
         .route("/poster/generate", post(poster_generate))
@@ -743,6 +749,22 @@ async fn openclaw_manifest(State(state): State<LocalState>) -> Json<OpenClawMani
                 risk: "read_only",
                 approval_required: false,
                 description: "Read one Ozon product fact pack with stable details and image URLs",
+            },
+            OpenClawTool {
+                name: "ozon.module3.recognize",
+                method: "POST",
+                path: "/tools/ozon.module3.recognize",
+                risk: "read_only",
+                approval_required: false,
+                description: "Read one Ozon product (title/description/attributes/category) plus its images and return a Russian, redistributed copy proposal; nothing is written back to Ozon",
+            },
+            OpenClawTool {
+                name: "ozon.module3.push",
+                method: "POST",
+                path: "/tools/ozon.module3.push",
+                risk: "write",
+                approval_required: true,
+                description: "Write a reviewed module-3 copy proposal (title/description/attributes) back to the LIVE Ozon store. Always returns a dry-run preview (before->after, matched + dropped attributes); only writes when called with confirm=true after operator review. Attribute names/values are re-matched against the Ozon category dictionary and any unmatched item is dropped (never written with a guessed id)",
             },
             OpenClawTool {
                 name: "poster.handoff",
@@ -3071,6 +3093,855 @@ async fn relist_generate(
     }))
 }
 
+// --------------------------------------------------------------------------- //
+// Module 3 ("copy") — recognize half (M3-PR1).                                //
+//                                                                             //
+// READ-ONLY: per product, read the 4 source fields, send them WITH the        //
+// product images to an OpenAI-compatible vision chat model, and return the    //
+// 4 REDISTRIBUTED fields as a reviewable Russian proposal. There is NO        //
+// write-back to Ozon and NO attribute-id remapping in this PR (M3-PR2).       //
+// --------------------------------------------------------------------------- //
+
+/// Max product images attached to the multimodal request, to bound tokens/cost.
+const MODULE3_MAX_IMAGES: usize = 6;
+const MODULE3_TITLE_MAX: usize = 200;
+const MODULE3_DESCRIPTION_MAX: usize = 1800;
+const MODULE3_MAX_BATCH: usize = RELIST_MAX_BATCH;
+const MODULE3_DEFAULT_LANGUAGE: &str = "ru";
+
+#[derive(Debug, Deserialize)]
+struct Module3RecognizeRequest {
+    #[serde(default)]
+    targets: Vec<RelistTarget>,
+    #[serde(default)]
+    target_language: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct Module3RecognizeResponse {
+    connector_mode: &'static str,
+    items: Vec<Module3Item>,
+}
+
+#[derive(Debug, Serialize)]
+struct Module3Item {
+    product_id: String,
+    offer_id: String,
+    source: Module3Fields,
+    proposal: Option<Module3Fields>,
+    error: Option<String>,
+}
+
+/// The 4 module-3 fields, in both the source (read from Ozon) and proposal
+/// (redistributed by the model) directions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Module3Fields {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    attributes: Vec<Module3Attribute>,
+    #[serde(default)]
+    type_category: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Module3Attribute {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    values: Vec<String>,
+}
+
+async fn module3_recognize(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Json(input): Json<Module3RecognizeRequest>,
+) -> Result<Json<Module3RecognizeResponse>, ApiError> {
+    require_bridge_or_operator_token(&state, &headers)?;
+    require_valid_lease_with_feature(&state, Feature::OzonRead).await?;
+    if input.targets.is_empty() {
+        return Err(ApiError::bad_request(
+            "select at least one product to recognize",
+        ));
+    }
+    if input.targets.len() > MODULE3_MAX_BATCH {
+        return Err(ApiError::bad_request(format!(
+            "recognize at most {MODULE3_MAX_BATCH} products per batch"
+        )));
+    }
+    let language = input
+        .target_language
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| MODULE3_DEFAULT_LANGUAGE.to_string());
+    let credentials = load_ozon_credentials(&state).await?;
+
+    let mut items = Vec::with_capacity(input.targets.len());
+    for target in input.targets {
+        let label = target.label();
+        match module3_recognize_one(&state, &credentials, target.into_lookup(), &language).await {
+            Ok(item) => items.push(item),
+            Err(error) => items.push(Module3Item {
+                product_id: String::new(),
+                offer_id: label,
+                source: Module3Fields::default(),
+                proposal: None,
+                error: Some(error),
+            }),
+        }
+    }
+
+    Ok(Json(Module3RecognizeResponse {
+        connector_mode: connector_mode(&state),
+        items,
+    }))
+}
+
+impl Default for Module3Fields {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            description: String::new(),
+            attributes: Vec::new(),
+            type_category: String::new(),
+        }
+    }
+}
+
+async fn module3_recognize_one(
+    state: &LocalState,
+    credentials: &OzonCredentials,
+    lookup: OzonProductLookup,
+    language: &str,
+) -> Result<Module3Item, String> {
+    let product = state
+        .ozon_connector
+        .product_get(credentials, lookup)
+        .await
+        .map_err(|error| format!("read product failed: {error}"))?;
+
+    let source = module3_source_fields(&product);
+    let document = module3_labeled_document(&source);
+    let images = module3_image_urls(&product);
+
+    // On any transport/parse failure, surface a per-item error and echo the raw
+    // source fields as the proposal so the operator still sees something.
+    let (proposal, error) =
+        match module3_request_proposal(state, language, &document, &images).await {
+            Ok(content) => match parse_module3_result(&content) {
+                Ok(mut fields) => {
+                    fields.title = word_boundary_truncate(&fields.title, MODULE3_TITLE_MAX);
+                    fields.description =
+                        word_boundary_truncate(&fields.description, MODULE3_DESCRIPTION_MAX);
+                    (Some(fields), None)
+                }
+                Err(parse_error) => (Some(source.clone()), Some(parse_error)),
+            },
+            Err(api_error) => (Some(source.clone()), Some(api_error.message)),
+        };
+
+    Ok(Module3Item {
+        product_id: product.product_id,
+        offer_id: product.offer_id,
+        source,
+        proposal,
+        error,
+    })
+}
+
+/// Read the 4 module-3 source fields off a product detail.
+fn module3_source_fields(product: &ozon_connector::OzonProductDetail) -> Module3Fields {
+    let title = product
+        .name
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    let description = product
+        .description
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    let attributes = product
+        .attributes
+        .iter()
+        .filter_map(|attribute| {
+            let name = attribute.name.as_deref().map(str::trim).unwrap_or("");
+            let values: Vec<String> = attribute
+                .values
+                .iter()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect();
+            if name.is_empty() && values.is_empty() {
+                return None;
+            }
+            Some(Module3Attribute {
+                name: name.to_string(),
+                values,
+            })
+        })
+        .collect();
+    let type_category = module3_type_category(product);
+    Module3Fields {
+        title,
+        description,
+        attributes,
+        type_category,
+    }
+}
+
+fn module3_type_category(product: &ozon_connector::OzonProductDetail) -> String {
+    let mut parts = Vec::new();
+    if let Some(type_id) = product.type_id {
+        parts.push(format!("type_id={type_id}"));
+    }
+    if let Some(category_id) = product.description_category_id {
+        parts.push(format!("description_category_id={category_id}"));
+    }
+    parts.join(", ")
+}
+
+/// Concatenate the 4 source fields into one labeled document for the model.
+fn module3_labeled_document(fields: &Module3Fields) -> String {
+    let mut attributes = String::new();
+    for attribute in &fields.attributes {
+        let name = if attribute.name.is_empty() {
+            "(без названия)"
+        } else {
+            attribute.name.as_str()
+        };
+        attributes.push_str(&format!("{name}: {}\n", attribute.values.join("; ")));
+    }
+    format!(
+        "===TITLE===\n{title}\n\n===DESCRIPTION===\n{description}\n\n===ATTRIBUTES===\n{attributes}\n===TYPE/CATEGORY===\n{type_category}",
+        title = fields.title,
+        description = fields.description,
+        attributes = attributes,
+        type_category = fields.type_category,
+    )
+}
+
+/// Ordered, deduped product image URLs (primary first), capped for cost.
+fn module3_image_urls(product: &ozon_connector::OzonProductDetail) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+    let mut push = |url: &str| {
+        let url = url.trim();
+        if url.is_empty() || urls.iter().any(|existing| existing == url) {
+            return;
+        }
+        urls.push(url.to_string());
+    };
+    if let Some(primary) = product.primary_image.as_deref() {
+        push(primary);
+    }
+    for image in &product.images {
+        push(&image.url);
+    }
+    for url in &product.gallery_images {
+        push(url);
+    }
+    urls.truncate(MODULE3_MAX_IMAGES);
+    urls
+}
+
+/// Build the system + user (multimodal) messages and call the chat codec.
+async fn module3_request_proposal(
+    state: &LocalState,
+    language: &str,
+    document: &str,
+    image_urls: &[String],
+) -> Result<String, ApiError> {
+    let system = format!(
+        "Ты — помощник по карточкам товаров маркетплейса Ozon. На основе исходных полей товара и его фотографий перераспредели и очисти контент по четырём полям. Выводи текст на языке с кодом \"{language}\" (по умолчанию русский). НИЧЕГО НЕ ВЫДУМЫВАЙ: используй только факты из исходного текста и изображений. Верни СТРОГО валидный JSON ровно с такими ключами: {{\"title\": строка, \"description\": строка, \"attributes\": [{{\"name\": строка, \"values\": [строка, ...]}}], \"type_category\": строка}}. Без markdown, без пояснений, только JSON."
+    );
+
+    let mut parts = vec![Module3ContentPart::Text {
+        text: format!(
+            "Исходные поля товара (перераспредели их по четырём полям):\n\n{document}"
+        ),
+    }];
+    for url in image_urls {
+        parts.push(Module3ContentPart::ImageUrl {
+            image_url: Module3ImageUrl { url: url.clone() },
+        });
+    }
+
+    let messages = vec![
+        ChatMessage {
+            role: "system",
+            content: ChatContent::Text(system),
+        },
+        ChatMessage {
+            role: "user",
+            content: ChatContent::Parts(parts),
+        },
+    ];
+
+    chat_completion(state, messages).await
+}
+
+// --- OpenAI-compatible chat-completion codec (multimodal) ------------------ //
+
+#[derive(Debug, Serialize)]
+struct ChatCompletionRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    temperature: f32,
+    max_tokens: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatMessage {
+    role: &'static str,
+    content: ChatContent,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ChatContent {
+    Text(String),
+    Parts(Vec<Module3ContentPart>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Module3ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: Module3ImageUrl },
+}
+
+#[derive(Debug, Serialize)]
+struct Module3ImageUrl {
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionResponse {
+    #[serde(default)]
+    choices: Vec<ChatCompletionChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionChoice {
+    #[serde(default)]
+    message: ChatCompletionMessage,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChatCompletionMessage {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+/// POST an OpenAI-compatible chat completion via the PR2 model-router seam and
+/// return `choices[0].message.content`. Uses `apply_auth` (not `bearer_auth`) so
+/// Header/Query-keyed providers also work.
+async fn chat_completion(
+    state: &LocalState,
+    messages: Vec<ChatMessage>,
+) -> Result<String, ApiError> {
+    let (base_url, model, api_key, auth) = match resolve_capability(state, Capability::TextGen)
+        .await?
+    {
+        ResolvedProvider::Generic {
+            kind: ProviderKind::OpenAiCompatChat,
+            base_url,
+            model,
+            api_key,
+            auth,
+        } => (base_url, model, api_key, auth),
+        ResolvedProvider::Generic { .. } => {
+            return Err(ApiError::bad_request(
+                "configured text/vision provider is not an OpenAI-compatible chat provider",
+            ));
+        }
+        ResolvedProvider::NotConfigured { reason, .. } => {
+            return Err(ApiError::bad_request(format!(
+                "text/vision provider is not configured: {reason}"
+            )));
+        }
+        ResolvedProvider::OpenAiImage(_) => {
+            return Err(ApiError::bad_request(
+                "text/vision provider is not configured",
+            ));
+        }
+    };
+
+    // No response_format: many OpenAI-compatible vision endpoints reject
+    // json_object mode (especially alongside image_url content). The recognizer
+    // system prompt demands strict JSON and the parser tolerantly strips
+    // fences/quotes before deserializing.
+    let request = ChatCompletionRequest {
+        model,
+        messages,
+        temperature: 0.2,
+        max_tokens: 2048,
+    };
+
+    let endpoint = endpoint_for(ProviderKind::OpenAiCompatChat, &base_url);
+    let builder = state.http_client.post(endpoint).json(&request);
+    let response = apply_auth(builder, &auth, &api_key)
+        .send()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("chat request failed: {error}")))?;
+
+    if !response.status().is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "unknown error".to_string());
+        return Err(ApiError::bad_gateway(format!(
+            "chat completion failed: {}",
+            summarize_openai_error(&body)
+        )));
+    }
+
+    let payload: ChatCompletionResponse = response
+        .json()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("invalid chat response: {error}")))?;
+    payload
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|choice| choice.message.content)
+        .map(|content| content.trim().to_string())
+        .filter(|content| !content.is_empty())
+        .ok_or_else(|| ApiError::bad_gateway("chat completion returned no content"))
+}
+
+/// Strip one enclosing markdown code fence and/or one enclosing quote pair, then
+/// parse the JSON into a `Module3Fields`. Mirrors `textgen.py:53-56` quote
+/// stripping plus tolerant fenced-block handling.
+fn parse_module3_result(content: &str) -> Result<Module3Fields, String> {
+    let cleaned = strip_json_wrappers(content);
+    serde_json::from_str::<Module3Fields>(&cleaned)
+        .map_err(|error| format!("could not parse model JSON: {error}"))
+}
+
+// --------------------------------------------------------------------------- //
+// Module 3 ("copy") — push half (M3-PR2).                                     //
+//                                                                             //
+// WRITE-BACK to the LIVE store. A push is gated: it ALWAYS runs a dry-run     //
+// preview (before -> after for title/description + the matched/dropped        //
+// attributes) and only writes when the caller passes an explicit confirm.     //
+//                                                                             //
+// SAFETY: attribute names + value strings from the (human-reviewed) proposal  //
+// are re-matched against the Ozon category dictionary by NORMALIZED EXACT     //
+// match only. Anything that does not match is DROPPED + reported — never      //
+// written with a guessed numeric id.                                          //
+// --------------------------------------------------------------------------- //
+
+#[derive(Debug, Deserialize)]
+struct Module3PushRequest {
+    #[serde(default)]
+    items: Vec<Module3PushTarget>,
+    /// Must be `true` to actually write. Absent/false = dry-run preview only.
+    #[serde(default)]
+    confirm: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct Module3PushTarget {
+    /// Numeric Ozon product id (used to read the live product + its category).
+    product_id: String,
+    /// The reviewed/edited proposal to write back.
+    proposal: Module3Fields,
+}
+
+#[derive(Debug, Serialize)]
+struct Module3PushResponse {
+    connector_mode: &'static str,
+    /// Echoes whether this was an executed write (`true`) or a dry-run (`false`).
+    confirmed: bool,
+    items: Vec<Module3PushItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct Module3PushItem {
+    product_id: String,
+    offer_id: String,
+    /// The dry-run preview is ALWAYS present, even on a confirmed write.
+    preview: Option<Module3PushPreview>,
+    /// Only set on a confirmed, executed write.
+    written: bool,
+    task_id: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Module3FieldChange {
+    before: String,
+    after: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Module3PushPreview {
+    title: Module3FieldChange,
+    description: Module3FieldChange,
+    attributes_to_write: Vec<Module3MatchedAttribute>,
+    dropped: Vec<Module3DroppedItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Module3MatchedAttribute {
+    attribute_id: u64,
+    name: String,
+    /// Human-readable values that WILL be written (display strings).
+    values: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct Module3DroppedItem {
+    /// The proposal attribute name this drop is about.
+    name: String,
+    /// The specific value dropped (None when the whole attribute name is unmatched).
+    value: Option<String>,
+    reason: String,
+}
+
+/// Internal result of the pure re-match step: resolved (numeric-id) attributes
+/// plus the human-readable preview rows and dropped report.
+struct Module3MatchOutcome {
+    resolved: Vec<OzonResolvedAttribute>,
+    matched: Vec<Module3MatchedAttribute>,
+    dropped: Vec<Module3DroppedItem>,
+}
+
+/// Normalize a name/value for conservative exact matching: trim, case-fold, and
+/// collapse internal whitespace. No fuzzy/semantic transforms.
+fn module3_normalize(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Pure re-match: map proposal attributes [{name, values}] against the fetched
+/// category dictionary. Dictionary-typed attributes require a value_id match
+/// (unmatched values dropped); free-text attributes pass the string through.
+/// Unmatched attribute NAMES are dropped wholesale. NOTHING is ever assigned a
+/// guessed id.
+fn module3_match_attributes(
+    proposal: &[Module3Attribute],
+    dictionary: &[OzonCategoryAttribute],
+    values_by_attribute: &HashMap<u64, Vec<OzonCategoryAttributeValue>>,
+) -> Module3MatchOutcome {
+    let mut resolved: Vec<OzonResolvedAttribute> = Vec::new();
+    let mut matched: Vec<Module3MatchedAttribute> = Vec::new();
+    let mut dropped: Vec<Module3DroppedItem> = Vec::new();
+
+    for attribute in proposal {
+        let raw_name = attribute.name.trim();
+        if raw_name.is_empty() {
+            dropped.push(Module3DroppedItem {
+                name: String::new(),
+                value: None,
+                reason: "empty attribute name".to_string(),
+            });
+            continue;
+        }
+        let normalized_name = module3_normalize(raw_name);
+        let Some(definition) = dictionary
+            .iter()
+            .find(|candidate| module3_normalize(&candidate.name) == normalized_name)
+        else {
+            dropped.push(Module3DroppedItem {
+                name: raw_name.to_string(),
+                value: None,
+                reason: "attribute name not in category dictionary".to_string(),
+            });
+            continue;
+        };
+
+        let mut resolved_values: Vec<OzonResolvedValue> = Vec::new();
+        let mut matched_values: Vec<String> = Vec::new();
+
+        for raw_value in &attribute.values {
+            let value = raw_value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            if definition.is_dictionary() {
+                let normalized_value = module3_normalize(value);
+                let candidate = values_by_attribute
+                    .get(&definition.id)
+                    .and_then(|values| {
+                        values
+                            .iter()
+                            .find(|entry| module3_normalize(&entry.value) == normalized_value)
+                    });
+                match candidate {
+                    Some(entry) => {
+                        resolved_values.push(OzonResolvedValue::Dictionary {
+                            dictionary_value_id: entry.value_id,
+                        });
+                        matched_values.push(entry.value.clone());
+                    }
+                    None => dropped.push(Module3DroppedItem {
+                        name: raw_name.to_string(),
+                        value: Some(value.to_string()),
+                        reason: "value not in attribute dictionary".to_string(),
+                    }),
+                }
+            } else {
+                resolved_values.push(OzonResolvedValue::FreeText {
+                    value: value.to_string(),
+                });
+                matched_values.push(value.to_string());
+            }
+        }
+
+        if resolved_values.is_empty() {
+            // Name matched but no value survived: report it (no empty write).
+            if !definition.is_dictionary() {
+                dropped.push(Module3DroppedItem {
+                    name: raw_name.to_string(),
+                    value: None,
+                    reason: "no non-empty values to write".to_string(),
+                });
+            }
+            continue;
+        }
+
+        resolved.push(OzonResolvedAttribute {
+            attribute_id: definition.id,
+            values: resolved_values,
+        });
+        matched.push(Module3MatchedAttribute {
+            attribute_id: definition.id,
+            name: definition.name.clone(),
+            values: matched_values,
+        });
+    }
+
+    Module3MatchOutcome {
+        resolved,
+        matched,
+        dropped,
+    }
+}
+
+async fn module3_push(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Json(input): Json<Module3PushRequest>,
+) -> Result<Json<Module3PushResponse>, ApiError> {
+    require_bridge_or_operator_token(&state, &headers)?;
+    // Mirrors the relist push gate (same feature): a valid lease with write-
+    // capable Ozon access is required before any preview or write.
+    require_valid_lease_with_feature(&state, Feature::OzonRead).await?;
+    if input.items.is_empty() {
+        return Err(ApiError::bad_request("nothing to push"));
+    }
+    if input.items.len() > MODULE3_MAX_BATCH {
+        return Err(ApiError::bad_request(format!(
+            "push at most {MODULE3_MAX_BATCH} products per batch"
+        )));
+    }
+    let credentials = load_ozon_credentials(&state).await?;
+
+    let mut items = Vec::with_capacity(input.items.len());
+    for target in input.items {
+        match module3_push_one(&state, &credentials, &target, input.confirm).await {
+            Ok(item) => items.push(item),
+            Err(error) => items.push(Module3PushItem {
+                product_id: target.product_id.clone(),
+                offer_id: String::new(),
+                preview: None,
+                written: false,
+                task_id: None,
+                error: Some(error),
+            }),
+        }
+    }
+
+    Ok(Json(Module3PushResponse {
+        connector_mode: connector_mode(&state),
+        confirmed: input.confirm,
+        items,
+    }))
+}
+
+async fn module3_push_one(
+    state: &LocalState,
+    credentials: &OzonCredentials,
+    target: &Module3PushTarget,
+    confirm: bool,
+) -> Result<Module3PushItem, String> {
+    // 1) Read the LIVE product to get the before-values + the category/type that
+    //    scopes the attribute dictionary. Always re-read at push time so the
+    //    "before" and the dictionary reflect the current live listing.
+    let lookup = OzonProductLookup {
+        product_id: Some(target.product_id.clone()),
+        offer_id: None,
+        sku: None,
+    }
+    .normalized();
+    let product = state
+        .ozon_connector
+        .product_get(credentials, lookup)
+        .await
+        .map_err(|error| format!("read product failed: {error}"))?;
+
+    let description_category_id = product
+        .description_category_id
+        .ok_or_else(|| "product has no description_category_id; cannot resolve attributes".to_string())?;
+    let type_id = product
+        .type_id
+        .ok_or_else(|| "product has no type_id; cannot resolve attributes".to_string())?;
+
+    // 2) Fetch the category attribute dictionary, then the value dictionaries for
+    //    each dictionary-typed attribute the proposal actually references.
+    let dictionary = state
+        .ozon_writer
+        .description_category_attributes(credentials, description_category_id, type_id)
+        .await
+        .map_err(|error| format!("read category attributes failed: {error}"))?;
+
+    let referenced_ids = module3_referenced_dictionary_ids(&target.proposal.attributes, &dictionary);
+    let mut values_by_attribute: HashMap<u64, Vec<OzonCategoryAttributeValue>> = HashMap::new();
+    for attribute_id in referenced_ids {
+        let values = state
+            .ozon_writer
+            .description_category_attribute_values(
+                credentials,
+                description_category_id,
+                type_id,
+                attribute_id,
+            )
+            .await
+            .map_err(|error| format!("read attribute values failed: {error}"))?;
+        values_by_attribute.insert(attribute_id, values);
+    }
+
+    // 3) Pure re-match (no I/O). Drops + reports anything unmatched.
+    let outcome =
+        module3_match_attributes(&target.proposal.attributes, &dictionary, &values_by_attribute);
+
+    let before_title = product.name.clone().unwrap_or_default();
+    let before_description = product.description.clone().unwrap_or_default();
+    let after_title = word_boundary_truncate(target.proposal.title.trim(), MODULE3_TITLE_MAX);
+    let after_description =
+        word_boundary_truncate(target.proposal.description.trim(), MODULE3_DESCRIPTION_MAX);
+
+    let preview = Module3PushPreview {
+        title: Module3FieldChange {
+            before: before_title,
+            after: after_title.clone(),
+        },
+        description: Module3FieldChange {
+            before: before_description,
+            after: after_description.clone(),
+        },
+        attributes_to_write: outcome.matched.clone(),
+        dropped: outcome.dropped.clone(),
+    };
+
+    // 4) DRY-RUN: without an explicit confirm, return the preview and write
+    //    NOTHING. This is the only path AI/bridge callers can reach by default.
+    if !confirm {
+        return Ok(Module3PushItem {
+            product_id: product.product_id,
+            offer_id: product.offer_id,
+            preview: Some(preview),
+            written: false,
+            task_id: None,
+            error: None,
+        });
+    }
+
+    // 5) Confirmed write: send only the matched (resolved-id) attributes plus the
+    //    title/description. `name`/`description` are only sent when non-empty.
+    let update = OzonProductCopyUpdate {
+        offer_id: product.offer_id.clone(),
+        name: Some(after_title).filter(|value| !value.is_empty()),
+        description: Some(after_description).filter(|value| !value.is_empty()),
+        attributes: outcome.resolved,
+    };
+    let result = state
+        .ozon_writer
+        .product_update_copy(credentials, update)
+        .await
+        .map_err(|error| format!("product update failed: {error}"))?;
+
+    Ok(Module3PushItem {
+        product_id: product.product_id,
+        offer_id: product.offer_id,
+        preview: Some(preview),
+        written: result.accepted,
+        task_id: result.task_id,
+        error: None,
+    })
+}
+
+/// Collect the numeric attribute ids of the dictionary-typed attributes that the
+/// proposal references by name (so we only fetch the value dictionaries we need).
+fn module3_referenced_dictionary_ids(
+    proposal: &[Module3Attribute],
+    dictionary: &[OzonCategoryAttribute],
+) -> Vec<u64> {
+    let mut ids: Vec<u64> = Vec::new();
+    for attribute in proposal {
+        let normalized_name = module3_normalize(attribute.name.trim());
+        if normalized_name.is_empty() {
+            continue;
+        }
+        if let Some(definition) = dictionary
+            .iter()
+            .find(|candidate| module3_normalize(&candidate.name) == normalized_name)
+        {
+            if definition.is_dictionary() && !ids.contains(&definition.id) {
+                ids.push(definition.id);
+            }
+        }
+    }
+    ids
+}
+
+fn strip_json_wrappers(content: &str) -> String {
+    let mut out = content.trim().to_string();
+    // Strip one enclosing markdown code fence (```json ... ``` or ``` ... ```).
+    if out.starts_with("```") {
+        if let Some(rest) = out.strip_prefix("```") {
+            let rest = rest.strip_prefix("json").unwrap_or(rest);
+            let rest = rest.strip_prefix("JSON").unwrap_or(rest);
+            let rest = rest.trim_start_matches('\n');
+            if let Some(inner) = rest.strip_suffix("```") {
+                out = inner.trim().to_string();
+            } else {
+                out = rest.trim().to_string();
+            }
+        }
+    }
+    // Strip a single enclosing quote pair (mirrors textgen.py:53-56).
+    let chars: Vec<char> = out.chars().collect();
+    if chars.len() >= 2 {
+        let first = chars[0];
+        let last = chars[chars.len() - 1];
+        if matches!(first, '"' | '\'' | '«') && matches!(last, '"' | '\'' | '»') {
+            out = chars[1..chars.len() - 1].iter().collect::<String>();
+            out = out.trim().to_string();
+        }
+    }
+    out
+}
+
+/// Hard cap on character count, cut on a word boundary (mirrors relist.py:125-152).
+fn word_boundary_truncate(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let cut: String = trimmed.chars().take(max_chars).collect();
+    let cut = match cut.rfind(' ') {
+        Some(index) => &cut[..index],
+        None => cut.as_str(),
+    };
+    cut.trim_end().to_string()
+}
+
 /// Build the per-product Russian-Ozon prompt: the product name (+ a few real
 /// attributes) up front so the model's headline & selling points are accurate,
 /// followed by the fixed rules.
@@ -4363,6 +5234,147 @@ mod tests {
 
     use super::*;
 
+    fn dict_attr(id: u64, name: &str, dictionary_id: u64) -> OzonCategoryAttribute {
+        OzonCategoryAttribute {
+            id,
+            name: name.to_string(),
+            is_collection: false,
+            dictionary_id,
+            attribute_type: None,
+        }
+    }
+
+    fn proposal_attr(name: &str, values: &[&str]) -> Module3Attribute {
+        Module3Attribute {
+            name: name.to_string(),
+            values: values.iter().map(|value| value.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn module3_match_exact_dictionary_and_freetext() {
+        let dictionary = vec![dict_attr(85, "Brand", 0), dict_attr(10096, "Color", 901)];
+        let mut values = HashMap::new();
+        values.insert(
+            10096,
+            vec![OzonCategoryAttributeValue {
+                value_id: 5001,
+                value: "Graphite".to_string(),
+            }],
+        );
+        let proposal = vec![
+            proposal_attr("Brand", &["Acme"]),
+            proposal_attr("Color", &["Graphite"]),
+        ];
+
+        let outcome = module3_match_attributes(&proposal, &dictionary, &values);
+
+        assert_eq!(outcome.dropped.len(), 0);
+        assert_eq!(outcome.resolved.len(), 2);
+        // Free-text brand passes the raw string through.
+        let brand = outcome.resolved.iter().find(|a| a.attribute_id == 85).unwrap();
+        assert!(matches!(&brand.values[0], OzonResolvedValue::FreeText { value } if value == "Acme"));
+        // Dictionary color resolves to a numeric value_id.
+        let color = outcome.resolved.iter().find(|a| a.attribute_id == 10096).unwrap();
+        assert!(matches!(
+            &color.values[0],
+            OzonResolvedValue::Dictionary { dictionary_value_id: 5001 }
+        ));
+    }
+
+    #[test]
+    fn module3_match_is_case_and_whitespace_insensitive() {
+        let dictionary = vec![dict_attr(10096, "Color", 901)];
+        let mut values = HashMap::new();
+        values.insert(
+            10096,
+            vec![OzonCategoryAttributeValue {
+                value_id: 5001,
+                value: "Graphite Grey".to_string(),
+            }],
+        );
+        // Mixed case + extra/internal whitespace on both name and value.
+        let proposal = vec![proposal_attr("  cOLOR ", &["  graphite   grey "])];
+
+        let outcome = module3_match_attributes(&proposal, &dictionary, &values);
+
+        assert_eq!(outcome.dropped.len(), 0);
+        assert_eq!(outcome.resolved.len(), 1);
+        assert!(matches!(
+            &outcome.resolved[0].values[0],
+            OzonResolvedValue::Dictionary { dictionary_value_id: 5001 }
+        ));
+    }
+
+    #[test]
+    fn module3_match_drops_unmatched_attribute_name() {
+        let dictionary = vec![dict_attr(85, "Brand", 0)];
+        let values = HashMap::new();
+        let proposal = vec![proposal_attr("Totally Unknown", &["whatever"])];
+
+        let outcome = module3_match_attributes(&proposal, &dictionary, &values);
+
+        assert!(outcome.resolved.is_empty());
+        assert_eq!(outcome.matched.len(), 0);
+        assert_eq!(outcome.dropped.len(), 1);
+        assert_eq!(outcome.dropped[0].name, "Totally Unknown");
+        assert!(outcome.dropped[0].value.is_none());
+        assert!(outcome.dropped[0].reason.contains("not in category dictionary"));
+    }
+
+    #[test]
+    fn module3_match_drops_unmatched_dictionary_value() {
+        let dictionary = vec![dict_attr(10096, "Color", 901)];
+        let mut values = HashMap::new();
+        values.insert(
+            10096,
+            vec![OzonCategoryAttributeValue {
+                value_id: 5001,
+                value: "Graphite".to_string(),
+            }],
+        );
+        // Name matches, value does NOT exist in the dictionary -> value dropped,
+        // and since no value survives the attribute is not written at all.
+        let proposal = vec![proposal_attr("Color", &["Neon Pink"])];
+
+        let outcome = module3_match_attributes(&proposal, &dictionary, &values);
+
+        assert!(outcome.resolved.is_empty());
+        assert_eq!(outcome.dropped.len(), 1);
+        assert_eq!(outcome.dropped[0].value.as_deref(), Some("Neon Pink"));
+        assert!(outcome.dropped[0].reason.contains("not in attribute dictionary"));
+    }
+
+    #[test]
+    fn module3_match_freetext_passthrough_without_dictionary_fetch() {
+        let dictionary = vec![dict_attr(85, "Brand", 0)];
+        // No value dictionary provided at all — free-text must still pass.
+        let values = HashMap::new();
+        let proposal = vec![proposal_attr("Brand", &["Made-Up Co"])];
+
+        let outcome = module3_match_attributes(&proposal, &dictionary, &values);
+
+        assert_eq!(outcome.dropped.len(), 0);
+        assert_eq!(outcome.resolved.len(), 1);
+        assert_eq!(outcome.resolved[0].attribute_id, 85);
+        assert!(matches!(
+            &outcome.resolved[0].values[0],
+            OzonResolvedValue::FreeText { value } if value == "Made-Up Co"
+        ));
+    }
+
+    #[test]
+    fn module3_referenced_ids_only_includes_dictionary_typed_matches() {
+        let dictionary = vec![dict_attr(85, "Brand", 0), dict_attr(10096, "Color", 901)];
+        let proposal = vec![
+            proposal_attr("Brand", &["Acme"]),
+            proposal_attr("Color", &["Graphite"]),
+            proposal_attr("Unknown", &["x"]),
+        ];
+        let ids = module3_referenced_dictionary_ids(&proposal, &dictionary);
+        assert_eq!(ids, vec![10096]);
+    }
+
     fn test_state() -> LocalState {
         LocalState::new_with_secret_store(test_config(), Arc::new(MemorySecretStore::default()))
             .expect("local state")
@@ -4818,6 +5830,7 @@ mod tests {
             name: Some("Pocket lighter".to_string()),
             description_category_id: None,
             type_id: None,
+            description: None,
             barcodes: vec![],
             primary_image: Some("https://cdn.example.test/product.jpg".to_string()),
             images: vec![ozon_connector::OzonProductImage {
@@ -4867,6 +5880,7 @@ mod tests {
             name: Some("Pocket lighter".to_string()),
             description_category_id: None,
             type_id: None,
+            description: None,
             barcodes: vec![],
             primary_image: Some("https://cdn.example.test/product.jpg".to_string()),
             images: vec![ozon_connector::OzonProductImage {
@@ -5094,5 +6108,72 @@ mod tests {
         config.openclaw_token = DEFAULT_DEV_OPENCLAW_TOKEN.to_string();
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn module3_parses_fenced_and_quoted_json() {
+        let fenced = "```json\n{\"title\":\"T\",\"description\":\"D\",\"attributes\":[{\"name\":\"Цвет\",\"values\":[\"красный\"]}],\"type_category\":\"type_id=1\"}\n```";
+        let parsed = parse_module3_result(fenced).expect("fenced json");
+        assert_eq!(parsed.title, "T");
+        assert_eq!(parsed.description, "D");
+        assert_eq!(parsed.attributes.len(), 1);
+        assert_eq!(parsed.attributes[0].name, "Цвет");
+        assert_eq!(parsed.type_category, "type_id=1");
+
+        let plain = "{\"title\":\"X\",\"description\":\"\",\"attributes\":[],\"type_category\":\"\"}";
+        assert_eq!(parse_module3_result(plain).expect("plain").title, "X");
+
+        assert!(parse_module3_result("not json").is_err());
+    }
+
+    #[test]
+    fn module3_word_boundary_truncation_caps_on_space() {
+        let value = "alpha beta gamma delta";
+        // 12 chars lands mid-"gamma"; we cut back to the last full word.
+        assert_eq!(word_boundary_truncate(value, 12), "alpha beta");
+        assert_eq!(word_boundary_truncate("short", 200), "short");
+    }
+
+    #[test]
+    fn module3_labeled_document_has_all_four_sections() {
+        let fields = Module3Fields {
+            title: "Title".to_string(),
+            description: "Desc".to_string(),
+            attributes: vec![Module3Attribute {
+                name: "Brand".to_string(),
+                values: vec!["Acme".to_string(), "Co".to_string()],
+            }],
+            type_category: "type_id=20001, description_category_id=10001".to_string(),
+        };
+        let doc = module3_labeled_document(&fields);
+        assert!(doc.contains("===TITLE===\nTitle"));
+        assert!(doc.contains("===DESCRIPTION===\nDesc"));
+        assert!(doc.contains("Brand: Acme; Co"));
+        assert!(doc.contains("===TYPE/CATEGORY===\ntype_id=20001"));
+    }
+
+    #[tokio::test]
+    async fn module3_source_fields_cap_images_at_six() {
+        let connector = MockOzonConnector;
+        let credentials = OzonCredentials {
+            client_id: "mock".to_string(),
+            api_key: SecretString::from("mock"),
+        };
+        let detail = connector
+            .product_get(
+                &credentials,
+                OzonProductLookup {
+                    product_id: Some("mock-product-1".to_string()),
+                    offer_id: None,
+                    sku: None,
+                },
+            )
+            .await
+            .expect("detail");
+        let fields = module3_source_fields(&detail);
+        assert_eq!(fields.title, "Mock Ozon product 2");
+        assert_eq!(fields.description, "Mock Ozon description for product 2");
+        assert!(fields.type_category.contains("type_id="));
+        assert!(module3_image_urls(&detail).len() <= MODULE3_MAX_IMAGES);
     }
 }
