@@ -2,14 +2,22 @@ import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
+  ArrowRight,
+  Boxes,
+  Clapperboard,
   CheckCircle2,
   Clipboard,
+  Cpu,
   DatabaseZap,
   Eye,
   EyeOff,
+  FileSpreadsheet,
   Image as ImageIcon,
   KeyRound,
+  Languages,
+  Layers,
   ListChecks,
+  PackagePlus,
   PauseCircle,
   Play,
   Radio,
@@ -303,6 +311,15 @@ type ConfigStatus = {
     agent_api: string;
     manifest_url: string;
   };
+  capabilities?: {
+    capability: string;
+    ready: boolean;
+    provider_kind?: string | null;
+    base_url?: string | null;
+    model?: string | null;
+    secret_present?: boolean;
+    issue?: string | null;
+  }[];
 };
 
 type ValidationResult = {
@@ -379,6 +396,8 @@ function App() {
   const [scheduleInterval, setScheduleInterval] = useState(900);
   const [scheduleLimit, setScheduleLimit] = useState(20);
   const [view, setView] = useState<"workbench" | "console">("workbench");
+  const [cockpitOpen, setCockpitOpen] = useState(false);
+  const [cockpitRefreshing, setCockpitRefreshing] = useState(false);
   const [relistProducts, setRelistProducts] = useState<Product[]>([]);
   const [relistSelected, setRelistSelected] = useState<Record<string, boolean>>({});
   const [relistResults, setRelistResults] = useState<RelistItem[] | null>(null);
@@ -444,6 +463,120 @@ function App() {
     const done = tasks.filter((task) => task.state === "succeeded").length;
     return { pending, queued, done };
   }, [tasks]);
+
+  const cockpitNodes = useMemo(
+    () =>
+      buildCockpitNodes(c, {
+        nodeUp: localServiceReady,
+        bridge: openClawBridgeReady,
+        lease: leaseReady,
+        secretBackend: configStatus?.secret_store.backend ?? null,
+        secretAvailable: configStatus?.secret_store.available ?? false,
+        ozon: ozonConfigReady,
+        openai: openAiConfigReady,
+        connector: configStatus?.connector_mode ?? runtime.connector_mode,
+        posterReady: Boolean(
+          configStatus?.poster_generation?.openclaw_bridge_ready ||
+            configStatus?.poster_generation?.api_fallback_configured
+        ),
+        imageRouting: Boolean(
+          configStatus?.capabilities?.find((x) => x.capability === "image_gen")?.ready
+        )
+      }),
+    [
+      c,
+      localServiceReady,
+      openClawBridgeReady,
+      leaseReady,
+      configStatus,
+      ozonConfigReady,
+      openAiConfigReady,
+      runtime.connector_mode
+    ]
+  );
+
+  const cockpitSummary = useMemo<CockpitSummary>(() => {
+    const counts = { live: 0, partial: 0, isolated: 0, missing: 0 };
+    let wiredOk = 0;
+    let wiredTotal = 0;
+    for (const node of cockpitNodes) {
+      counts[node.status] += 1;
+      for (const chip of node.chips) {
+        wiredTotal += 1;
+        if (chip.state === "ok") {
+          wiredOk += 1;
+        } else if (chip.state === "wip") {
+          wiredOk += 0.5;
+        }
+      }
+    }
+    return {
+      counts,
+      live: counts.live,
+      total: cockpitNodes.length,
+      wiredPct: wiredTotal ? Math.round((wiredOk / wiredTotal) * 100) : 0,
+      buildCommit: health?.build_commit ?? null,
+      version: health?.package_version ?? null,
+      connector: configStatus?.connector_mode ?? runtime.connector_mode,
+      lease: leaseReady,
+      nodeUp: localServiceReady,
+      checkedAt: configStatus?.checked_at ? new Date(configStatus.checked_at).toLocaleTimeString() : null
+    };
+  }, [cockpitNodes, health, configStatus, runtime.connector_mode, leaseReady, localServiceReady]);
+
+  const cockpitLive = useMemo<Record<number, { label: string; value: string }[]>>(() => {
+    const labels = c.cockpit.metrics;
+    const dash = "—";
+    const leaseExpiry = configStatus?.lease.expires_at
+      ? new Date(configStatus.lease.expires_at).toLocaleDateString()
+      : dash;
+    return {
+      0: [
+        { label: labels.observing, value: "7" },
+        { label: labels.tools, value: String(manifest?.tools?.length ?? 0) }
+      ],
+      1: [
+        { label: labels.products, value: productCount != null ? String(productCount) : dash },
+        { label: labels.connector, value: configStatus?.connector_mode ?? runtime.connector_mode }
+      ],
+      2: [
+        { label: labels.pending, value: String(queueStats.pending) },
+        { label: labels.queued, value: String(queueStats.queued) },
+        { label: labels.adopted, value: String(relistAdoptCount) }
+      ],
+      3: [{ label: labels.model, value: openAiConfigReady ? openAiImageModel : dash }],
+      4: [{ label: labels.runtime, value: labels.none }],
+      5: [
+        { label: labels.features, value: String(health?.features?.length ?? 0) },
+        { label: labels.leaseExp, value: leaseExpiry },
+        { label: labels.secret, value: configStatus?.secret_store.backend ?? dash }
+      ],
+      6: [{ label: labels.runtime, value: labels.none }]
+    };
+  }, [
+    c,
+    manifest,
+    productCount,
+    configStatus,
+    runtime.connector_mode,
+    queueStats,
+    relistAdoptCount,
+    openAiConfigReady,
+    openAiImageModel,
+    health
+  ]);
+
+  async function refreshCockpit() {
+    if (cockpitRefreshing) {
+      return;
+    }
+    setCockpitRefreshing(true);
+    try {
+      await Promise.all([checkHealth(), refresh()]);
+    } finally {
+      setCockpitRefreshing(false);
+    }
+  }
 
   useEffect(() => {
     window.localStorage.setItem("ozon-local-locale", locale);
@@ -1299,6 +1432,9 @@ function App() {
           </select>
         </label>
         <span className={health ? "ok" : "warn"}>{health ? c.app.ready : c.app.offline}</span>
+        <button className="nav-cockpit" onClick={() => setCockpitOpen(true)} title={c.cockpit.title}>
+          <Boxes size={15} /> {c.cockpit.tab}
+        </button>
       </nav>
 
       <div className="view-tabs">
@@ -2110,12 +2246,559 @@ function App() {
         </>
       )}
 
+      {cockpitOpen && (
+        <CockpitView
+          c={c}
+          nodes={cockpitNodes}
+          summary={cockpitSummary}
+          live={cockpitLive}
+          refreshing={cockpitRefreshing}
+          onRefresh={refreshCockpit}
+          onClose={() => setCockpitOpen(false)}
+          eventState={eventState}
+        />
+      )}
+
       <footer>
         <TerminalSquare size={18} />
         <span>{message}</span>
         {health ? <CheckCircle2 size={18} /> : <XCircle size={18} />}
       </footer>
     </main>
+  );
+}
+
+type CockpitStatus = "live" | "partial" | "isolated" | "missing";
+type CockpitChipState = "ok" | "wip" | "gap";
+type CockpitChip = { label: string; state: CockpitChipState };
+type CockpitLane = "observer" | "pipeline" | "foundation" | "branch";
+
+type CockpitNode = {
+  id: number;
+  lane: CockpitLane;
+  status: CockpitStatus;
+  runtime: "ok" | "warn" | "off";
+  title: string;
+  role: string;
+  next: string;
+  gaps: string[];
+  backing: string[];
+  chips: CockpitChip[];
+};
+
+type CockpitSignals = {
+  nodeUp: boolean;
+  bridge: boolean;
+  lease: boolean;
+  secretBackend: string | null;
+  secretAvailable: boolean;
+  ozon: boolean;
+  openai: boolean;
+  connector: string;
+  posterReady: boolean;
+  imageRouting: boolean;
+};
+
+type CockpitSummary = {
+  counts: Record<CockpitStatus, number>;
+  live: number;
+  total: number;
+  wiredPct: number;
+  buildCommit: string | null;
+  version: string | null;
+  connector: string;
+  lease: boolean;
+  nodeUp: boolean;
+  checkedAt: string | null;
+};
+
+const COCKPIT_ICONS: Record<number, React.ComponentType<{ size?: number | string }>> = {
+  0: Boxes,
+  1: PackagePlus,
+  2: ImageIcon,
+  3: Languages,
+  4: FileSpreadsheet,
+  5: Cpu,
+  6: Clapperboard
+};
+
+function cockpitStatusLabel(c: LocalNodeCopy, status: CockpitStatus) {
+  switch (status) {
+    case "live":
+      return c.cockpit.statusLive;
+    case "partial":
+      return c.cockpit.statusPartial;
+    case "isolated":
+      return c.cockpit.statusIsolated;
+    default:
+      return c.cockpit.statusMissing;
+  }
+}
+
+// Build the 7-module project map. The structural `status` is the honest "is this
+// wired end-to-end" verdict from the codebase survey; the `runtime` dot reflects
+// whether the part that IS wired is actually up right now (from live /health +
+// /diagnostics). Chips break each module into concrete capabilities (ok / wip / gap).
+function buildCockpitNodes(c: LocalNodeCopy, sig: CockpitSignals): CockpitNode[] {
+  const m = c.cockpit.modules;
+  const ch = c.cockpit.chips;
+  const chip = (label: string, state: CockpitChipState): CockpitChip => ({ label, state });
+  const secretLabel = sig.secretBackend ? `${ch.secretStore} · ${sig.secretBackend}` : ch.secretStore;
+  return [
+    {
+      id: 0,
+      lane: "observer",
+      status: "live",
+      runtime: sig.nodeUp ? "ok" : "off",
+      title: m.m0.title,
+      role: m.m0.role,
+      next: m.m0.next,
+      gaps: m.m0.gaps,
+      backing: m.m0.backing,
+      chips: [chip(ch.observe, "ok")]
+    },
+    {
+      id: 1,
+      lane: "pipeline",
+      status: "partial",
+      runtime: sig.ozon ? "ok" : sig.nodeUp ? "warn" : "off",
+      title: m.m1.title,
+      role: m.m1.role,
+      next: m.m1.next,
+      gaps: m.m1.gaps,
+      backing: m.m1.backing,
+      chips: [chip(ch.ozonRead, sig.ozon ? "ok" : "gap"), chip(ch.excelReader, "gap"), chip(ch.dropImport, "gap")]
+    },
+    {
+      id: 2,
+      lane: "pipeline",
+      status: "partial",
+      runtime: sig.ozon && sig.posterReady ? "ok" : sig.nodeUp ? "warn" : "off",
+      title: m.m2.title,
+      role: m.m2.role,
+      next: m.m2.next,
+      gaps: m.m2.gaps,
+      backing: m.m2.backing,
+      chips: [chip(ch.genChain, "ok"), chip(ch.adoptUi, "ok"), chip(ch.persist, "gap")]
+    },
+    {
+      id: 3,
+      lane: "pipeline",
+      status: "partial",
+      runtime: sig.openai ? "ok" : sig.nodeUp ? "warn" : "off",
+      title: m.m3.title,
+      role: m.m3.role,
+      next: m.m3.next,
+      gaps: m.m3.gaps,
+      backing: m.m3.backing,
+      chips: [chip(ch.rewrite, "ok"), chip(ch.multimodal, "gap"), chip(ch.yandex, "gap")]
+    },
+    {
+      id: 4,
+      lane: "pipeline",
+      status: "isolated",
+      runtime: "off",
+      title: m.m4.title,
+      role: m.m4.role,
+      next: m.m4.next,
+      gaps: m.m4.gaps,
+      backing: m.m4.backing,
+      chips: [chip(ch.excelEngine, "ok"), chip(ch.verifier, "ok"), chip(ch.httpExpose, "gap")]
+    },
+    {
+      id: 5,
+      lane: "foundation",
+      status: "partial",
+      runtime: sig.lease && sig.secretAvailable ? "ok" : sig.nodeUp ? "warn" : "off",
+      title: m.m5.title,
+      role: m.m5.role,
+      next: m.m5.next,
+      gaps: m.m5.gaps,
+      backing: m.m5.backing,
+      chips: [
+        chip(ch.lease, sig.lease ? "ok" : "gap"),
+        chip(secretLabel, sig.secretAvailable ? "ok" : "gap"),
+        chip(ch.modelRouting, sig.imageRouting ? "ok" : "wip"),
+        chip(ch.singleShop, "gap")
+      ]
+    },
+    {
+      id: 6,
+      lane: "branch",
+      status: "missing",
+      runtime: "off",
+      title: m.m6.title,
+      role: m.m6.role,
+      next: m.m6.next,
+      gaps: m.m6.gaps,
+      backing: m.m6.backing,
+      chips: [chip(ch.firstLastFrame, "gap"), chip(ch.videoApi, "gap"), chip(ch.videoPush, "gap")]
+    }
+  ];
+}
+
+const COCKPIT_EDGES: [number, number][] = [[1,2],[2,3],[3,4],[5,1],[5,2],[5,3],[5,4],[6,2],[6,4],[5,6],[0,1],[0,2],[0,3],[0,4],[0,5],[0,6]];
+
+function cockpitRelated(id: number): Set<number> {
+  const s = new Set<number>([id]);
+  for (const [a, b] of COCKPIT_EDGES) {
+    if (a === id) s.add(b);
+    if (b === id) s.add(a);
+  }
+  return s;
+}
+
+function CockpitNodeCard({
+  node,
+  c,
+  selected,
+  onSelect,
+  dark,
+  tag,
+  related,
+  dim
+}: {
+  node: CockpitNode;
+  c: LocalNodeCopy;
+  selected: boolean;
+  onSelect: (id: number) => void;
+  dark?: boolean;
+  tag?: string;
+  related?: boolean;
+  dim?: boolean;
+}) {
+  const Icon = COCKPIT_ICONS[node.id] ?? Boxes;
+  return (
+    <button
+      type="button"
+      className={`cockpit-node is-${node.status}${dark ? " on-dark" : ""}${selected ? " is-selected" : ""}${related ? " cockpit-related" : ""}${dim ? " cockpit-dim" : ""}`}
+      onClick={() => onSelect(node.id)}
+      aria-pressed={selected}
+    >
+      {tag && <span className="cockpit-node-tag">{tag}</span>}
+      <div className="cockpit-node-top">
+        <span className="cockpit-node-num">{node.id}</span>
+        <span className="cockpit-node-icon">
+          <Icon size={18} />
+        </span>
+        <h3>{node.title}</h3>
+        <span className={`cockpit-dot ${node.runtime}`} aria-hidden />
+        <span className={`cockpit-badge is-${node.status}`}>{cockpitStatusLabel(c, node.status)}</span>
+      </div>
+      <p className="cockpit-node-role">{node.role}</p>
+      <div className="cockpit-chips">
+        {node.chips.map((entry, index) => (
+          <span key={index} className={`cockpit-chip ${entry.state}`}>
+            {entry.label}
+          </span>
+        ))}
+      </div>
+    </button>
+  );
+}
+
+function CockpitView({
+  c,
+  nodes,
+  summary,
+  live,
+  refreshing,
+  onRefresh,
+  onClose,
+  eventState
+}: {
+  c: LocalNodeCopy;
+  nodes: CockpitNode[];
+  summary: CockpitSummary;
+  live: Record<number, { label: string; value: string }[]>;
+  refreshing: boolean;
+  onRefresh: () => void;
+  onClose: () => void;
+  eventState: string;
+}) {
+  const [selected, setSelected] = useState(0);
+  const [todoCopied, setTodoCopied] = useState(false);
+  const observer = nodes.find((node) => node.lane === "observer");
+  const pipeline = nodes.filter((node) => node.lane === "pipeline");
+  const branch = nodes.find((node) => node.lane === "branch");
+  const foundation = nodes.find((node) => node.lane === "foundation");
+  const active = nodes.find((node) => node.id === selected) ?? nodes[0];
+  const related = cockpitRelated(active.id);
+
+  useEffect(() => {
+    setTodoCopied(false);
+  }, [selected]);
+
+  async function copyTodo() {
+    const md = [
+      "## [模块" + active.id + "] " + active.title + " — " + cockpitStatusLabel(c, active.status),
+      "",
+      c.cockpit.detailGaps + ":",
+      ...active.gaps.map((g) => "- [ ] " + g),
+      "",
+      c.cockpit.detailNext + ": " + active.next,
+      c.cockpit.detailBacking + ": " + active.backing.join("; ")
+    ].join("\n");
+    try {
+      await navigator.clipboard.writeText(md);
+      setTodoCopied(true);
+      window.setTimeout(() => setTodoCopied(false), 2000);
+    } catch {
+      setTodoCopied(false);
+    }
+  }
+
+  return (
+    <div
+      className="cockpit-overlay"
+      role="dialog"
+      aria-modal="true"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
+    >
+    <section className="cockpit">
+      <div className="cockpit-head">
+        <div className="section-title">
+          <Boxes />
+          <div>
+            <h2>{c.cockpit.title}</h2>
+            <p>{c.cockpit.subtitle}</p>
+          </div>
+        </div>
+        <div className="cockpit-head-actions">
+          {summary.checkedAt && <span className="cockpit-checked">{c.cockpit.checkedAt(summary.checkedAt)}</span>}
+          <button className="secondary-button" onClick={onRefresh} disabled={refreshing}>
+            <RefreshCcw size={16} /> {refreshing ? c.cockpit.refreshing : c.cockpit.refresh}
+          </button>
+          <button className="cockpit-close" onClick={onClose} aria-label={c.cockpit.close}>
+            <XCircle size={20} />
+          </button>
+        </div>
+      </div>
+
+      <div className="cockpit-pulse">
+        <div className="cockpit-pulse-counts">
+          <span className="cockpit-tally live">
+            <strong>{summary.counts.live}</strong>
+            {c.cockpit.statusLive}
+          </span>
+          <span className="cockpit-tally partial">
+            <strong>{summary.counts.partial}</strong>
+            {c.cockpit.statusPartial}
+          </span>
+          <span className="cockpit-tally isolated">
+            <strong>{summary.counts.isolated}</strong>
+            {c.cockpit.statusIsolated}
+          </span>
+          <span className="cockpit-tally missing">
+            <strong>{summary.counts.missing}</strong>
+            {c.cockpit.statusMissing}
+          </span>
+        </div>
+        <div className="cockpit-pulse-meta">
+          <div>
+            <span>{c.cockpit.pulseBuild}</span>
+            <strong>{summary.buildCommit ? summary.buildCommit.slice(0, 7) : "—"}</strong>
+          </div>
+          <div>
+            <span>{c.cockpit.pulseConnector}</span>
+            <strong>{summary.connector}</strong>
+          </div>
+          <div>
+            <span>{summary.lease ? c.cockpit.pulseLeaseOk : c.cockpit.pulseLeaseOff}</span>
+            <strong className={summary.lease ? "ok" : "warn"}>{summary.lease ? "✓" : "—"}</strong>
+          </div>
+          <div>
+            <span>{summary.nodeUp ? c.cockpit.pulseNodeOk : c.cockpit.pulseNodeOff}</span>
+            <strong className={summary.nodeUp ? "ok" : "warn"}>{summary.nodeUp ? "✓" : "—"}</strong>
+          </div>
+          <div>
+            <span>{eventState === "connected" ? c.cockpit.liveOn : eventState === "connecting" ? c.cockpit.liveConnecting : c.cockpit.liveOff}</span>
+            <strong className={eventState === "connected" ? "ok" : "warn"}>{eventState === "connected" ? "●" : "○"}</strong>
+          </div>
+        </div>
+      </div>
+
+      <div className="cockpit-progress">
+        <div className="cockpit-progress-track">
+          <div className="cockpit-progress-fill" style={{ width: `${summary.wiredPct}%` }} />
+        </div>
+        <span>
+          {c.cockpit.wired} {summary.wiredPct}%
+        </span>
+      </div>
+
+      <div className="cockpit-legend">
+        <span className="cockpit-legend-item">
+          <i className="cockpit-swatch live" />
+          {c.cockpit.statusLive}
+        </span>
+        <span className="cockpit-legend-item">
+          <i className="cockpit-swatch partial" />
+          {c.cockpit.statusPartial}
+        </span>
+        <span className="cockpit-legend-item">
+          <i className="cockpit-swatch isolated" />
+          {c.cockpit.statusIsolated}
+        </span>
+        <span className="cockpit-legend-item">
+          <i className="cockpit-swatch missing" />
+          {c.cockpit.statusMissing}
+        </span>
+      </div>
+
+      {observer && (
+        <div className="cockpit-lane cockpit-observer">
+          <div className="cockpit-lane-label">
+            <Eye size={14} /> {c.cockpit.laneObserver}
+          </div>
+          <CockpitNodeCard
+            node={observer}
+            c={c}
+            selected={active.id === observer.id}
+            onSelect={setSelected}
+            tag={c.cockpit.youAreHere}
+            related={observer.id !== active.id && related.has(observer.id)}
+            dim={!related.has(observer.id)}
+          />
+        </div>
+      )}
+
+      <div className="cockpit-lane">
+        <div className="cockpit-lane-label">
+          <ArrowRight size={14} /> {c.cockpit.lanePipeline}
+        </div>
+        <div className="cockpit-pipeline">
+          {pipeline.map((node, index) => (
+            <React.Fragment key={node.id}>
+              <CockpitNodeCard
+                node={node}
+                c={c}
+                selected={active.id === node.id}
+                onSelect={setSelected}
+                related={node.id !== active.id && related.has(node.id)}
+                dim={!related.has(node.id)}
+              />
+              {index < pipeline.length - 1 && (
+                <div className="cockpit-arrow" aria-hidden>
+                  <ArrowRight size={20} />
+                </div>
+              )}
+            </React.Fragment>
+          ))}
+        </div>
+      </div>
+
+      {branch && (
+        <div className="cockpit-lane">
+          <div className="cockpit-lane-label">
+            <Clapperboard size={14} /> {c.cockpit.laneBranch}
+          </div>
+          <div className="cockpit-branch">
+            <CockpitNodeCard
+              node={branch}
+              c={c}
+              selected={active.id === branch.id}
+              onSelect={setSelected}
+              related={branch.id !== active.id && related.has(branch.id)}
+              dim={!related.has(branch.id)}
+            />
+            <span className="cockpit-branch-hint">{c.cockpit.branchHint}</span>
+          </div>
+        </div>
+      )}
+
+      {foundation && (
+        <div className="cockpit-lane">
+          <div className="cockpit-lane-label">
+            <Layers size={14} /> {c.cockpit.laneFoundation}
+          </div>
+          <CockpitNodeCard
+            node={foundation}
+            c={c}
+            selected={active.id === foundation.id}
+            onSelect={setSelected}
+            dark
+            related={foundation.id !== active.id && related.has(foundation.id)}
+            dim={!related.has(foundation.id)}
+          />
+        </div>
+      )}
+
+      {active && (
+        <div className="cockpit-detail">
+          <div className="cockpit-detail-head">
+            <span className="cockpit-node-num">{active.id}</span>
+            <h3>{active.title}</h3>
+            <span className={`cockpit-badge is-${active.status}`}>{cockpitStatusLabel(c, active.status)}</span>
+          </div>
+          <p className="cockpit-detail-role">{active.role}</p>
+          <div className="cockpit-detail-cols">
+            <div>
+              <h4>{c.cockpit.detailBacking}</h4>
+              <ul className="cockpit-mono">
+                {active.backing.map((item, index) => (
+                  <li key={index}>{item}</li>
+                ))}
+              </ul>
+            </div>
+            <div>
+              <h4>{c.cockpit.detailGaps}</h4>
+              <ul>
+                {active.gaps.map((item, index) => (
+                  <li key={index}>{item}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+          {nodes.filter((n) => n.id !== active.id && related.has(n.id)).length > 0 && (
+            <div className="cockpit-related-row">
+              <h4>{c.cockpit.related}</h4>
+              <div className="cockpit-related-chips">
+                {nodes
+                  .filter((n) => n.id !== active.id && related.has(n.id))
+                  .map((n) => (
+                    <button
+                      key={n.id}
+                      className="cockpit-related-chip"
+                      onClick={() => setSelected(n.id)}
+                    >
+                      {n.id} · {n.title}
+                    </button>
+                  ))}
+              </div>
+            </div>
+          )}
+          {live[active.id] && live[active.id].length > 0 && (
+            <div className="cockpit-live">
+              <h4>{c.cockpit.liveReadout}</h4>
+              <div className="cockpit-live-grid">
+                {live[active.id].map((metric, index) => (
+                  <div key={index} className="cockpit-metric">
+                    <span>{metric.label}</span>
+                    <strong>{metric.value}</strong>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="cockpit-next">
+            <span>{c.cockpit.detailNext}</span>
+            <strong>{active.next}</strong>
+            {active.status !== "live" && (
+              <button className="secondary-button cockpit-todo-btn" onClick={copyTodo}>
+                {c.cockpit.genTodo}
+              </button>
+            )}
+            {todoCopied && <span className="cockpit-todo-ok">{c.cockpit.todoCopied}</span>}
+          </div>
+        </div>
+      )}
+    </section>
+    </div>
   );
 }
 
