@@ -9,6 +9,7 @@ import {
   Clipboard,
   Cpu,
   DatabaseZap,
+  Download,
   Eye,
   EyeOff,
   FileSpreadsheet,
@@ -195,6 +196,34 @@ type RelistPushResult = {
   image_count: number;
   ok: boolean;
   error: string | null;
+};
+
+// Module 4 (export / delivery). One assembled row joins the module-2 adopted
+// image (primary_image_url) with the module-3 redistributed title/listing,
+// keyed by product_id, falling back to the product's source values.
+type ExportRow = {
+  product_id: string;
+  offer_id: string;
+  title: string;
+  listing: string;
+  primary_image_url: string | null;
+  additional_image_urls: string[];
+};
+
+type ExportVerifySummary = {
+  ok: boolean;
+  expected_changes: number;
+  unexpected_changes: number;
+  frozen_cells_compared: number;
+  sheets_compared: number;
+};
+
+type RelistExportResponse = {
+  ok: boolean;
+  out_path: string;
+  file_url: string;
+  verify: ExportVerifySummary | null;
+  warnings: string[];
 };
 
 type Module3FieldChange = {
@@ -477,7 +506,7 @@ function App() {
   const [schedule, setSchedule] = useState<ScheduleStatus | null>(null);
   const [scheduleInterval, setScheduleInterval] = useState(900);
   const [scheduleLimit, setScheduleLimit] = useState(20);
-  const [view, setView] = useState<"workbench" | "copy" | "console">("workbench");
+  const [view, setView] = useState<"workbench" | "copy" | "export" | "console">("workbench");
   const [cockpitOpen, setCockpitOpen] = useState(false);
   const [cockpitRefreshing, setCockpitRefreshing] = useState(false);
   const [relistProducts, setRelistProducts] = useState<Product[]>([]);
@@ -500,6 +529,12 @@ function App() {
   const [module3Previews, setModule3Previews] = useState<Module3PushItem[] | null>(null);
   const [module3Pushing, setModule3Pushing] = useState(false);
   const [module3PushResults, setModule3PushResults] = useState<Module3PushItem[] | null>(null);
+  // Module 4 (export / delivery) — local only, no Ozon push.
+  const [exportTemplatePath, setExportTemplatePath] = useState("");
+  const [exportConfigPath, setExportConfigPath] = useState("");
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportResult, setExportResult] = useState<RelistExportResponse | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
   const realModeRequiresLease = configStatus?.real_ozon_enabled ?? true;
   const ozonConfigReady = configStatus?.ozon.configured === true;
   const openAiConfigReady = configStatus?.openai.configured === true;
@@ -1203,6 +1238,105 @@ function App() {
     }
   }
 
+  // Module 4 — assemble the export rows from the CURRENT accepted state:
+  //   * module-2 adopted image (new_url) -> primary_image_url
+  //   * module-3 redistributed title/description -> title / listing
+  // joined by product_id, with fallbacks to the source title/description and the
+  // product's original primary image when a piece is missing. The union of all
+  // product_ids seen across module-2 and module-3 forms the row set.
+  function assembleExportRows(): ExportRow[] {
+    const ids = new Set<string>();
+    (relistResults ?? []).forEach((item) => item.product_id && ids.add(item.product_id));
+    (module3Results ?? []).forEach((item) => item.product_id && ids.add(item.product_id));
+
+    const relistById = new Map((relistResults ?? []).map((item) => [item.product_id, item]));
+    const m3ById = new Map((module3Results ?? []).map((item) => [item.product_id, item]));
+    const productById = new Map(relistProducts.map((product) => [product.product_id, product]));
+
+    const rows: ExportRow[] = [];
+    for (const productId of ids) {
+      const relist = relistById.get(productId);
+      const m3 = m3ById.get(productId);
+      const product = productById.get(productId);
+
+      // Title/listing: prefer the adopted module-3 proposal (edited if any),
+      // else the module-3 source, else the product/relist name.
+      const m3Fields =
+        m3 && m3.proposal && !m3.error && module3Adopt[productId]
+          ? module3Edited[productId] ?? m3.proposal
+          : null;
+      const title =
+        (m3Fields?.title || m3?.source.title || relist?.name || product?.name || "").trim();
+      const listing = (m3Fields?.description || m3?.source.description || "").trim();
+
+      // Primary image: prefer the adopted module-2 new_url, else the product's
+      // original primary image.
+      const adoptedImage =
+        relist && relist.new_url && !relist.error && relistAdopt[productId] ? relist.new_url : null;
+      const primaryImageUrl = adoptedImage || relist?.original_url || null;
+
+      rows.push({
+        product_id: productId,
+        offer_id: relist?.offer_id || m3?.offer_id || product?.offer_id || "",
+        title,
+        listing,
+        primary_image_url: primaryImageUrl,
+        additional_image_urls: []
+      });
+    }
+    return rows;
+  }
+
+  async function runExport() {
+    if (!ensureOzonReadAccess(c.export.generate)) return;
+    const template = exportTemplatePath.trim();
+    if (!template) {
+      setMessage(c.export.msgTemplateRequired);
+      return;
+    }
+    const rows = assembleExportRows();
+    if (rows.length === 0) {
+      setMessage(c.export.msgNoRows);
+      return;
+    }
+    setExportBusy(true);
+    setExportResult(null);
+    setExportError(null);
+    setMessage(c.export.msgExporting(rows.length));
+    try {
+      const config = exportConfigPath.trim();
+      const response = await api("/tools/ozon.relist.export", {
+        method: "POST",
+        body: JSON.stringify({
+          template_path: template,
+          config_path: config || undefined,
+          rows: rows.map((row) => ({
+            title: row.title,
+            listing: row.listing,
+            primary_image_url: row.primary_image_url,
+            additional_image_urls: row.additional_image_urls
+          }))
+        })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        // A verify failure (frozen-cell change) comes back as a hard error — the
+        // deliverable is contaminated and the server never returns it.
+        setExportError(userFacingError(data.error));
+        setMessage(c.export.msgFailed(userFacingError(data.error)));
+        return;
+      }
+      const result = data as RelistExportResponse;
+      setExportResult(result);
+      setMessage(c.export.msgDone(result.out_path));
+    } catch {
+      setExportError(c.messages.localServiceUnreachable);
+      setMessage(c.export.msgFailed(c.messages.localServiceUnreachable));
+    } finally {
+      setExportBusy(false);
+    }
+  }
+
   async function pushRelist() {
     if (!relistResults) return;
     const items = relistResults
@@ -1738,6 +1872,9 @@ function App() {
         <button className={view === "copy" ? "active" : ""} onClick={() => setView("copy")}>
           <FileText size={16} /> {c.module3.tab}
         </button>
+        <button className={view === "export" ? "active" : ""} onClick={() => setView("export")}>
+          <Download size={16} /> {c.export.tab}
+        </button>
         <button className={view === "console" ? "active" : ""} onClick={() => setView("console")}>
           <SlidersHorizontal size={16} /> {c.relist.tabConsole}
         </button>
@@ -2106,6 +2243,121 @@ function App() {
           </div>
         </section>
       )}
+
+      {view === "export" && (() => {
+        const exportRows = assembleExportRows();
+        return (
+        <section className="workspace-grid relist-grid" id="module4-workbench">
+          <div className="panel relist-pick">
+            <div className="section-title">
+              <Download />
+              <div>
+                <h2>{c.export.title}</h2>
+                <p>{c.export.description}</p>
+              </div>
+            </div>
+
+            {!canUseOzonReadTools && <p className="hint">{ozonReadGateMessage}</p>}
+            <p className="hint">{c.export.engineHint}</p>
+
+            <label className="field">
+              <span>{c.export.templateLabel}</span>
+              <input
+                type="text"
+                value={exportTemplatePath}
+                placeholder={c.export.templatePlaceholder}
+                onChange={(event) => setExportTemplatePath(event.target.value)}
+              />
+            </label>
+            <label className="field">
+              <span>{c.export.configLabel}</span>
+              <input
+                type="text"
+                value={exportConfigPath}
+                placeholder={c.export.configPlaceholder}
+                onChange={(event) => setExportConfigPath(event.target.value)}
+              />
+            </label>
+
+            <button
+              className="primary-button"
+              disabled={!canUseOzonReadTools || exportBusy || exportRows.length === 0}
+              onClick={runExport}
+            >
+              <Download size={16} /> {exportBusy ? c.export.generating : c.export.generate}
+            </button>
+          </div>
+
+          <div className="panel relist-results">
+            <div className="section-title">
+              <FileSpreadsheet />
+              <div>
+                <h2>{c.export.rowsTitle}</h2>
+                <p>{c.export.rowsSubtitle(exportRows.length)}</p>
+              </div>
+            </div>
+
+            {exportRows.length === 0 ? (
+              <p className="hint">{c.export.noRows}</p>
+            ) : (
+              <table className="export-rows">
+                <thead>
+                  <tr>
+                    <th>{c.export.colProduct}</th>
+                    <th>{c.export.colTitle}</th>
+                    <th>{c.export.colListing}</th>
+                    <th>{c.export.colImage}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {exportRows.map((row) => (
+                    <tr key={row.product_id}>
+                      <td>{row.offer_id || row.product_id}</td>
+                      <td>{row.title || <em>{c.export.missing}</em>}</td>
+                      <td>{row.listing ? `${row.listing.slice(0, 80)}${row.listing.length > 80 ? "…" : ""}` : <em>{c.export.missing}</em>}</td>
+                      <td>{row.primary_image_url ? <span className="ok-pill">{c.export.haveImage}</span> : <em>{c.export.missing}</em>}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+
+            {exportError && (
+              <div className="result-banner result-error">
+                <XCircle size={16} /> {c.export.hardFail}: {exportError}
+              </div>
+            )}
+
+            {exportResult && (
+              <div className={`result-banner ${exportResult.verify?.ok ? "result-ok" : "result-warn"}`}>
+                <div>
+                  <CheckCircle2 size={16} /> {c.export.doneTitle}
+                </div>
+                <div className="export-path"><strong>{c.export.filePath}:</strong> {exportResult.out_path}</div>
+                {exportResult.verify && (
+                  <div className="export-verify">
+                    {exportResult.verify.ok ? c.export.verifyOk : c.export.verifyFail}
+                    {" — "}
+                    {c.export.verifyDetail(
+                      exportResult.verify.expected_changes,
+                      exportResult.verify.unexpected_changes,
+                      exportResult.verify.frozen_cells_compared
+                    )}
+                  </div>
+                )}
+                {exportResult.warnings.length > 0 && (
+                  <ul className="export-warnings">
+                    {exportResult.warnings.map((warning, index) => (
+                      <li key={index}>{warning}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
+        </section>
+        );
+      })()}
 
       {view === "console" && (
         <>

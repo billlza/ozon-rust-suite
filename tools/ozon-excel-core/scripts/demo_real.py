@@ -198,85 +198,30 @@ def _inject_products(in_xlsx, out_xlsx, config, products):
     """Use the mapper to find the title/listing/image columns + data start, then
     overwrite the first len(products) data rows with the real product data.
 
-    Returns a dict describing where each piece landed (for the report)."""
-    wb = load_workbook(str(in_xlsx))
-    ws = wb[MAIN_SHEET]
-    hb = detect_header(ws, config)
-    mapped = resolve_columns(ws, config, hb)
+    Thin adapter over ozon_excel_core.inject.inject_rows: it maps the demo's
+    product dicts (name/description/primary_image/images) onto the package's
+    canonical row shape (title/listing/primary_image/additional_images) and
+    applies the demo's per-product image cap before delegating. Returns a dict
+    describing where each piece landed (for the report)."""
+    from ozon_excel_core.inject import inject_rows
 
-    title_col = mapped.title.col_index if mapped.title else None
-    listing_col = mapped.listing.col_index if mapped.listing else None
-    main_col = mapped.images_main[0].col_index if mapped.images_main else None
-    # additional image target columns, in order (multi-url col, then photo-2 col)
-    add_cols = [mc.col_index for mc in mapped.images_additional]
-
-    data_start = hb.data_start_row
-    placed = {
-        "data_start_row": data_start,
-        "title_col": _letter(mapped.title),
-        "listing_col": _letter(mapped.listing),
-        "main_image_col": _letter(mapped.images_main[0]) if mapped.images_main else None,
-        "additional_image_cols": [_letter(mc) for mc in mapped.images_additional],
-        "rows": [],
-    }
-
-    def _first_url(v):
-        """Ozon may return an image field as a str or a list of urls; cell values
-        must be scalar strings."""
-        if isinstance(v, (list, tuple)):
-            v = v[0] if v else None
-        return str(v) if v else None
-
-    for i, product in enumerate(products):
-        r = data_start + i
-        if title_col:
-            ws.cell(row=r, column=title_col, value=str(product["name"]))
-        if listing_col:
-            ws.cell(row=r, column=listing_col, value=str(product.get("description") or ""))
-        primary = _first_url(product.get("primary_image"))
-        if main_col and primary:
-            ws.cell(row=r, column=main_col, value=primary)
-
-        # Distribute the remaining images across the additional target columns.
-        # The first additional column is multi_url (accepts several, newline-
-        # joined); any further single-url columns (e.g. "photo 2") take one each.
-        # Cap additional images per product to bound paid image-generation during
-        # the demo (the cache de-dupes by source url; primary is handled above).
-        _img_cap = int(os.environ.get("OZON_RELIST_DEMO_IMG_CAP", "2"))
-        others = [str(u) for u in (product.get("images") or []) if u and str(u) != primary][:_img_cap]
-        if add_cols and others:
-            first, rest = add_cols[0], add_cols[1:]
-            # The trailing single-url columns each take one image; the multi_url
-            # first column takes everything that's left, newline-joined.
-            n_singles = min(len(rest), len(others))
-            singles = others[len(others) - n_singles:] if n_singles else []
-            multi = others[: len(others) - n_singles]
-            if multi:
-                ws.cell(row=r, column=first, value="\n".join(multi))
-            elif singles:
-                # No leftover for the multi column; still fill it with one image
-                # so the main multi_url slot is not left empty.
-                ws.cell(row=r, column=first, value=singles[0])
-                singles = singles[1:]
-                rest = rest[1:]
-            for col, url in zip(rest, singles):
-                ws.cell(row=r, column=col, value=url)
-
-        placed["rows"].append({"row": r, "name": str(product["name"])[:48]})
-
-    # Drop any leftover sample rows so the demo processes ONLY the real products
-    # (un-injected sample rows still carry placeholder img.ozon.test urls).
-    last = data_start + len(products) - 1
-    if ws.max_row > last:
-        ws.delete_rows(last + 1, ws.max_row - last)
-
-    wb.save(str(out_xlsx))
-    wb.close()
+    _img_cap = int(os.environ.get("OZON_RELIST_DEMO_IMG_CAP", "2"))
+    rows = [
+        {
+            "title": str(product["name"]),
+            "listing": str(product.get("description") or ""),
+            "primary_image": product.get("primary_image"),
+            "additional_images": list(product.get("images") or [])[:_img_cap],
+        }
+        for product in products
+    ]
+    placed = inject_rows(in_xlsx, out_xlsx, config, rows)
+    # Preserve the demo report's historical "name" key (inject_rows reports
+    # "title"); the rest of the placement dict is identical.
+    placed["rows"] = [
+        {"row": r["row"], "name": r["title"]} for r in placed["rows"]
+    ]
     return placed
-
-
-def _letter(mc):
-    return mc.column_letter if mc is not None else None
 
 
 # --------------------------------------------------------------------------- #

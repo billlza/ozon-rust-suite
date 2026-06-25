@@ -235,6 +235,7 @@ fn skill_router(state: LocalState) -> Router {
         .route("/tools/ozon.products.get", post(ozon_products_get))
         .route("/tools/ozon.relist.generate", post(relist_generate))
         .route("/tools/ozon.relist.push", post(relist_push))
+        .route("/tools/ozon.relist.export", post(relist_export))
         .route(
             "/tools/ozon.module3.recognize",
             post(module3_recognize),
@@ -765,6 +766,14 @@ async fn openclaw_manifest(State(state): State<LocalState>) -> Json<OpenClawMani
                 risk: "write",
                 approval_required: true,
                 description: "Write a reviewed module-3 copy proposal (title/description/attributes) back to the LIVE Ozon store. Always returns a dry-run preview (before->after, matched + dropped attributes); only writes when called with confirm=true after operator review. Attribute names/values are re-matched against the Ozon category dictionary and any unmatched item is dropped (never written with a guessed id)",
+            },
+            OpenClawTool {
+                name: "ozon.relist.export",
+                method: "POST",
+                path: "/tools/ozon.relist.export",
+                risk: "read_only",
+                approval_required: false,
+                description: "Module 4 export/delivery: inject reviewed per-row title/listing/image URLs into an Ozon template .xlsx and run the engine process --verify to write a deliverable workbook locally (NO Ozon push). Returns the deliverable file path + verify summary; a verification failure (frozen-cell change) is a hard error and the file is never returned. Needs the local Python engine (dev uses the repo .venv)",
             },
             OpenClawTool {
                 name: "poster.handoff",
@@ -2935,6 +2944,426 @@ async fn generate_poster_background(
         prompt: request.prompt,
         revised_prompt: image.revised_prompt,
         background_data_url: format!("data:image/png;base64,{}", BASE64_STANDARD.encode(bytes)),
+    })
+}
+
+// ------------------------------------------------------------------------- //
+// Module 4 — export / delivery (LOCAL ONLY, no Ozon push).                    //
+//                                                                             //
+// Inject reviewed per-row {title, listing, primary_image, additional_images}  //
+// into an Ozon template .xlsx via the packaged Python injector, then run the  //
+// engine `process --verify` (which writes the deliverable AND proves only the //
+// mapped title/listing/image cells changed). On exit code 1 the verifier      //
+// found unexpected/frozen-cell changes — the deliverable is contaminated and  //
+// is NEVER returned as usable.                                                //
+//                                                                             //
+// NOTE: this needs the Python engine. In dev we use the repo .venv            //
+// (tools/ozon-excel-core/.venv); a shipped installer must bundle Python       //
+// (follow-up, out of scope here). tokio is built WITHOUT the `process`        //
+// feature, so the blocking child runs inside tokio::task::spawn_blocking with //
+// std::process::Command (explicit args slice + absolute interpreter, never a  //
+// joined shell string — paths may contain spaces).                            //
+// ------------------------------------------------------------------------- //
+
+/// Default dev location of the pure-openpyxl engine (repo `tools/ozon-excel-core`).
+const ENGINE_ROOT_DEV_DEFAULT: &str = "/Users/bill/ozon-rust-suite/tools/ozon-excel-core";
+const RELIST_EXPORT_MAX_ROWS: usize = 200;
+
+/// Resolve the Python interpreter for the export engine:
+///   OZON_EXCEL_CORE_PYTHON / OZON_PYTHON env -> repo .venv -> `python3` on PATH.
+fn python_interpreter() -> PathBuf {
+    for key in ["OZON_EXCEL_CORE_PYTHON", "OZON_PYTHON"] {
+        if let Ok(value) = env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed);
+            }
+        }
+    }
+    let venv = engine_root().join(".venv").join("bin").join("python");
+    if venv.exists() {
+        return venv;
+    }
+    PathBuf::from("python3")
+}
+
+/// Resolve the engine root (where `src/ozon_excel_core` + `fields.example.yaml`
+/// live). Overridable via OZON_EXCEL_CORE_ROOT; dev default is the repo path.
+fn engine_root() -> PathBuf {
+    if let Ok(value) = env::var("OZON_EXCEL_CORE_ROOT") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    PathBuf::from(ENGINE_ROOT_DEV_DEFAULT)
+}
+
+/// Default config (`fields.example.yaml`) shipped alongside the engine.
+fn default_export_config_path() -> PathBuf {
+    engine_root().join("fields.example.yaml")
+}
+
+/// `<data-dir>/exports/` — created on demand. Mirrors `default_secret_file_path`'s
+/// per-OS data-dir resolution so deliverables land next to the local node's state.
+fn exports_dir() -> PathBuf {
+    let base = default_secret_file_path()
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("exports")
+}
+
+#[derive(Debug, Deserialize)]
+struct RelistExportRequest {
+    template_path: String,
+    #[serde(default)]
+    config_path: Option<String>,
+    #[serde(default)]
+    rows: Vec<ExportRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExportRow {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    listing: String,
+    #[serde(default)]
+    primary_image_url: Option<String>,
+    #[serde(default)]
+    additional_image_urls: Vec<String>,
+}
+
+/// The shape the Python injector consumes (one object per row in rows.json).
+#[derive(Debug, Serialize)]
+struct InjectRow {
+    title: String,
+    listing: String,
+    primary_image: Option<String>,
+    additional_images: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RelistExportResponse {
+    ok: bool,
+    out_path: String,
+    file_url: String,
+    verify: Option<VerifySummary>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct VerifySummary {
+    ok: bool,
+    expected_changes: u64,
+    unexpected_changes: u64,
+    frozen_cells_compared: u64,
+    sheets_compared: u64,
+}
+
+/// Outcome of the blocking engine pipeline (runs inside spawn_blocking).
+struct ExportPipelineOutput {
+    out_path: PathBuf,
+    verify: Option<VerifySummary>,
+    warnings: Vec<String>,
+}
+
+async fn relist_export(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Json(input): Json<RelistExportRequest>,
+) -> Result<Json<RelistExportResponse>, ApiError> {
+    require_bridge_or_operator_token(&state, &headers)?;
+    require_valid_lease_with_feature(&state, Feature::OzonRead).await?;
+
+    let template_path = input.template_path.trim().to_string();
+    if template_path.is_empty() {
+        return Err(ApiError::bad_request("template_path is required"));
+    }
+    let template = PathBuf::from(&template_path);
+    if !template.is_file() {
+        return Err(ApiError::bad_request(format!(
+            "template .xlsx not found: {template_path}"
+        )));
+    }
+    if input.rows.is_empty() {
+        return Err(ApiError::bad_request("provide at least one export row"));
+    }
+    if input.rows.len() > RELIST_EXPORT_MAX_ROWS {
+        return Err(ApiError::bad_request(format!(
+            "export at most {RELIST_EXPORT_MAX_ROWS} rows per call"
+        )));
+    }
+
+    let config_path = input
+        .config_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_export_config_path);
+    if !config_path.is_file() {
+        return Err(ApiError::bad_request(format!(
+            "config not found: {}",
+            config_path.display()
+        )));
+    }
+
+    let inject_rows: Vec<InjectRow> = input
+        .rows
+        .into_iter()
+        .map(|row| InjectRow {
+            title: row.title,
+            listing: row.listing,
+            primary_image: row
+                .primary_image_url
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            additional_images: row
+                .additional_image_urls
+                .into_iter()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect(),
+        })
+        .collect();
+
+    let exports = exports_dir();
+    let out_path = exports.join(format!(
+        "ozon-deliverable-{}.xlsx",
+        Uuid::new_v4().simple()
+    ));
+    let python = python_interpreter();
+    let root = engine_root();
+
+    let output = tokio::task::spawn_blocking(move || {
+        run_export_pipeline(python, root, template, config_path, exports, out_path, inject_rows)
+    })
+    .await
+    .map_err(|_| ApiError::internal("export task panicked"))??;
+
+    let file_url = format!("file://{}", output.out_path.display());
+    Ok(Json(RelistExportResponse {
+        ok: true,
+        out_path: output.out_path.display().to_string(),
+        file_url,
+        verify: output.verify,
+        warnings: output.warnings,
+    }))
+}
+
+/// Blocking engine pipeline: inject rows into the template, then run
+/// `process --verify` to write + prove the deliverable. Maps the engine's
+/// deterministic exit codes (0/1/2/3) onto ApiError. MUST run inside
+/// tokio::task::spawn_blocking — it uses std::process::Command (no tokio
+/// `process` feature) and synchronous fs.
+fn run_export_pipeline(
+    python: PathBuf,
+    root: PathBuf,
+    template: PathBuf,
+    config_path: PathBuf,
+    exports: PathBuf,
+    out_path: PathBuf,
+    rows: Vec<InjectRow>,
+) -> Result<ExportPipelineOutput, ApiError> {
+    use std::process::Command;
+
+    fs::create_dir_all(&exports)
+        .map_err(|err| ApiError::internal(format!("cannot create exports dir: {err}")))?;
+
+    // Intermediate populated workbook + rows.json live next to the deliverable.
+    let stem = Uuid::new_v4().simple().to_string();
+    let rows_json = exports.join(format!("export-rows-{stem}.json"));
+    let populated = exports.join(format!("export-populated-{stem}.xlsx"));
+
+    let rows_body = serde_json::to_vec(&rows)
+        .map_err(|err| ApiError::internal(format!("cannot serialize export rows: {err}")))?;
+    fs::write(&rows_json, rows_body)
+        .map_err(|err| ApiError::internal(format!("cannot write rows.json: {err}")))?;
+
+    // PYTHONPATH points at the engine's src so `-m ozon_excel_core.cli` resolves
+    // in the dev tree even without an editable install. We deliberately do NOT
+    // forward any secrets into the child env.
+    let pythonpath = root.join("src");
+    let cleanup = |extra: &[&PathBuf]| {
+        let _ = fs::remove_file(&rows_json);
+        for path in extra {
+            let _ = fs::remove_file(path);
+        }
+    };
+
+    let template_arg = template.to_string_lossy().to_string();
+    let rows_arg = rows_json.to_string_lossy().to_string();
+    let populated_arg = populated.to_string_lossy().to_string();
+    let config_arg = config_path.to_string_lossy().to_string();
+
+    // 1) inject -> populated.xlsx
+    let inject = Command::new(&python)
+        .current_dir(&root)
+        .env("PYTHONPATH", &pythonpath)
+        .args([
+            "-m",
+            "ozon_excel_core.cli",
+            "inject",
+            "--in",
+            &template_arg,
+            "--rows",
+            &rows_arg,
+            "--out",
+            &populated_arg,
+            "--config",
+            &config_arg,
+            "--quiet",
+        ])
+        .output();
+    let inject = match inject {
+        Ok(out) => out,
+        Err(err) => {
+            cleanup(&[]);
+            return Err(ApiError::internal(format!(
+                "failed to launch Python engine ({}): {err}",
+                python.display()
+            )));
+        }
+    };
+    if !inject.status.success() {
+        let code = inject.status.code().unwrap_or(-1);
+        let stderr = summarize_stderr(&inject.stderr);
+        cleanup(&[&populated]);
+        return Err(map_engine_exit(code, &stderr, "inject"));
+    }
+
+    // 2) process --verify -> deliverable (writes AND proves the frozen set).
+    let out_arg = out_path.to_string_lossy().to_string();
+    let process = Command::new(&python)
+        .current_dir(&root)
+        .env("PYTHONPATH", &pythonpath)
+        .args([
+            "-m",
+            "ozon_excel_core.cli",
+            "process",
+            "--in",
+            &populated_arg,
+            "--out",
+            &out_arg,
+            "--config",
+            &config_arg,
+            "--transform",
+            "identity",
+            "--verify",
+            "--quiet",
+        ])
+        .output();
+    let process = match process {
+        Ok(out) => out,
+        Err(err) => {
+            cleanup(&[&populated]);
+            return Err(ApiError::internal(format!(
+                "failed to launch Python engine ({}): {err}",
+                python.display()
+            )));
+        }
+    };
+    if !process.status.success() {
+        let code = process.status.code().unwrap_or(-1);
+        let stderr = summarize_stderr(&process.stderr);
+        // Exit 1 = the verifier found unexpected/frozen-cell changes: the
+        // deliverable is contaminated. Never return it — delete it.
+        let _ = fs::remove_file(&out_path);
+        cleanup(&[&populated]);
+        return Err(map_engine_exit(code, &stderr, "process --verify"));
+    }
+
+    // 3) verify --report json (best-effort) to fill the structured summary.
+    let mut warnings = Vec::new();
+    let verify = match Command::new(&python)
+        .current_dir(&root)
+        .env("PYTHONPATH", &pythonpath)
+        .args([
+            "-m",
+            "ozon_excel_core.cli",
+            "verify",
+            "--in",
+            &populated_arg,
+            "--out",
+            &out_arg,
+            "--config",
+            &config_arg,
+            "--report",
+            "json",
+        ])
+        .output()
+    {
+        Ok(out) if out.status.success() => parse_verify_summary(&out.stdout),
+        Ok(_) => {
+            warnings.push("verify --report json did not return a parseable summary".to_string());
+            None
+        }
+        Err(err) => {
+            warnings.push(format!("verify --report json could not run: {err}"));
+            None
+        }
+    };
+
+    cleanup(&[&populated]);
+    Ok(ExportPipelineOutput {
+        out_path,
+        verify,
+        warnings,
+    })
+}
+
+/// Map the engine's deterministic exit codes onto ApiError.
+///   0 -> ok (callers never reach here with 0)
+///   1 -> verification found unexpected changes (HARD FAIL; deliverable unsafe)
+///   2 -> config / mapping error
+///   3 -> preflight risk
+fn map_engine_exit(code: i32, stderr: &str, stage: &str) -> ApiError {
+    let detail = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(" — {stderr}")
+    };
+    match code {
+        1 => ApiError::bad_gateway(format!(
+            "verification found unexpected changes — deliverable is unsafe and was discarded{detail}"
+        )),
+        2 => ApiError::bad_request(format!("config/mapping error ({stage}){detail}")),
+        3 => ApiError::bad_request(format!("preflight risk ({stage}){detail}")),
+        other => ApiError::internal(format!(
+            "export engine failed at {stage} (exit {other}){detail}"
+        )),
+    }
+}
+
+/// Summarize child stderr to a single bounded line for the API error message.
+fn summarize_stderr(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let last = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .next_back()
+        .unwrap_or("");
+    if last.len() > 280 {
+        format!("{}…", &last[..277])
+    } else {
+        last.to_string()
+    }
+}
+
+/// Parse `verify --report json` stdout into the structured VerifySummary.
+fn parse_verify_summary(stdout: &[u8]) -> Option<VerifySummary> {
+    let value: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    let summary = value.get("summary")?;
+    let as_u64 = |key: &str| summary.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    Some(VerifySummary {
+        ok: value.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        expected_changes: as_u64("expected_changes"),
+        unexpected_changes: as_u64("unexpected_changes"),
+        frozen_cells_compared: as_u64("frozen_cells_compared"),
+        sheets_compared: as_u64("sheets_compared"),
     })
 }
 

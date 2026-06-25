@@ -59,6 +59,17 @@ def main(argv=None) -> int:
                            help="write a representative Ozon-style .xlsx")
     p_gen.add_argument("--out", dest="out_path", required=True)
 
+    p_inj = sub.add_parser(
+        "inject", parents=[common],
+        help="inject per-row {title,listing,primary_image,additional_images} "
+             "JSON into the mapped target cells of a template")
+    p_inj.add_argument("--in", dest="in_path", required=True)
+    p_inj.add_argument("--rows", dest="rows_path", required=True,
+                       help="path to a JSON file: a list of row objects")
+    p_inj.add_argument("--out", dest="out_path", required=True)
+    p_inj.add_argument("--config", required=True)
+    p_inj.add_argument("--sheet", default=None)
+
     p_push = sub.add_parser(
         "push-ozon", parents=[common],
         help="push a relisted .xlsx back to Ozon (images, optional title)")
@@ -83,6 +94,8 @@ def main(argv=None) -> int:
             return _cmd_verify(args)
         if args.command == "gen-sample":
             return _cmd_gen_sample(args)
+        if args.command == "inject":
+            return _cmd_inject(args)
         if args.command == "push-ozon":
             return _cmd_push_ozon(args)
     except (ConfigError, MappingError, TransformError) as exc:
@@ -160,6 +173,38 @@ def _cmd_gen_sample(args) -> int:
     gen_sample(args.out_path)
     if not args.quiet:
         print(f"wrote sample workbook: {_abs(args.out_path)}")
+    return 0
+
+
+def _cmd_inject(args) -> int:
+    from .inject import inject_rows
+
+    if _abs(args.in_path) == _abs(args.out_path):
+        print("ERROR: --in and --out must differ", file=sys.stderr)
+        return 2
+
+    config = load_config(args.config)
+
+    with open(args.rows_path, "r", encoding="utf-8") as fh:
+        rows = json.load(fh)
+    if not isinstance(rows, list):
+        print("ERROR (config/mapping): --rows JSON must be a list of row objects",
+              file=sys.stderr)
+        return 2
+
+    placed = inject_rows(args.in_path, args.out_path, config, rows, sheet=args.sheet)
+
+    if not args.quiet:
+        print("=== ozon-excel-core inject ===")
+        print(f"in  : {_abs(args.in_path)}")
+        print(f"out : {_abs(args.out_path)}")
+        print(f"rows: {len(rows)}")
+        print(
+            f"data_start={placed['data_start_row']}  "
+            f"title={placed['title_col']}  listing={placed['listing_col']}  "
+            f"main_image={placed['main_image_col']}  "
+            f"additional_images={placed['additional_image_cols']}"
+        )
     return 0
 
 
