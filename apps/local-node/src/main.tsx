@@ -2875,14 +2875,14 @@ function buildCockpitNodes(c: LocalNodeCopy, sig: CockpitSignals): CockpitNode[]
     {
       id: 3,
       lane: "pipeline",
-      status: "partial",
+      status: "live",
       runtime: sig.openai ? "ok" : sig.nodeUp ? "warn" : "off",
       title: m.m3.title,
       role: m.m3.role,
       next: m.m3.next,
       gaps: m.m3.gaps,
       backing: m.m3.backing,
-      chips: [chip(ch.rewrite, "ok"), chip(ch.multimodal, "gap"), chip(ch.yandex, "gap")]
+      chips: [chip(ch.rewrite, "ok"), chip(ch.multimodal, "ok"), chip(ch.yandex, "gap")]
     },
     {
       id: 4,
@@ -2899,7 +2899,7 @@ function buildCockpitNodes(c: LocalNodeCopy, sig: CockpitSignals): CockpitNode[]
     {
       id: 5,
       lane: "foundation",
-      status: "partial",
+      status: "live",
       runtime: sig.lease && sig.secretAvailable ? "ok" : sig.nodeUp ? "warn" : "off",
       title: m.m5.title,
       role: m.m5.role,
