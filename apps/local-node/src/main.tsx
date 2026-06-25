@@ -48,22 +48,36 @@ type StoredAcceptance = {
   results: RelistItem[] | null;
   adopt: Record<string, boolean>;
   pushResults: RelistPushResult[] | null;
+  // Selected candidate index per relist item key (default 0).
+  choice: Record<string, number>;
 };
+
+// Migrate an older persisted RelistItem (which had `new_url` but no
+// `candidates`) so prior saved reviews still render under the candidate model.
+function migrateRelistItem(item: RelistItem): RelistItem {
+  if (Array.isArray(item.candidates)) {
+    return item;
+  }
+  const url = item.new_url ?? null;
+  return { ...item, candidates: url ? [url] : [] };
+}
 
 function loadStoredAcceptance(): StoredAcceptance {
   try {
     const raw = window.localStorage.getItem(ACCEPTANCE_STORAGE_KEY);
     if (!raw) {
-      return { results: null, adopt: {}, pushResults: null };
+      return { results: null, adopt: {}, pushResults: null, choice: {} };
     }
     const parsed = JSON.parse(raw) as Partial<StoredAcceptance>;
+    const results = parsed.results ? parsed.results.map(migrateRelistItem) : null;
     return {
-      results: parsed.results ?? null,
+      results,
       adopt: parsed.adopt ?? {},
-      pushResults: parsed.pushResults ?? null
+      pushResults: parsed.pushResults ?? null,
+      choice: parsed.choice ?? {}
     };
   } catch {
-    return { results: null, adopt: {}, pushResults: null };
+    return { results: null, adopt: {}, pushResults: null, choice: {} };
   }
 }
 
@@ -166,9 +180,26 @@ type RelistItem = {
   offer_id: string;
   name: string | null;
   original_url: string | null;
-  new_url: string | null;
+  // Up to RELIST_MAX_CANDIDATES hosted restyle URLs; the operator picks one.
+  candidates: string[];
+  // Retained as optional for migration of older persisted reviews (pre-candidates).
+  new_url?: string | null;
   error: string | null;
+  // Set on rows imported from a supplier .xlsx (Module 1): these can be
+  // relisted/exported but have no Ozon product_id, so push-by-product_id is N/A.
+  imported?: boolean;
 };
+
+// Resolve the candidate the operator has selected for an item (default index 0),
+// falling back to a migrated single new_url. Used at every render/push/export
+// read site so selection stays consistent.
+function selectedCandidateUrl(
+  item: RelistItem,
+  choice: number | undefined
+): string | null {
+  const idx = choice ?? 0;
+  return item.candidates?.[idx] ?? item.candidates?.[0] ?? item.new_url ?? null;
+}
 
 type Module3Attribute = {
   name: string;
@@ -499,6 +530,21 @@ function App() {
   const [openAiBaseUrl, setOpenAiBaseUrl] = useState("https://api.openai.com");
   const [openAiImageModel, setOpenAiImageModel] = useState("gpt-image-1");
   const [openAiApiKey, setOpenAiApiKey] = useState("");
+  // Provider-config UI (modules 3/6): secret save + add/replace provider entry.
+  const [secretName, setSecretName] = useState("");
+  const [secretValue, setSecretValue] = useState("");
+  const [secretFingerprint, setSecretFingerprint] = useState<string | null>(null);
+  const [providerCapability, setProviderCapability] = useState<"image_gen" | "text_gen" | "video_gen">("text_gen");
+  const [providerKind, setProviderKind] = useState<
+    "openai_images" | "openai_images_edit" | "openai_compat_chat" | "cloud_video"
+  >("openai_compat_chat");
+  const [providerBaseUrl, setProviderBaseUrl] = useState("");
+  const [providerModel, setProviderModel] = useState("");
+  const [providerSecretRef, setProviderSecretRef] = useState("");
+  const [providerAuthStyle, setProviderAuthStyle] = useState<"bearer" | "header" | "query">("bearer");
+  const [providerAuthParam, setProviderAuthParam] = useState("");
+  const [providerEnabled, setProviderEnabled] = useState(true);
+  const [providerBusy, setProviderBusy] = useState(false);
   const [products, setProducts] = useState<Product[]>([]);
   const [productCount, setProductCount] = useState<number | null>(null);
   const [productListMeta, setProductListMeta] = useState<ProductListResult | null>(null);
@@ -530,6 +576,12 @@ function App() {
   const [relistSelected, setRelistSelected] = useState<Record<string, boolean>>({});
   const [relistResults, setRelistResults] = useState<RelistItem[] | null>(() => loadStoredAcceptance().results);
   const [relistAdopt, setRelistAdopt] = useState<Record<string, boolean>>(() => loadStoredAcceptance().adopt);
+  // Selected candidate index per relist item key (product_id), default 0.
+  const [relistChoice, setRelistChoice] = useState<Record<string, number>>(() => loadStoredAcceptance().choice);
+  // Module 1 intake (read-only): xlsx extract + drag-drop image import.
+  const [relistImportBusy, setRelistImportBusy] = useState(false);
+  const [relistImportError, setRelistImportError] = useState<string | null>(null);
+  const [relistDragOver, setRelistDragOver] = useState(false);
   const [relistBusy, setRelistBusy] = useState(false);
   const [relistPushing, setRelistPushing] = useState(false);
   const [relistPushResults, setRelistPushResults] = useState<RelistPushResult[] | null>(
@@ -571,7 +623,12 @@ function App() {
   const relistSelectedCount = relistProducts.filter((product) => relistSelected[product.product_id]).length;
   const module3SelectedCount = module3Products.filter((product) => module3Selected[product.product_id]).length;
   const relistAdoptCount = relistResults
-    ? relistResults.filter((item) => item.new_url && !item.error && relistAdopt[item.product_id]).length
+    ? relistResults.filter(
+        (item) =>
+          selectedCandidateUrl(item, relistChoice[item.product_id]) &&
+          !item.error &&
+          relistAdopt[item.product_id]
+      ).length
     : 0;
   const module3AdoptCount = module3Results
     ? module3Results.filter((item) => item.proposal && !item.error && module3Adopt[item.product_id]).length
@@ -754,13 +811,14 @@ function App() {
         JSON.stringify({
           results: relistResults,
           adopt: relistAdopt,
-          pushResults: relistPushResults
+          pushResults: relistPushResults,
+          choice: relistChoice
         })
       );
     } catch {
       // localStorage may be unavailable or full; persistence is non-critical.
     }
-  }, [relistResults, relistAdopt, relistPushResults]);
+  }, [relistResults, relistAdopt, relistPushResults, relistChoice]);
 
   async function api(path: string, init: RequestInit = {}) {
     return fetch(`${runtime.skill_api}${path}`, {
@@ -933,6 +991,114 @@ function App() {
     }
   }
 
+  // Provider config — Sub-form A: save a named secret. The key field is an empty
+  // human input; the response returns ONLY a fingerprint, never the key.
+  async function saveSecret() {
+    const name = secretName.trim();
+    if (!name) {
+      setMessage(c.providers.msgNameRequired);
+      return;
+    }
+    if (!/^[a-z0-9_]+$/.test(name)) {
+      setMessage(c.providers.msgNamePolicy);
+      return;
+    }
+    if (!secretValue) {
+      setMessage(c.providers.msgValueRequired);
+      return;
+    }
+    setProviderBusy(true);
+    try {
+      const response = await api("/config/secret", {
+        method: "POST",
+        body: JSON.stringify({ name, value: secretValue })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setSecretFingerprint(null);
+        setMessage(c.providers.msgSecretFailed(userFacingError(data.error)));
+        return;
+      }
+      setSecretValue(""); // never retain the raw key in component state
+      setSecretFingerprint(data.fingerprint as string);
+      setMessage(c.providers.msgSecretSaved(data.name, data.fingerprint));
+      await checkHealth();
+    } catch {
+      setMessage(c.providers.msgSecretFailed(c.messages.localServiceUnreachable));
+    } finally {
+      setProviderBusy(false);
+    }
+  }
+
+  // Provider config — Sub-form B: add/replace a provider entry. Fetches the
+  // current registry (GET), merges this entry into its capability vec (add or
+  // replace by base_url+model), and POSTs the full merged registry back.
+  async function saveProvider() {
+    const baseUrl = providerBaseUrl.trim();
+    const model = providerModel.trim();
+    const ref = providerSecretRef.trim();
+    if (!baseUrl || !model || !ref) {
+      setMessage(c.providers.msgProviderFieldsRequired);
+      return;
+    }
+    let auth: { bearer?: Record<string, never>; header?: { name: string }; query?: { name: string } } | string;
+    if (providerAuthStyle === "bearer") {
+      auth = "bearer";
+    } else {
+      const paramName = providerAuthParam.trim();
+      if (!paramName) {
+        setMessage(c.providers.msgAuthParamRequired);
+        return;
+      }
+      auth =
+        providerAuthStyle === "header"
+          ? { header: { name: paramName } }
+          : { query: { name: paramName } };
+    }
+    const entry = {
+      kind: providerKind,
+      base_url: baseUrl,
+      model,
+      secret_ref: ref,
+      auth,
+      enabled: providerEnabled
+    };
+    setProviderBusy(true);
+    try {
+      const getResponse = await api("/config/registry", { method: "GET" });
+      const current = await getResponse.json();
+      if (!getResponse.ok) {
+        setMessage(c.providers.msgProviderFailed(userFacingError(current.error)));
+        return;
+      }
+      const registry = {
+        image_gen: Array.isArray(current.image_gen) ? current.image_gen : [],
+        text_gen: Array.isArray(current.text_gen) ? current.text_gen : [],
+        video_gen: Array.isArray(current.video_gen) ? current.video_gen : []
+      } as Record<string, Record<string, unknown>[]>;
+      const list = registry[providerCapability];
+      const idx = list.findIndex((e) => e.base_url === baseUrl && e.model === model);
+      if (idx >= 0) list[idx] = entry as unknown as Record<string, unknown>;
+      else list.push(entry as unknown as Record<string, unknown>);
+
+      const postResponse = await api("/config/registry", {
+        method: "POST",
+        body: JSON.stringify(registry)
+      });
+      const saved = await postResponse.json();
+      if (!postResponse.ok) {
+        setMessage(c.providers.msgProviderFailed(userFacingError(saved.error)));
+        return;
+      }
+      setMessage(c.providers.msgProviderSaved(providerCapability));
+      await checkHealth();
+    } catch {
+      setMessage(c.providers.msgProviderFailed(c.messages.localServiceUnreachable));
+    } finally {
+      setProviderBusy(false);
+    }
+  }
+
   async function validateConfig() {
     try {
       const response = await api("/config/ozon/validate", { method: "POST" });
@@ -1072,19 +1238,154 @@ function App() {
         setMessage(c.relist.msgGenFailed(userFacingError(data.error)));
         return;
       }
-      const items = (data.items ?? []) as RelistItem[];
+      const items = ((data.items ?? []) as RelistItem[]).map(migrateRelistItem);
       setRelistResults(items);
       const adopt: Record<string, boolean> = {};
+      const choice: Record<string, number> = {};
       items.forEach((item) => {
-        if (item.new_url && !item.error) adopt[item.product_id] = true;
+        if (item.candidates.length > 0 && !item.error) {
+          adopt[item.product_id] = true;
+          choice[item.product_id] = 0;
+        }
       });
       setRelistAdopt(adopt);
-      const ok = items.filter((item) => item.new_url && !item.error).length;
+      setRelistChoice(choice);
+      const ok = items.filter((item) => item.candidates.length > 0 && !item.error).length;
       setMessage(c.relist.msgGenerated(ok, items.length));
     } catch {
       setMessage(c.relist.msgGenFailed(c.messages.localServiceUnreachable));
     } finally {
       setRelistBusy(false);
+    }
+  }
+
+  // Move the selected candidate index for an item by +/-1, wrapping within range.
+  function stepRelistChoice(item: RelistItem, delta: number) {
+    const n = item.candidates.length;
+    if (n <= 1) return;
+    setRelistChoice((prev) => {
+      const current = prev[item.product_id] ?? 0;
+      const next = ((current + delta) % n + n) % n;
+      return { ...prev, [item.product_id]: next };
+    });
+  }
+
+  // Module 1 intake: read a supplier .xlsx (read-only) and MERGE its rows into
+  // the relist product list. Imported rows get a synthetic "xlsx:"+sku product_id
+  // (they lack an Ozon product_id) and use sku as the offer_id.
+  async function importXlsxFile(file: File) {
+    if (!ensureOzonReadAccess(c.relist.intakeImportXlsx)) return;
+    setRelistImportBusy(true);
+    setRelistImportError(null);
+    try {
+      // The sidecar reads the workbook from disk; we forward the OS path the
+      // browser exposes when available, else the bare name (operator picks the
+      // file the engine can resolve in its working tree).
+      const path = (file as File & { path?: string }).path ?? file.name;
+      const response = await api("/tools/ozon.relist.extract", {
+        method: "POST",
+        body: JSON.stringify({ template_path: path })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setRelistImportError(userFacingError(data.error));
+        return;
+      }
+      const rows = (data.rows ?? []) as {
+        sheet: string;
+        row: number;
+        sku: string | null;
+        title: string | null;
+        listing: string | null;
+        images_main: string[];
+        images_additional: string[];
+      }[];
+      const imported: Product[] = rows
+        .filter((row) => row.sku || row.title)
+        .map((row) => {
+          const sku = (row.sku ?? `${row.sheet}-${row.row}`).trim();
+          return {
+            product_id: `xlsx:${sku}`,
+            offer_id: sku,
+            name: row.title,
+            visibility: null,
+            archived: null,
+            has_fbo_stocks: null,
+            has_fbs_stocks: null
+          };
+        });
+      // MERGE: replace any prior import of the same synthetic id, keep the rest.
+      setRelistProducts((prev) => {
+        const byId = new Map(prev.map((p) => [p.product_id, p]));
+        imported.forEach((p) => byId.set(p.product_id, p));
+        return Array.from(byId.values());
+      });
+      setMessage(c.relist.intakeImportedRows(imported.length));
+    } catch {
+      setRelistImportError(c.messages.localServiceUnreachable);
+    } finally {
+      setRelistImportBusy(false);
+    }
+  }
+
+  // Module 1 intake: host an operator-dropped PNG and attach it as a candidate on
+  // the matching relist item (matched by product_id == "xlsx:"+<basename>, else
+  // applied to the most-recently-imported row). PNG only (server enforces).
+  async function importDroppedImage(file: File) {
+    if (!ensureOzonReadAccess(c.relist.intakeDropImage)) return;
+    setRelistImportBusy(true);
+    setRelistImportError(null);
+    try {
+      const dataBase64 = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result ?? ""));
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+      });
+      const response = await api("/tools/ozon.relist.import-image", {
+        method: "POST",
+        body: JSON.stringify({ filename: file.name, data_base64: dataBase64 })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setRelistImportError(userFacingError(data.error));
+        return;
+      }
+      const newUrl = data.new_url as string;
+      // Match by file stem to an imported sku ("name.png" -> sku "name"); else
+      // attach to the first imported row that has no candidate yet.
+      const stem = file.name.replace(/\.[^.]+$/, "").trim();
+      setRelistResults((prev) => {
+        const existing = prev ?? [];
+        // Ensure an imported product carrying this image exists as a relist item.
+        const matchIndex = existing.findIndex(
+          (item) => item.imported && (item.offer_id === stem || item.product_id === `xlsx:${stem}`)
+        );
+        if (matchIndex >= 0) {
+          const next = existing.slice();
+          const item = next[matchIndex];
+          next[matchIndex] = { ...item, candidates: [...item.candidates, newUrl], error: null };
+          return next;
+        }
+        // No matching imported item yet: create a fresh imported relist row.
+        const productId = `xlsx:${stem || "image"}`;
+        const newItem: RelistItem = {
+          product_id: productId,
+          offer_id: stem || file.name,
+          name: null,
+          original_url: null,
+          candidates: [newUrl],
+          error: null,
+          imported: true
+        };
+        return [...existing, newItem];
+      });
+      setRelistAdopt((prev) => ({ ...prev, [`xlsx:${stem || "image"}`]: true }));
+      setMessage(c.relist.intakeImportedImage);
+    } catch {
+      setRelistImportError(c.messages.localServiceUnreachable);
+    } finally {
+      setRelistImportBusy(false);
     }
   }
 
@@ -1275,8 +1576,9 @@ function App() {
       options.push({ url: value, label });
     };
     (relistResults ?? []).forEach((item) => {
-      if (item.new_url && !item.error) {
-        push(item.new_url, c.video.frameNewImage(item.offer_id || item.product_id));
+      const selected = selectedCandidateUrl(item, relistChoice[item.product_id]);
+      if (selected && !item.error) {
+        push(selected, c.video.frameNewImage(item.offer_id || item.product_id));
       }
       // The module-2 original primary is also a valid first frame.
       push(item.original_url, c.video.framePrimary(item.offer_id || item.product_id));
@@ -1288,7 +1590,7 @@ function App() {
       );
     }
     return options;
-  }, [relistResults, productDetail, c]);
+  }, [relistResults, relistChoice, productDetail, c]);
 
   // Stop any in-flight poll loop (component teardown, new job, or terminal job).
   function stopVideoPoll() {
@@ -1392,10 +1694,13 @@ function App() {
         (m3Fields?.title || m3?.source.title || relist?.name || product?.name || "").trim();
       const listing = (m3Fields?.description || m3?.source.description || "").trim();
 
-      // Primary image: prefer the adopted module-2 new_url, else the product's
-      // original primary image.
+      // Primary image: prefer the adopted module-2 selected candidate, else the
+      // product's original primary image.
+      const selectedImage = relist
+        ? selectedCandidateUrl(relist, relistChoice[productId])
+        : null;
       const adoptedImage =
-        relist && relist.new_url && !relist.error && relistAdopt[productId] ? relist.new_url : null;
+        relist && selectedImage && !relist.error && relistAdopt[productId] ? selectedImage : null;
       const primaryImageUrl = adoptedImage || relist?.original_url || null;
 
       rows.push({
@@ -1462,9 +1767,18 @@ function App() {
 
   async function pushRelist() {
     if (!relistResults) return;
+    // Push-by-product_id only applies to API-sourced rows. Imported (.xlsx) rows
+    // have a synthetic product_id and are excluded — they are export-only.
     const items = relistResults
-      .filter((item) => item.new_url && !item.error && relistAdopt[item.product_id])
-      .map((item) => ({ product_id: item.product_id, new_primary_url: item.new_url as string }));
+      .filter((item) => {
+        if (item.imported || item.error) return false;
+        if (!relistAdopt[item.product_id]) return false;
+        return Boolean(selectedCandidateUrl(item, relistChoice[item.product_id]));
+      })
+      .map((item) => ({
+        product_id: item.product_id,
+        new_primary_url: selectedCandidateUrl(item, relistChoice[item.product_id]) as string
+      }));
     if (items.length === 0) {
       setMessage(c.relist.msgAdoptFirst);
       return;
@@ -2084,6 +2398,42 @@ function App() {
                 <Sparkles size={16} /> {relistBusy ? c.relist.generating : c.relist.generate(relistSelectedCount)}
               </button>
             </div>
+
+            <div className="relist-intake">
+              <div className="section-subtitle">{c.relist.intakeTitle}</div>
+              <p className="hint">{c.relist.intakeDescription}</p>
+              <label className="file-button">
+                <input
+                  type="file"
+                  accept=".xlsx,.xlsm"
+                  style={{ display: "none" }}
+                  disabled={!canUseOzonReadTools || relistImportBusy}
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    if (file) void importXlsxFile(file);
+                    event.target.value = "";
+                  }}
+                />
+                {relistImportBusy ? c.relist.intakeBusy : c.relist.intakeImportXlsx}
+              </label>
+              <div
+                className={`drop-zone ${relistDragOver ? "drag-over" : ""}`}
+                onDragOver={(event) => {
+                  event.preventDefault();
+                  setRelistDragOver(true);
+                }}
+                onDragLeave={() => setRelistDragOver(false)}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  setRelistDragOver(false);
+                  const file = event.dataTransfer.files?.[0];
+                  if (file) void importDroppedImage(file);
+                }}
+              >
+                {c.relist.intakeDropImage}
+              </div>
+              {relistImportError && <p className="notice error">{relistImportError}</p>}
+            </div>
             <div className="product-list relist-list">
               {relistProducts.length === 0 && <p className="empty">{c.relist.emptyProducts}</p>}
               {relistProducts.map((product) => (
@@ -2125,6 +2475,7 @@ function App() {
                       <div className="relist-card-head">
                         <strong>{item.offer_id || item.product_id}</strong>
                         {item.name && <span>{item.name}</span>}
+                        {item.imported && <span className="badge">{c.relist.importedBadge}</span>}
                       </div>
                       {item.error ? (
                         <p className="notice error">{userFacingError(item.error)}</p>
@@ -2136,10 +2487,39 @@ function App() {
                               <figcaption>{c.relist.before}</figcaption>
                             </figure>
                             <figure>
-                              {item.new_url && <img src={item.new_url} alt="after" />}
+                              {selectedCandidateUrl(item, relistChoice[item.product_id]) && (
+                                <img
+                                  src={selectedCandidateUrl(item, relistChoice[item.product_id]) as string}
+                                  alt="after"
+                                />
+                              )}
                               <figcaption>{c.relist.after}</figcaption>
                             </figure>
                           </div>
+                          {item.candidates.length > 1 && (
+                            <div className="relist-candidate-nav">
+                              <button
+                                type="button"
+                                className="secondary-button"
+                                onClick={() => stepRelistChoice(item, -1)}
+                              >
+                                {c.relist.candidatePrev}
+                              </button>
+                              <span>
+                                {c.relist.candidateCounter(
+                                  (relistChoice[item.product_id] ?? 0) + 1,
+                                  item.candidates.length
+                                )}
+                              </span>
+                              <button
+                                type="button"
+                                className="secondary-button"
+                                onClick={() => stepRelistChoice(item, 1)}
+                              >
+                                {c.relist.candidateNext}
+                              </button>
+                            </div>
+                          )}
                           <label className="relist-adopt">
                             <input
                               type="checkbox"
@@ -2148,6 +2528,9 @@ function App() {
                             />
                             {c.relist.adopt}
                           </label>
+                          {item.imported && (
+                            <p className="notice">{c.relist.importedPushHint}</p>
+                          )}
                         </>
                       )}
                     </div>
@@ -2879,6 +3262,161 @@ function App() {
                   {validation.checked_at} · {validationMessage(validation, c)}
                 </p>
               )}
+            </div>
+
+            <div className="panel provider-panel">
+              <div className="section-title">
+                <SlidersHorizontal />
+                <div>
+                  <h2>{c.providers.title}</h2>
+                  <p>{c.providers.description}</p>
+                </div>
+              </div>
+
+              {/* Sub-form A: save a named secret (returns fingerprint only). */}
+              <div className="provider-subform">
+                <div className="section-subtitle">{c.providers.secretFormTitle}</div>
+                <p className="hint">{c.providers.secretFormHint}</p>
+                <div className="form-grid compact">
+                  <label>
+                    {c.providers.secretNameLabel}
+                    <input
+                      autoComplete="off"
+                      placeholder="my_provider_key"
+                      value={secretName}
+                      onChange={(event) => setSecretName(event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    {c.providers.secretValueLabel}
+                    <input
+                      autoComplete="off"
+                      type="password"
+                      placeholder={c.providers.secretValuePlaceholder}
+                      value={secretValue}
+                      onChange={(event) => setSecretValue(event.target.value)}
+                    />
+                  </label>
+                </div>
+                <button className="secondary-button" onClick={saveSecret} disabled={providerBusy}>
+                  <CheckCircle2 size={18} /> {c.providers.saveSecret}
+                </button>
+                {secretFingerprint && (
+                  <p className="notice">{c.providers.savedFingerprint(secretFingerprint)}</p>
+                )}
+              </div>
+
+              {/* Sub-form B: add/replace a provider entry (GET-merge-POST). */}
+              <div className="provider-subform">
+                <div className="section-subtitle">{c.providers.providerFormTitle}</div>
+                <p className="hint">{c.providers.providerFormHint}</p>
+                <div className="form-grid compact">
+                  <label>
+                    {c.providers.capabilityLabel}
+                    <select
+                      value={providerCapability}
+                      onChange={(event) =>
+                        setProviderCapability(event.target.value as typeof providerCapability)
+                      }
+                    >
+                      <option value="image_gen">image_gen</option>
+                      <option value="text_gen">text_gen</option>
+                      <option value="video_gen">video_gen</option>
+                    </select>
+                  </label>
+                  <label>
+                    {c.providers.kindLabel}
+                    <select
+                      value={providerKind}
+                      onChange={(event) => setProviderKind(event.target.value as typeof providerKind)}
+                    >
+                      <option value="openai_images">openai_images</option>
+                      <option value="openai_images_edit">openai_images_edit</option>
+                      <option value="openai_compat_chat">openai_compat_chat</option>
+                      <option value="cloud_video">cloud_video</option>
+                    </select>
+                  </label>
+                  <label>
+                    {c.providers.baseUrlLabel}
+                    <input
+                      autoComplete="off"
+                      placeholder="https://api.example.com/v1"
+                      value={providerBaseUrl}
+                      onChange={(event) => setProviderBaseUrl(event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    {c.providers.modelLabel}
+                    <input
+                      autoComplete="off"
+                      placeholder="model-id"
+                      value={providerModel}
+                      onChange={(event) => setProviderModel(event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    {c.providers.secretRefLabel}
+                    <input
+                      autoComplete="off"
+                      placeholder="my_provider_key"
+                      value={providerSecretRef}
+                      onChange={(event) => setProviderSecretRef(event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    {c.providers.authLabel}
+                    <select
+                      value={providerAuthStyle}
+                      onChange={(event) =>
+                        setProviderAuthStyle(event.target.value as typeof providerAuthStyle)
+                      }
+                    >
+                      <option value="bearer">bearer</option>
+                      <option value="header">header</option>
+                      <option value="query">query</option>
+                    </select>
+                  </label>
+                  {providerAuthStyle !== "bearer" && (
+                    <label>
+                      {c.providers.authParamLabel}
+                      <input
+                        autoComplete="off"
+                        placeholder={providerAuthStyle === "header" ? "X-Api-Key" : "api_key"}
+                        value={providerAuthParam}
+                        onChange={(event) => setProviderAuthParam(event.target.value)}
+                      />
+                    </label>
+                  )}
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={providerEnabled}
+                      onChange={(event) => setProviderEnabled(event.target.checked)}
+                    />
+                    {c.providers.enabledLabel}
+                  </label>
+                </div>
+                <button className="secondary-button" onClick={saveProvider} disabled={providerBusy}>
+                  <CheckCircle2 size={18} /> {c.providers.saveProvider}
+                </button>
+              </div>
+
+              {/* Current providers, sourced from configStatus.capabilities. */}
+              <div className="provider-current">
+                <div className="section-subtitle">{c.providers.currentTitle}</div>
+                {(configStatus?.capabilities ?? []).map((cap) => (
+                  <div className="status-item" key={cap.capability}>
+                    <span>{cap.capability}</span>
+                    <strong>
+                      {cap.provider_kind ?? c.providers.none}
+                      {cap.model ? ` · ${cap.model}` : ""}
+                    </strong>
+                    <em className={cap.ready ? "badge ok-badge" : "badge warn-badge"}>
+                      {cap.ready ? c.providers.ready : c.providers.notReady}
+                    </em>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
         </details>

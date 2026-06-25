@@ -70,6 +70,14 @@ def main(argv=None) -> int:
     p_inj.add_argument("--config", required=True)
     p_inj.add_argument("--sheet", default=None)
 
+    p_ext = sub.add_parser(
+        "extract", parents=[common],
+        help="read a workbook and emit per-row {sku,title,listing,images} JSON "
+             "to stdout (read-only; never writes)")
+    p_ext.add_argument("--in", dest="in_path", required=True)
+    p_ext.add_argument("--config", required=True)
+    p_ext.add_argument("--sheet", default=None)
+
     p_push = sub.add_parser(
         "push-ozon", parents=[common],
         help="push a relisted .xlsx back to Ozon (images, optional title)")
@@ -96,6 +104,8 @@ def main(argv=None) -> int:
             return _cmd_gen_sample(args)
         if args.command == "inject":
             return _cmd_inject(args)
+        if args.command == "extract":
+            return _cmd_extract(args)
         if args.command == "push-ozon":
             return _cmd_push_ozon(args)
     except (ConfigError, MappingError, TransformError) as exc:
@@ -205,6 +215,48 @@ def _cmd_inject(args) -> int:
             f"main_image={placed['main_image_col']}  "
             f"additional_images={placed['additional_image_cols']}"
         )
+    return 0
+
+
+def _flatten_image_urls(cells) -> list:
+    """Flatten a list[ImageCell] into a flat list[str] of URLs, in order."""
+    urls: list = []
+    for ic in cells:
+        for u in (ic.urls or []):
+            if u:
+                urls.append(str(u))
+    return urls
+
+
+def _cmd_extract(args) -> int:
+    """Read-only: project each ProductRow to a JSON row and dump to stdout.
+
+    Mirrors `verify --report json`: pure read, no write side-effects. Shares the
+    0/2/3 exit-code contract via main()'s try/except (load_config / detect_header
+    raise ConfigError/MappingError -> 2; preflight risk -> 3)."""
+    from .extract import extract
+
+    config = load_config(args.config)
+    per_sheet = extract(args.in_path, config)
+
+    rows_out: list = []
+    for sheet_title, (_mapped, product_rows) in per_sheet.items():
+        if args.sheet and sheet_title != args.sheet:
+            continue
+        for pr in product_rows:
+            rows_out.append(
+                {
+                    "sheet": pr.sheet,
+                    "row": pr.row,
+                    "sku": pr.sku,
+                    "title": pr.title,
+                    "listing": pr.listing,
+                    "images_main": _flatten_image_urls(pr.images_main),
+                    "images_additional": _flatten_image_urls(pr.images_additional),
+                }
+            )
+
+    print(json.dumps({"rows": rows_out}, ensure_ascii=False))
     return 0
 
 

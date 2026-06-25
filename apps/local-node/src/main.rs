@@ -89,6 +89,10 @@ const RELIST_OZON_RULES: &str = "\nRULE 1 - Keep the product unchanged: reproduc
 // Portrait 2:3 — room for the headline + badges above/over the product.
 const RELIST_IMAGE_SIZE: &str = "1024x1536";
 const RELIST_MAX_BATCH: usize = 12;
+/// Number of restyle candidates generated per product in the relist workbench.
+/// The operator picks one in the UI; a partial failure returns the successful
+/// subset rather than failing the whole item.
+const RELIST_MAX_CANDIDATES: usize = 3;
 const SECRET_OZON_CONFIG: &str = "ozon_config";
 const SECRET_OPENAI_CONFIG: &str = "openai_config";
 const SECRET_MODEL_REGISTRY: &str = "model_registry";
@@ -229,13 +233,22 @@ fn skill_router(state: LocalState) -> Router {
         .route("/config/ozon", post(save_ozon_config))
         .route("/config/ozon/validate", post(validate_ozon_config))
         .route("/config/openai", post(save_openai_config))
-        .route("/config/registry", post(save_model_registry))
+        .route(
+            "/config/registry",
+            get(get_model_registry).post(save_model_registry),
+        )
+        .route("/config/secret", post(save_secret))
         .route("/tools/ozon.products.count", post(ozon_products_count))
         .route("/tools/ozon.products.list", post(ozon_products_list))
         .route("/tools/ozon.products.get", post(ozon_products_get))
         .route("/tools/ozon.relist.generate", post(relist_generate))
         .route("/tools/ozon.relist.push", post(relist_push))
         .route("/tools/ozon.relist.export", post(relist_export))
+        .route("/tools/ozon.relist.extract", post(relist_extract))
+        .route(
+            "/tools/ozon.relist.import-image",
+            post(relist_import_image),
+        )
         .route(
             "/tools/ozon.module3.recognize",
             post(module3_recognize),
@@ -796,6 +809,22 @@ async fn openclaw_manifest(State(state): State<LocalState>) -> Json<OpenClawMani
                 description: "Module 4 export/delivery: inject reviewed per-row title/listing/image URLs into an Ozon template .xlsx and run the engine process --verify to write a deliverable workbook locally (NO Ozon push). Returns the deliverable file path + verify summary; a verification failure (frozen-cell change) is a hard error and the file is never returned. Needs the local Python engine (dev uses the repo .venv)",
             },
             OpenClawTool {
+                name: "ozon.relist.extract",
+                method: "POST",
+                path: "/tools/ozon.relist.extract",
+                risk: "read_only",
+                approval_required: false,
+                description: "Module 1 intake: read a supplier .xlsx with the local Python engine and return per-row {sheet,row,sku,title,listing,images_main,images_additional} JSON for review/merge into the relist list. READ-ONLY — never writes a workbook or pushes to Ozon",
+            },
+            OpenClawTool {
+                name: "ozon.relist.import-image",
+                method: "POST",
+                path: "/tools/ozon.relist.import-image",
+                risk: "read_only",
+                approval_required: false,
+                description: "Module 1 intake: accept an operator-dragged PNG image as base64-in-JSON, host it on a public image host, and return the hosted URL so it can be set as a relist candidate. READ-ONLY — nothing is pushed to Ozon",
+            },
+            OpenClawTool {
                 name: "poster.handoff",
                 method: "POST",
                 path: "/poster/handoff",
@@ -1086,6 +1115,74 @@ async fn save_model_registry(
         video_gen_entries: validated.video_gen.len(),
         saved_at: Utc::now().to_rfc3339(),
     }))
+}
+
+/// Reserved secret names that back the node's own config blobs. An operator may
+/// NOT overwrite these through the generic /config/secret endpoint.
+const RESERVED_SECRET_NAMES: &[&str] = &[
+    SECRET_OZON_CONFIG,
+    SECRET_OPENAI_CONFIG,
+    SECRET_MODEL_REGISTRY,
+    SECRET_CLOUD_LEASE,
+    SECRET_DEVICE_FINGERPRINT,
+];
+
+async fn save_secret(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Json(input): Json<SecretSaveRequest>,
+) -> Result<Json<SecretSaveResponse>, ApiError> {
+    require_operator_token(&state, &headers)?;
+
+    let name = input.name.trim().to_string();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("secret name is required"));
+    }
+    // Policy: lowercase ascii, digits, underscore only — the same shape registry
+    // secret_refs use. Rejecting anything else keeps refs predictable + safe.
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Err(ApiError::bad_request(
+            "secret name must match [a-z0-9_]+ (lowercase letters, digits, underscore)",
+        ));
+    }
+    if RESERVED_SECRET_NAMES.contains(&name.as_str()) {
+        return Err(ApiError::bad_request(format!(
+            "'{name}' is a reserved secret name and cannot be set here"
+        )));
+    }
+
+    let value = input.value;
+    if value.is_empty() {
+        return Err(ApiError::bad_request("secret value is required"));
+    }
+    let secret = SecretString::from(value);
+    let fingerprint = fingerprint_secret(&secret);
+    state
+        .secrets
+        .put(SecretName::new(name.clone()), secret)
+        .await
+        .map_err(|_| ApiError::internal("failed to save secret"))?;
+
+    Ok(Json(SecretSaveResponse {
+        name,
+        fingerprint,
+        saved_at: Utc::now().to_rfc3339(),
+    }))
+}
+
+/// Read-only view of the persisted model registry so the provider UI can fetch,
+/// merge one entry, and re-POST the full registry. Includes secret_ref + auth but
+/// NEVER a raw key (the registry blob never stores one — only secret_ref).
+async fn get_model_registry(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+) -> Result<Json<StoredModelRegistry>, ApiError> {
+    require_operator_token(&state, &headers)?;
+    let registry = load_persisted_model_registry(&state).await;
+    Ok(Json(registry))
 }
 
 async fn save_portal_lease(
@@ -3388,6 +3485,224 @@ fn parse_verify_summary(stdout: &[u8]) -> Option<VerifySummary> {
 }
 
 // ------------------------------------------------------------------------- //
+// Module 1 intake (READ-ONLY): read a supplier .xlsx with the Python engine and
+// project each product row to JSON so the workbench can merge imported rows into
+// the relist list. NO inject / process / push — this never mutates a workbook or
+// touches Ozon.
+// ------------------------------------------------------------------------- //
+
+#[derive(Debug, Deserialize)]
+struct RelistExtractRequest {
+    template_path: String,
+    #[serde(default)]
+    config_path: Option<String>,
+    #[serde(default)]
+    sheet: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ExtractedRow {
+    #[serde(default)]
+    sheet: String,
+    #[serde(default)]
+    row: u64,
+    #[serde(default)]
+    sku: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    listing: Option<String>,
+    #[serde(default)]
+    images_main: Vec<String>,
+    #[serde(default)]
+    images_additional: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtractStdout {
+    #[serde(default)]
+    rows: Vec<ExtractedRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct RelistExtractResponse {
+    rows: Vec<ExtractedRow>,
+}
+
+async fn relist_extract(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Json(input): Json<RelistExtractRequest>,
+) -> Result<Json<RelistExtractResponse>, ApiError> {
+    require_bridge_or_operator_token(&state, &headers)?;
+    require_valid_lease_with_feature(&state, Feature::OzonRead).await?;
+
+    let template_path = input.template_path.trim().to_string();
+    if template_path.is_empty() {
+        return Err(ApiError::bad_request("template_path is required"));
+    }
+    let template = PathBuf::from(&template_path);
+    if !template.is_file() {
+        return Err(ApiError::bad_request(format!(
+            "template .xlsx not found: {template_path}"
+        )));
+    }
+
+    let config_path = input
+        .config_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_export_config_path);
+    if !config_path.is_file() {
+        return Err(ApiError::bad_request(format!(
+            "config not found: {}",
+            config_path.display()
+        )));
+    }
+
+    let sheet = input
+        .sheet
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let python = python_interpreter();
+    let root = engine_root();
+
+    let rows = tokio::task::spawn_blocking(move || {
+        run_extract_pipeline(python, root, template, config_path, sheet)
+    })
+    .await
+    .map_err(|_| ApiError::internal("extract task panicked"))??;
+
+    Ok(Json(RelistExtractResponse { rows }))
+}
+
+/// Blocking read-only engine call: `-m ozon_excel_core.cli extract` and parse the
+/// JSON object it prints to stdout. Maps the engine's deterministic exit codes
+/// (0/2/3) onto ApiError. MUST run inside tokio::task::spawn_blocking — it uses
+/// std::process::Command (no tokio `process` feature). No secrets are forwarded.
+fn run_extract_pipeline(
+    python: PathBuf,
+    root: PathBuf,
+    template: PathBuf,
+    config_path: PathBuf,
+    sheet: Option<String>,
+) -> Result<Vec<ExtractedRow>, ApiError> {
+    use std::process::Command;
+
+    let pythonpath = root.join("src");
+    let template_arg = template.to_string_lossy().to_string();
+    let config_arg = config_path.to_string_lossy().to_string();
+
+    let mut args: Vec<String> = vec![
+        "-m".into(),
+        "ozon_excel_core.cli".into(),
+        "extract".into(),
+        "--in".into(),
+        template_arg,
+        "--config".into(),
+        config_arg,
+    ];
+    if let Some(sheet) = sheet {
+        args.push("--sheet".into());
+        args.push(sheet);
+    }
+
+    let output = Command::new(&python)
+        .current_dir(&root)
+        .env("PYTHONPATH", &pythonpath)
+        .args(&args)
+        .output();
+    let output = match output {
+        Ok(out) => out,
+        Err(err) => {
+            return Err(ApiError::internal(format!(
+                "failed to launch Python engine ({}): {err}",
+                python.display()
+            )));
+        }
+    };
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        let stderr = summarize_stderr(&output.stderr);
+        return Err(map_engine_exit(code, &stderr, "extract"));
+    }
+
+    let parsed: ExtractStdout = serde_json::from_slice(&output.stdout).map_err(|err| {
+        ApiError::bad_gateway(format!("extract did not return parseable JSON: {err}"))
+    })?;
+    Ok(parsed.rows)
+}
+
+// ------------------------------------------------------------------------- //
+// Module 1 intake (READ-ONLY): accept an operator-dragged image as base64-in-JSON,
+// host it publicly, and return the hosted URL so the workbench can set it as a
+// candidate on a relist row. PNG is required: the image-host upload part is hard
+// PNG (relist_upload_to_host), and we deliberately do NOT pull in a heavy image
+// transcoder crate just for this — non-PNG drops are rejected with a clear error.
+// ------------------------------------------------------------------------- //
+
+#[derive(Debug, Deserialize)]
+struct RelistImportImageRequest {
+    #[serde(default)]
+    filename: Option<String>,
+    data_base64: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RelistImportImageResponse {
+    new_url: String,
+}
+
+/// The 8-byte PNG magic number. We only accept PNG bytes here (see module note).
+const PNG_MAGIC: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+async fn relist_import_image(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Json(input): Json<RelistImportImageRequest>,
+) -> Result<Json<RelistImportImageResponse>, ApiError> {
+    require_bridge_or_operator_token(&state, &headers)?;
+    require_valid_lease_with_feature(&state, Feature::OzonRead).await?;
+
+    // Tolerate a `data:image/png;base64,...` data-URL prefix from the browser.
+    let raw = input.data_base64.trim();
+    let raw = raw.rsplit_once(',').map(|(_, b)| b).unwrap_or(raw);
+    if raw.is_empty() {
+        return Err(ApiError::bad_request("data_base64 is required"));
+    }
+    let bytes = BASE64_STANDARD
+        .decode(raw.as_bytes())
+        .map_err(|_| ApiError::bad_request("data_base64 is not valid base64"))?;
+    if bytes.len() < PNG_MAGIC.len() || &bytes[..PNG_MAGIC.len()] != PNG_MAGIC {
+        return Err(ApiError::bad_request(
+            "only PNG images are accepted — please drop a .png file (other formats are not supported by this local helper)",
+        ));
+    }
+
+    let filename = input
+        .filename
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|name| {
+            if name.to_ascii_lowercase().ends_with(".png") {
+                name.to_string()
+            } else {
+                format!("{name}.png")
+            }
+        })
+        .unwrap_or_else(|| format!("import-{}.png", Uuid::new_v4().simple()));
+
+    let new_url = relist_host_image(&state, &filename, bytes).await?;
+    Ok(Json(RelistImportImageResponse { new_url }))
+}
+
+// ------------------------------------------------------------------------- //
 // Re-listing workbench: restyle a product's primary image (GPT image-edit),
 // host it publicly, and push it back to Ozon as the new primary image.
 // Images go through the API (proven-reliable). Title/listing are intentionally
@@ -3455,7 +3770,9 @@ struct RelistItem {
     offer_id: String,
     name: Option<String>,
     original_url: Option<String>,
-    new_url: Option<String>,
+    /// Up to RELIST_MAX_CANDIDATES hosted restyle URLs; the operator selects one
+    /// in the UI. Empty when generation failed (see `error`).
+    candidates: Vec<String>,
     error: Option<String>,
 }
 
@@ -3528,7 +3845,7 @@ async fn relist_generate(
                 offer_id: label,
                 name: None,
                 original_url: None,
-                new_url: None,
+                candidates: Vec::new(),
                 error: Some(error),
             }),
         }
@@ -4901,23 +5218,41 @@ async fn relist_generate_one(
         Some(value) => value.to_string(),
         None => compose_relist_prompt(&product),
     };
+    // The source photo is downloaded once and reused for every candidate. Each
+    // candidate re-runs the image edit (the model varies) + a fresh host upload.
     let source = relist_download(state, &original)
         .await
         .map_err(|error| error.message)?;
-    let edited = relist_edit_image(state, source, &prompt)
-        .await
-        .map_err(|error| error.message)?;
-    let filename = format!("relist-{}-{}.png", product.product_id, Uuid::new_v4().simple());
-    let new_url = relist_host_image(state, &filename, edited)
-        .await
-        .map_err(|error| error.message)?;
+
+    let mut candidates = Vec::with_capacity(RELIST_MAX_CANDIDATES);
+    let mut last_error: Option<String> = None;
+    for _ in 0..RELIST_MAX_CANDIDATES {
+        let edited = match relist_edit_image(state, source.clone(), &prompt).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                last_error = Some(error.message);
+                continue;
+            }
+        };
+        let filename = format!("relist-{}-{}.png", product.product_id, Uuid::new_v4().simple());
+        match relist_host_image(state, &filename, edited).await {
+            Ok(url) => candidates.push(url),
+            Err(error) => last_error = Some(error.message),
+        }
+    }
+
+    // Partial failure returns the successful subset; only a total failure (no
+    // candidate hosted) is reported as an error for this item.
+    if candidates.is_empty() {
+        return Err(last_error.unwrap_or_else(|| "failed to generate any candidate".to_string()));
+    }
 
     Ok(RelistItem {
         product_id: product.product_id,
         offer_id: product.offer_id,
         name: product.name,
         original_url: Some(original),
-        new_url: Some(new_url),
+        candidates,
         error: None,
     })
 }
@@ -5691,6 +6026,20 @@ struct ModelRegistryResponse {
     image_gen_entries: usize,
     text_gen_entries: usize,
     video_gen_entries: usize,
+    saved_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SecretSaveRequest {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SecretSaveResponse {
+    name: String,
+    /// Stable, non-reversible fingerprint of the saved value. NEVER the key.
+    fingerprint: String,
     saved_at: String,
 }
 
