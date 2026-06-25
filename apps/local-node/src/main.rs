@@ -56,9 +56,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 mod model_router;
+mod video_dialect;
 use model_router::{
     Capability, CapabilityStatus, ProviderEntry, ProviderKind, ResolvedProvider,
-    StoredModelRegistry, apply_auth, endpoint_for, inspect_capabilities, resolve_capability,
+    StoredModelRegistry, VideoDialect, apply_auth, endpoint_for, inspect_capabilities,
+    resolve_capability,
 };
 
 const DEFAULT_DEV_LOCAL_TOKEN: &str = "dev-local-token";
@@ -1092,6 +1094,8 @@ async fn save_model_registry(
                 secret_ref: secret_ref.to_string(),
                 auth: entry.auth.clone(),
                 enabled: entry.enabled,
+                video_dialect: entry.video_dialect,
+                extra: entry.extra.clone(),
             });
         }
     }
@@ -4219,6 +4223,7 @@ async fn chat_completion(
             model,
             api_key,
             auth,
+            ..
         } => (base_url, model, api_key, auth),
         ResolvedProvider::Generic { .. } => {
             return Err(ApiError::bad_request(
@@ -4443,12 +4448,22 @@ fn clamp_video_duration(requested: Option<u32>) -> u32 {
     }
 }
 
-/// Resolve the `cloud_video` provider via the PR2 seam. NO gating here (the
-/// handler gates first); mirrors `chat_completion`'s NotConfigured / wrong-kind
-/// errors so the UI can surface a clear "configure a video provider" message.
-async fn resolve_cloud_video(
-    state: &LocalState,
-) -> Result<(String, String, String, model_router::AuthStyle), ApiError> {
+/// A fully-resolved cloud-video provider: connection + the dispatch dialect and
+/// its `extra` knobs. NO gating here (the handler gates first); mirrors
+/// `chat_completion`'s NotConfigured / wrong-kind errors so the UI can surface a
+/// clear "configure a video provider" message.
+struct ResolvedVideoProvider {
+    base_url: String,
+    model: String,
+    api_key: String,
+    auth: model_router::AuthStyle,
+    dialect: VideoDialect,
+    extra: std::collections::BTreeMap<String, String>,
+}
+
+/// Resolve the `cloud_video` provider via the PR2 seam, threading the dialect +
+/// extra so the codec can dispatch.
+async fn resolve_cloud_video(state: &LocalState) -> Result<ResolvedVideoProvider, ApiError> {
     match resolve_capability(state, Capability::VideoGen).await? {
         ResolvedProvider::Generic {
             kind: ProviderKind::CloudVideo,
@@ -4456,7 +4471,16 @@ async fn resolve_cloud_video(
             model,
             api_key,
             auth,
-        } => Ok((base_url, model, api_key, auth)),
+            video_dialect,
+            extra,
+        } => Ok(ResolvedVideoProvider {
+            base_url,
+            model,
+            api_key,
+            auth,
+            dialect: video_dialect,
+            extra,
+        }),
         ResolvedProvider::Generic { .. } => Err(ApiError::bad_request(
             "configured video provider is not a cloud_video provider",
         )),
@@ -4469,12 +4493,53 @@ async fn resolve_cloud_video(
     }
 }
 
+/// Execute one dialect [`video_dialect::HttpSpec`] and return the parsed JSON.
+/// Centralizes method/header/body wiring + non-2xx handling for all non-default
+/// dialects. The api key (incl. `ak:sk` for signed dialects) is placed by the
+/// dialect's own headers and is never logged here.
+async fn execute_video_spec(
+    state: &LocalState,
+    spec: video_dialect::HttpSpec,
+    phase: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let mut builder = match spec.method {
+        video_dialect::HttpMethod::Get => state.http_client.get(&spec.url),
+        video_dialect::HttpMethod::Post => state.http_client.post(&spec.url),
+    };
+    for (name, value) in &spec.headers {
+        builder = builder.header(name, value);
+    }
+    if let Some(body) = &spec.body {
+        builder = builder.json(body);
+    }
+    let response = builder
+        .send()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("video {phase} request failed: {error}")))?;
+
+    if !response.status().is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "unknown error".to_string());
+        return Err(ApiError::bad_gateway(format!(
+            "video {phase} failed: {}",
+            summarize_openai_error(&body)
+        )));
+    }
+
+    response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("invalid video {phase} response: {error}")))
+}
+
 /// Create an async generation job at the provider and return its job id.
 ///
-/// POSTs the OpenAI-compatible create body to `endpoint_for(CloudVideo, base)`
-/// via `apply_auth` (so Header/Query-keyed providers also work). The JSON field
-/// paths are sensible OpenAI-ish DEFAULTS — adapting to a chosen vendor = tweak
-/// `VideoCreateRequest` / `VideoCreateResponse`.
+/// Dispatches on the configured [`VideoDialect`]. `OpenAiCompat` is the DEFAULT
+/// and runs the original module-6 code path VERBATIM (same `VideoCreateRequest`
+/// body via `apply_auth` to `endpoint_for(CloudVideo, base)`); the other dialects
+/// build their request through `video_dialect::build_create` + execute it.
 async fn video_create_job(
     state: &LocalState,
     prompt: &str,
@@ -4482,95 +4547,150 @@ async fn video_create_job(
     last_frame_url: Option<&str>,
     duration_seconds: u32,
 ) -> Result<String, ApiError> {
-    let (base_url, model, api_key, auth) = resolve_cloud_video(state).await?;
+    let provider = resolve_cloud_video(state).await?;
 
-    let request = VideoCreateRequest {
-        model,
-        prompt: prompt.to_string(),
-        first_frame: VideoFrameRef {
-            url: first_frame_url.to_string(),
-        },
-        last_frame: last_frame_url.map(|url| VideoFrameRef {
-            url: url.to_string(),
-        }),
-        duration_seconds,
-    };
+    if provider.dialect == VideoDialect::OpenAiCompat {
+        // --- DEFAULT path: byte-for-byte the original module-6 behavior. ---
+        let request = VideoCreateRequest {
+            model: provider.model.clone(),
+            prompt: prompt.to_string(),
+            first_frame: VideoFrameRef {
+                url: first_frame_url.to_string(),
+            },
+            last_frame: last_frame_url.map(|url| VideoFrameRef {
+                url: url.to_string(),
+            }),
+            duration_seconds,
+        };
 
-    let endpoint = endpoint_for(ProviderKind::CloudVideo, &base_url);
-    let builder = state.http_client.post(endpoint).json(&request);
-    let response = apply_auth(builder, &auth, &api_key)
-        .send()
-        .await
-        .map_err(|error| ApiError::bad_gateway(format!("video create request failed: {error}")))?;
-
-    if !response.status().is_success() {
-        let body = response
-            .text()
+        let endpoint = endpoint_for(ProviderKind::CloudVideo, &provider.base_url);
+        let builder = state.http_client.post(endpoint).json(&request);
+        let response = apply_auth(builder, &provider.auth, &provider.api_key)
+            .send()
             .await
-            .unwrap_or_else(|_| "unknown error".to_string());
-        return Err(ApiError::bad_gateway(format!(
-            "video create failed: {}",
-            summarize_openai_error(&body)
-        )));
+            .map_err(|error| {
+                ApiError::bad_gateway(format!("video create request failed: {error}"))
+            })?;
+
+        if !response.status().is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unknown error".to_string());
+            return Err(ApiError::bad_gateway(format!(
+                "video create failed: {}",
+                summarize_openai_error(&body)
+            )));
+        }
+
+        let payload: VideoCreateResponse = response.json().await.map_err(|error| {
+            ApiError::bad_gateway(format!("invalid video create response: {error}"))
+        })?;
+
+        return payload
+            .provider_job_id()
+            .ok_or_else(|| ApiError::bad_gateway("video create returned no job id"));
     }
 
-    let payload: VideoCreateResponse = response
-        .json()
-        .await
-        .map_err(|error| ApiError::bad_gateway(format!("invalid video create response: {error}")))?;
-
-    payload
-        .provider_job_id()
-        .ok_or_else(|| ApiError::bad_gateway("video create returned no job id"))
+    // --- Per-dialect path. ---
+    let now = Utc::now().timestamp();
+    let inputs = video_dialect::CreateInputs {
+        base_url: &provider.base_url,
+        model: &provider.model,
+        api_key: &provider.api_key,
+        prompt,
+        first_frame_url,
+        last_frame_url,
+        duration_seconds,
+        extra: &provider.extra,
+    };
+    let spec = video_dialect::build_create(provider.dialect, &inputs, now);
+    let payload = execute_video_spec(state, spec, "create").await?;
+    let outcome = video_dialect::parse_create(provider.dialect, &payload)
+        .map_err(|message| ApiError::bad_gateway(format!("video create: {message}")))?;
+    Ok(outcome.provider_job_id)
 }
 
-/// Poll one job's status at the provider. GETs `endpoint_for(CloudVideo, base) +
-/// "/{provider_job_id}"` via `apply_auth` and returns `(status, video_url?)`.
-/// The status string is mapped tolerantly; the URL is read from common paths.
+/// Poll one job's status at the provider, returning `(status, video_url?, error?)`.
+///
+/// Dispatches on the configured [`VideoDialect`]. `OpenAiCompat` (DEFAULT) runs
+/// the original module-6 GET path VERBATIM. Other dialects build + execute their
+/// poll request via `video_dialect`; MiniMax's two-step `file_id -> retrieve` is
+/// handled by issuing the follow-up fetch the parser requests.
 async fn video_poll_status(
     state: &LocalState,
     provider_job_id: &str,
 ) -> Result<(VideoStatus, Option<String>, Option<String>), ApiError> {
-    let (base_url, _model, api_key, auth) = resolve_cloud_video(state).await?;
-    let endpoint = format!(
-        "{}/{}",
-        endpoint_for(ProviderKind::CloudVideo, &base_url),
-        provider_job_id
-    );
-    let builder = state.http_client.get(endpoint);
-    let response = apply_auth(builder, &auth, &api_key)
-        .send()
-        .await
-        .map_err(|error| ApiError::bad_gateway(format!("video poll request failed: {error}")))?;
+    let provider = resolve_cloud_video(state).await?;
 
-    if !response.status().is_success() {
-        let body = response
-            .text()
+    if provider.dialect == VideoDialect::OpenAiCompat {
+        // --- DEFAULT path: byte-for-byte the original module-6 behavior. ---
+        let endpoint = format!(
+            "{}/{}",
+            endpoint_for(ProviderKind::CloudVideo, &provider.base_url),
+            provider_job_id
+        );
+        let builder = state.http_client.get(endpoint);
+        let response = apply_auth(builder, &provider.auth, &provider.api_key)
+            .send()
             .await
-            .unwrap_or_else(|_| "unknown error".to_string());
-        return Err(ApiError::bad_gateway(format!(
-            "video poll failed: {}",
-            summarize_openai_error(&body)
-        )));
+            .map_err(|error| {
+                ApiError::bad_gateway(format!("video poll request failed: {error}"))
+            })?;
+
+        if !response.status().is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unknown error".to_string());
+            return Err(ApiError::bad_gateway(format!(
+                "video poll failed: {}",
+                summarize_openai_error(&body)
+            )));
+        }
+
+        let payload: VideoStatusResponse = response.json().await.map_err(|error| {
+            ApiError::bad_gateway(format!("invalid video status response: {error}"))
+        })?;
+
+        let status = payload
+            .status
+            .as_deref()
+            .map(map_video_status)
+            // No status field but a URL came back -> treat as succeeded.
+            .unwrap_or(if payload.hosted_url().is_some() {
+                VideoStatus::Succeeded
+            } else {
+                VideoStatus::Running
+            });
+
+        return Ok((status, payload.hosted_url(), payload.error.clone()));
     }
 
-    let payload: VideoStatusResponse = response
-        .json()
-        .await
-        .map_err(|error| ApiError::bad_gateway(format!("invalid video status response: {error}")))?;
+    // --- Per-dialect path. ---
+    let now = Utc::now().timestamp();
+    let poll_inputs = video_dialect::PollInputs {
+        base_url: &provider.base_url,
+        api_key: &provider.api_key,
+        provider_job_id,
+        extra: &provider.extra,
+    };
+    let spec = video_dialect::build_poll(provider.dialect, &poll_inputs, now);
+    let payload = execute_video_spec(state, spec, "poll").await?;
 
-    let status = payload
-        .status
-        .as_deref()
-        .map(map_video_status)
-        // No status field but a URL came back -> treat as succeeded.
-        .unwrap_or(if payload.hosted_url().is_some() {
-            VideoStatus::Succeeded
-        } else {
-            VideoStatus::Running
-        });
-
-    Ok((status, payload.hosted_url(), payload.error.clone()))
+    match video_dialect::parse_poll(provider.dialect, &payload, &poll_inputs) {
+        video_dialect::PollOutcome::Status {
+            status,
+            video_url,
+            error,
+        } => Ok((status, video_url, error)),
+        video_dialect::PollOutcome::NeedsFetch { fetch } => {
+            // MiniMax success: one more GET to resolve file_id -> download_url.
+            let file_payload = execute_video_spec(state, fetch, "file retrieve").await?;
+            let url = video_dialect::parse_minimax_file_retrieve(&file_payload);
+            Ok((VideoStatus::Succeeded, url, None))
+        }
+    }
 }
 
 // --- Module 6 handlers ----------------------------------------------------- //
@@ -6966,6 +7086,8 @@ mod tests {
                     secret_ref: SECRET_OPENAI_CONFIG.to_string(),
                     auth: model_router::AuthStyle::Bearer,
                     enabled: true,
+                    video_dialect: model_router::VideoDialect::default(),
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             },
@@ -7022,6 +7144,8 @@ mod tests {
                         name: "x-api-key".to_string(),
                     },
                     enabled: true,
+                    video_dialect: model_router::VideoDialect::default(),
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             },
@@ -7038,6 +7162,7 @@ mod tests {
                 model,
                 api_key,
                 auth,
+                ..
             } => {
                 assert_eq!(kind, model_router::ProviderKind::OpenAiCompatChat);
                 assert_eq!(base_url, "https://chat.example.com");
@@ -7082,6 +7207,8 @@ mod tests {
                     secret_ref: SECRET_OPENAI_CONFIG.to_string(),
                     auth: model_router::AuthStyle::Bearer,
                     enabled: true,
+                    video_dialect: model_router::VideoDialect::default(),
+                    extra: Default::default(),
                 }],
                 ..Default::default()
             }),

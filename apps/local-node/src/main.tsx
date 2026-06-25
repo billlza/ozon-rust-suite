@@ -544,6 +544,15 @@ function App() {
   const [providerAuthStyle, setProviderAuthStyle] = useState<"bearer" | "header" | "query">("bearer");
   const [providerAuthParam, setProviderAuthParam] = useState("");
   const [providerEnabled, setProviderEnabled] = useState(true);
+  // Module 6: per-provider video dialect + adjustable dialect-specific params.
+  const [providerVideoDialect, setProviderVideoDialect] = useState<
+    "openai_compat" | "kling" | "minimax" | "vidu" | "runway" | "jimeng"
+  >("openai_compat");
+  // Dialect-specific extra params as ordered key/value rows (persisted into
+  // ProviderEntry.extra). Empty keys are dropped on save.
+  const [providerExtra, setProviderExtra] = useState<{ key: string; value: string }[]>([
+    { key: "", value: "" }
+  ]);
   const [providerBusy, setProviderBusy] = useState(false);
   const [products, setProducts] = useState<Product[]>([]);
   const [productCount, setProductCount] = useState<number | null>(null);
@@ -1055,7 +1064,7 @@ function App() {
           ? { header: { name: paramName } }
           : { query: { name: paramName } };
     }
-    const entry = {
+    const entry: Record<string, unknown> = {
       kind: providerKind,
       base_url: baseUrl,
       model,
@@ -1063,6 +1072,17 @@ function App() {
       auth,
       enabled: providerEnabled
     };
+    // Module 6: only a cloud_video / video_gen entry carries a dialect + extra.
+    if (providerCapability === "video_gen" && providerKind === "cloud_video") {
+      entry.video_dialect = providerVideoDialect;
+      const extra: Record<string, string> = {};
+      for (const row of providerExtra) {
+        const k = row.key.trim();
+        const v = row.value.trim();
+        if (k) extra[k] = v;
+      }
+      entry.extra = extra;
+    }
     setProviderBusy(true);
     try {
       const getResponse = await api("/config/registry", { method: "GET" });
@@ -3387,6 +3407,26 @@ function App() {
                       />
                     </label>
                   )}
+                  {providerCapability === "video_gen" && providerKind === "cloud_video" && (
+                    <label>
+                      {c.providers.videoDialectLabel}
+                      <select
+                        value={providerVideoDialect}
+                        onChange={(event) =>
+                          setProviderVideoDialect(
+                            event.target.value as typeof providerVideoDialect
+                          )
+                        }
+                      >
+                        <option value="openai_compat">openai_compat</option>
+                        <option value="kling">kling</option>
+                        <option value="minimax">minimax</option>
+                        <option value="vidu">vidu</option>
+                        <option value="runway">runway</option>
+                        <option value="jimeng">jimeng</option>
+                      </select>
+                    </label>
+                  )}
                   <label className="checkbox-label">
                     <input
                       type="checkbox"
@@ -3396,6 +3436,60 @@ function App() {
                     {c.providers.enabledLabel}
                   </label>
                 </div>
+                {providerCapability === "video_gen" &&
+                  providerKind === "cloud_video" &&
+                  providerVideoDialect !== "openai_compat" && (
+                    <div className="provider-extra">
+                      <div className="section-subtitle">{c.providers.extraTitle}</div>
+                      <p className="hint">{c.providers.extraHint}</p>
+                      {providerExtra.map((row, index) => (
+                        <div className="form-grid compact" key={index}>
+                          <label>
+                            {c.providers.extraKeyLabel}
+                            <input
+                              autoComplete="off"
+                              placeholder={c.providers.extraKeyPlaceholder}
+                              value={row.key}
+                              onChange={(event) =>
+                                setProviderExtra((rows) =>
+                                  rows.map((r, i) =>
+                                    i === index ? { ...r, key: event.target.value } : r
+                                  )
+                                )
+                              }
+                            />
+                          </label>
+                          <label>
+                            {c.providers.extraValueLabel}
+                            <input
+                              autoComplete="off"
+                              placeholder={c.providers.extraValuePlaceholder}
+                              value={row.value}
+                              onChange={(event) =>
+                                setProviderExtra((rows) =>
+                                  rows.map((r, i) =>
+                                    i === index ? { ...r, value: event.target.value } : r
+                                  )
+                                )
+                              }
+                            />
+                          </label>
+                        </div>
+                      ))}
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        onClick={() =>
+                          setProviderExtra((rows) => [...rows, { key: "", value: "" }])
+                        }
+                      >
+                        {c.providers.extraAddRow}
+                      </button>
+                    </div>
+                  )}
+                {providerCapability === "video_gen" && providerKind === "cloud_video" && (
+                  <p className="hint">{c.providers.akSkHelp}</p>
+                )}
                 <button className="secondary-button" onClick={saveProvider} disabled={providerBusy}>
                   <CheckCircle2 size={18} /> {c.providers.saveProvider}
                 </button>

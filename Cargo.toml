@@ -28,6 +28,7 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 futures-core = "0.3"
+hex = "0.4"
 hmac = "0.12"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 keyring = "4.0.0"

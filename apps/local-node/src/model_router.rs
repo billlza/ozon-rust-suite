@@ -67,6 +67,31 @@ impl Default for AuthStyle {
     }
 }
 
+/// Per-provider request/response convention for the Module 6 cloud-video codec.
+///
+/// `OpenAiCompat` is the DEFAULT and is byte-for-byte the original module-6
+/// behavior (OpenAI-compatible create + poll). The other variants select a
+/// vendor-specific dialect: the codec dispatches on this value to build the
+/// create/poll request and parse the response. Vendor-specific knobs (region,
+/// service, req_key, version, group_id, …) live in [`ProviderEntry::extra`] so
+/// they can be tuned without code changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoDialect {
+    OpenAiCompat,
+    Kling,
+    MiniMax,
+    Vidu,
+    Runway,
+    Jimeng,
+}
+
+impl Default for VideoDialect {
+    fn default() -> Self {
+        VideoDialect::OpenAiCompat
+    }
+}
+
 fn default_enabled() -> bool {
     true
 }
@@ -83,6 +108,16 @@ pub struct ProviderEntry {
     pub auth: AuthStyle,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Module 6 video dialect. Back-compatible: omitted -> `OpenAiCompat` (the
+    /// original behavior). Only meaningful for `kind = cloud_video` entries.
+    #[serde(default)]
+    pub video_dialect: VideoDialect,
+    /// Dialect-specific parameters, e.g. `jimeng` -> region/service/req_key/
+    /// action/version, `runway` -> version, `minimax` -> group_id. Back-compatible:
+    /// omitted -> empty. The codec reads vendor-specific bits from here so they are
+    /// adjustable without code changes.
+    #[serde(default)]
+    pub extra: std::collections::BTreeMap<String, String>,
 }
 
 /// The persisted registry: ordered provider entries per capability. The first
@@ -111,6 +146,11 @@ pub enum ResolvedProvider {
         model: String,
         api_key: String,
         auth: AuthStyle,
+        /// Module 6 video dialect (default `OpenAiCompat`). The video codec
+        /// dispatches on this; the chat codec ignores it.
+        video_dialect: VideoDialect,
+        /// Dialect-specific params carried verbatim from the registry entry.
+        extra: std::collections::BTreeMap<String, String>,
     },
     /// No provider is configured for this capability.
     NotConfigured { capability: String, reason: String },
@@ -214,6 +254,8 @@ pub async fn resolve_capability(
                     model: entry.model.clone(),
                     api_key,
                     auth: entry.auth.clone(),
+                    video_dialect: entry.video_dialect,
+                    extra: entry.extra.clone(),
                 })
             }
             None => Ok(ResolvedProvider::NotConfigured {
