@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
@@ -196,6 +196,23 @@ type RelistPushResult = {
   image_count: number;
   ok: boolean;
   error: string | null;
+};
+
+// Module 6 (cloud image-to-video). A job is async: create -> poll -> hosted URL.
+type VideoStatus = "queued" | "running" | "succeeded" | "failed";
+
+type VideoJob = {
+  id: string;
+  status: VideoStatus;
+  provider_job_id: string | null;
+  video_url: string | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+  first_frame_url: string;
+  last_frame_url: string | null;
+  prompt: string;
+  duration_seconds: number;
 };
 
 // Module 4 (export / delivery). One assembled row joins the module-2 adopted
@@ -506,7 +523,7 @@ function App() {
   const [schedule, setSchedule] = useState<ScheduleStatus | null>(null);
   const [scheduleInterval, setScheduleInterval] = useState(900);
   const [scheduleLimit, setScheduleLimit] = useState(20);
-  const [view, setView] = useState<"workbench" | "copy" | "export" | "console">("workbench");
+  const [view, setView] = useState<"workbench" | "copy" | "video" | "export" | "console">("workbench");
   const [cockpitOpen, setCockpitOpen] = useState(false);
   const [cockpitRefreshing, setCockpitRefreshing] = useState(false);
   const [relistProducts, setRelistProducts] = useState<Product[]>([]);
@@ -529,6 +546,14 @@ function App() {
   const [module3Previews, setModule3Previews] = useState<Module3PushItem[] | null>(null);
   const [module3Pushing, setModule3Pushing] = useState(false);
   const [module3PushResults, setModule3PushResults] = useState<Module3PushItem[] | null>(null);
+  // Module 6 (cloud image-to-video) — async generation, no Ozon push in v1.
+  const [videoFirstFrame, setVideoFirstFrame] = useState("");
+  const [videoLastFrame, setVideoLastFrame] = useState("");
+  const [videoPrompt, setVideoPrompt] = useState("");
+  const [videoDuration, setVideoDuration] = useState(8);
+  const [videoBusy, setVideoBusy] = useState(false);
+  const [videoJob, setVideoJob] = useState<VideoJob | null>(null);
+  const videoPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // Module 4 (export / delivery) — local only, no Ozon push.
   const [exportTemplatePath, setExportTemplatePath] = useState("");
   const [exportConfigPath, setExportConfigPath] = useState("");
@@ -1238,6 +1263,104 @@ function App() {
     }
   }
 
+  // Module 6 — candidate frame URLs: prefer module-2 adopted new images, then
+  // the product's primary/gallery images. Each option carries a human label.
+  const videoFrameOptions = useMemo(() => {
+    const options: { url: string; label: string }[] = [];
+    const seen = new Set<string>();
+    const push = (url: string | null | undefined, label: string) => {
+      const value = (url ?? "").trim();
+      if (!value || seen.has(value)) return;
+      seen.add(value);
+      options.push({ url: value, label });
+    };
+    (relistResults ?? []).forEach((item) => {
+      if (item.new_url && !item.error) {
+        push(item.new_url, c.video.frameNewImage(item.offer_id || item.product_id));
+      }
+      // The module-2 original primary is also a valid first frame.
+      push(item.original_url, c.video.framePrimary(item.offer_id || item.product_id));
+    });
+    if (productDetail?.product) {
+      push(productDetail.product.primary_image, c.video.framePrimary(productDetail.product.offer_id || productDetail.product.product_id));
+      productDetail.product.gallery_images.forEach((url, index) =>
+        push(url, c.video.frameGallery(index + 1))
+      );
+    }
+    return options;
+  }, [relistResults, productDetail, c]);
+
+  // Stop any in-flight poll loop (component teardown, new job, or terminal job).
+  function stopVideoPoll() {
+    if (videoPollRef.current !== null) {
+      clearInterval(videoPollRef.current);
+      videoPollRef.current = null;
+    }
+  }
+
+  useEffect(() => stopVideoPoll, []);
+
+  async function createVideo() {
+    if (!ensureOzonReadAccess(c.video.generate)) return;
+    const firstFrame = videoFirstFrame.trim();
+    if (!firstFrame) {
+      setMessage(c.video.msgFirstFrameRequired);
+      return;
+    }
+    stopVideoPoll();
+    setVideoBusy(true);
+    setVideoJob(null);
+    setMessage(c.video.msgCreating);
+    try {
+      const response = await api("/tools/ozon.video.create", {
+        method: "POST",
+        body: JSON.stringify({
+          first_frame_url: firstFrame,
+          last_frame_url: videoLastFrame.trim() || undefined,
+          prompt: videoPrompt.trim() || undefined,
+          duration_seconds: videoDuration
+        })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        // NotConfigured -> a clear bad_request; hint the operator to configure
+        // a video provider in the model registry.
+        setMessage(c.video.msgCreateFailed(userFacingError(data.error)));
+        return;
+      }
+      const job = data as VideoJob;
+      setVideoJob(job);
+      setMessage(c.video.msgCreated(job.id));
+      pollVideo(job.id);
+    } catch {
+      setMessage(c.video.msgCreateFailed(c.messages.localServiceUnreachable));
+    } finally {
+      setVideoBusy(false);
+    }
+  }
+
+  // Poll the bounded server-side job until it reaches a terminal status. The
+  // server poller is the real deadline; this UI interval just mirrors status.
+  function pollVideo(jobId: string) {
+    stopVideoPoll();
+    videoPollRef.current = setInterval(async () => {
+      try {
+        const response = await api(`/tools/ozon.video.get/${jobId}`, { method: "GET" });
+        if (!response.ok) return;
+        const job = (await response.json()) as VideoJob;
+        setVideoJob(job);
+        if (job.status === "succeeded" || job.status === "failed") {
+          stopVideoPoll();
+          setMessage(
+            job.status === "succeeded" ? c.video.msgSucceeded : c.video.msgFailed(job.error ?? "")
+          );
+        }
+      } catch {
+        // Transient fetch error; keep polling until the server job terminates.
+      }
+    }, 5000);
+  }
+
   // Module 4 — assemble the export rows from the CURRENT accepted state:
   //   * module-2 adopted image (new_url) -> primary_image_url
   //   * module-3 redistributed title/description -> title / listing
@@ -1872,6 +1995,9 @@ function App() {
         <button className={view === "copy" ? "active" : ""} onClick={() => setView("copy")}>
           <FileText size={16} /> {c.module3.tab}
         </button>
+        <button className={view === "video" ? "active" : ""} onClick={() => setView("video")}>
+          <Clapperboard size={16} /> {c.video.tab}
+        </button>
         <button className={view === "export" ? "active" : ""} onClick={() => setView("export")}>
           <Download size={16} /> {c.export.tab}
         </button>
@@ -2239,6 +2365,146 @@ function App() {
                   {!module3PreviewReady && <p className="hint">{c.module3.previewFirstHint}</p>}
                 </div>
               </>
+            )}
+          </div>
+        </section>
+      )}
+
+      {view === "video" && (
+        <section className="workspace-grid relist-grid" id="module6-workbench">
+          <div className="panel relist-pick">
+            <div className="section-title">
+              <Clapperboard />
+              <div>
+                <h2>{c.video.title}</h2>
+                <p>{c.video.description}</p>
+              </div>
+            </div>
+
+            {!canUseOzonReadTools && <p className="hint">{ozonReadGateMessage}</p>}
+            <p className="hint">{c.video.frameHint}</p>
+
+            <label className="field">
+              <span>{c.video.firstFrameLabel}</span>
+              {videoFrameOptions.length > 0 && (
+                <select
+                  value=""
+                  onChange={(event) => {
+                    if (event.target.value) setVideoFirstFrame(event.target.value);
+                  }}
+                >
+                  <option value="">{c.video.framePick}</option>
+                  {videoFrameOptions.map((option) => (
+                    <option key={`first-${option.url}`} value={option.url}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              )}
+              <input
+                type="text"
+                value={videoFirstFrame}
+                placeholder={c.video.firstFramePlaceholder}
+                onChange={(event) => setVideoFirstFrame(event.target.value)}
+              />
+            </label>
+
+            <label className="field">
+              <span>{c.video.lastFrameLabel}</span>
+              {videoFrameOptions.length > 0 && (
+                <select
+                  value=""
+                  onChange={(event) => setVideoLastFrame(event.target.value)}
+                >
+                  <option value="">{c.video.lastFrameNone}</option>
+                  {videoFrameOptions.map((option) => (
+                    <option key={`last-${option.url}`} value={option.url}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              )}
+              <input
+                type="text"
+                value={videoLastFrame}
+                placeholder={c.video.lastFramePlaceholder}
+                onChange={(event) => setVideoLastFrame(event.target.value)}
+              />
+            </label>
+
+            <label className="field">
+              <span>{c.video.promptLabel}</span>
+              <textarea
+                rows={3}
+                value={videoPrompt}
+                placeholder={c.video.promptPlaceholder}
+                onChange={(event) => setVideoPrompt(event.target.value)}
+              />
+            </label>
+
+            <label className="field">
+              <span>{c.video.durationLabel}</span>
+              <input
+                type="number"
+                min={1}
+                max={15}
+                value={videoDuration}
+                onChange={(event) => {
+                  const next = Number(event.target.value);
+                  if (Number.isFinite(next)) {
+                    setVideoDuration(Math.min(15, Math.max(1, Math.round(next))));
+                  }
+                }}
+              />
+            </label>
+
+            <button
+              className="primary-button"
+              disabled={!canUseOzonReadTools || videoBusy || !videoFirstFrame.trim()}
+              onClick={createVideo}
+            >
+              <Clapperboard size={16} /> {videoBusy ? c.video.generating : c.video.generate}
+            </button>
+          </div>
+
+          <div className="panel relist-results">
+            <div className="section-title">
+              <Clapperboard />
+              <div>
+                <h2>{c.video.resultTitle}</h2>
+                <p>{c.video.resultSubtitle}</p>
+              </div>
+            </div>
+
+            {!videoJob ? (
+              <p className="hint">{c.video.noJob}</p>
+            ) : (
+              <div className="video-job">
+                <div className={`result-banner ${videoJob.status === "succeeded" ? "result-ok" : videoJob.status === "failed" ? "result-error" : "result-warn"}`}>
+                  <strong>{c.video.statusLabel}:</strong> {c.video.statusText(videoJob.status)}
+                </div>
+
+                {videoJob.first_frame_url && (
+                  <p className="hint">{c.video.firstFrameShown}: {videoJob.first_frame_url}</p>
+                )}
+
+                {videoJob.status === "succeeded" && videoJob.video_url && (
+                  <div className="video-result">
+                    <video controls src={videoJob.video_url} style={{ maxWidth: "100%" }} />
+                    <p className="export-path">
+                      <strong>{c.video.urlLabel}:</strong>{" "}
+                      <a href={videoJob.video_url} target="_blank" rel="noreferrer">{videoJob.video_url}</a>
+                    </p>
+                    <p className="hint">{c.video.reviewHint}</p>
+                  </div>
+                )}
+
+                {videoJob.status === "failed" && videoJob.error && (
+                  <div className="result-banner result-error">
+                    <XCircle size={16} /> {videoJob.error}
+                  </div>
+                )}
+              </div>
             )}
           </div>
         </section>

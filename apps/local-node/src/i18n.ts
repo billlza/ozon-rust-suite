@@ -273,6 +273,50 @@ const zhCN = {
     msgDone: (path: string) => `交付文件已生成:${path}`,
     msgFailed: (err: string) => `导出失败:${err}`
   },
+  video: {
+    tab: "视频 / Video",
+    title: "云端图生视频",
+    description:
+      "用模块2 的新主图作首帧(可选末帧)加提示词,调用云端图生视频。生成是异步的:创建任务 → 轮询 → 返回托管视频链接供审阅。v1 不推回 Ozon。",
+    frameHint: "首帧必填、末帧可选;优先选模块2 已采用的新图,也可选商品原图或直接粘贴公开图片链接。",
+    firstFrameLabel: "首帧图片链接(必填)",
+    firstFramePlaceholder: "https://…/first.jpg",
+    lastFrameLabel: "末帧图片链接(可选)",
+    lastFramePlaceholder: "https://…/last.jpg(留空)",
+    lastFrameNone: "(不使用末帧)",
+    framePick: "从图库选择…",
+    frameNewImage: (label: string) => `模块2 新图 · ${label}`,
+    framePrimary: (label: string) => `主图 · ${label}`,
+    frameGallery: (n: number) => `画廊图 ${n}`,
+    promptLabel: "提示词(可选)",
+    promptPlaceholder: "描述镜头运动 / 画面变化…",
+    durationLabel: "时长(秒,最长 15)",
+    generate: "生成视频",
+    generating: "提交中…",
+    resultTitle: "生成结果",
+    resultSubtitle: "状态:排队 / 运行 / 成功 / 失败。成功后在此审阅托管视频。",
+    noJob: "还没有任务。填写首帧并点击生成视频。",
+    statusLabel: "状态",
+    statusText: (status: string) =>
+      status === "queued"
+        ? "排队中"
+        : status === "running"
+          ? "生成中"
+          : status === "succeeded"
+            ? "已完成"
+            : status === "failed"
+              ? "失败"
+              : status,
+    firstFrameShown: "首帧",
+    urlLabel: "视频链接",
+    reviewHint: "v1 仅供审阅,不会推回 Ozon。",
+    msgFirstFrameRequired: "请先填写首帧图片链接。",
+    msgCreating: "正在创建视频任务…",
+    msgCreated: (id: string) => `视频任务已创建:${id}`,
+    msgCreateFailed: (err: string) => `创建失败:${err}(若未配置视频提供方,请到模型注册表配置 cloud_video 提供方)`,
+    msgSucceeded: "视频已生成,可在右侧审阅。",
+    msgFailed: (err: string) => `视频生成失败:${err}`
+  },
   poster: {
     title: "商品海报工作台",
     description: "先从 Ozon 商品生成事实包，再交给龙虾/Codex 出图；本机 API 自动出图只是备用。",
@@ -853,6 +897,50 @@ const enUS: typeof zhCN = {
     msgExporting: (n: number) => `Exporting ${n} row(s)…`,
     msgDone: (path: string) => `Deliverable written: ${path}`,
     msgFailed: (err: string) => `Export failed: ${err}`
+  },
+  video: {
+    tab: "视频 / Video",
+    title: "Cloud image-to-video",
+    description:
+      "Use a module-2 new image as the first frame (optional last frame) plus a prompt to call cloud image-to-video. Generation is async: create job → poll → hosted video URL for review. v1 does NOT push to Ozon.",
+    frameHint: "First frame required, last frame optional. Prefer a module-2 adopted new image; you can also pick a product image or paste a public image URL.",
+    firstFrameLabel: "First-frame image URL (required)",
+    firstFramePlaceholder: "https://…/first.jpg",
+    lastFrameLabel: "Last-frame image URL (optional)",
+    lastFramePlaceholder: "https://…/last.jpg (leave blank)",
+    lastFrameNone: "(no last frame)",
+    framePick: "Pick from gallery…",
+    frameNewImage: (label: string) => `Module 2 new image · ${label}`,
+    framePrimary: (label: string) => `Primary image · ${label}`,
+    frameGallery: (n: number) => `Gallery image ${n}`,
+    promptLabel: "Prompt (optional)",
+    promptPlaceholder: "Describe the camera move / scene change…",
+    durationLabel: "Duration (seconds, max 15)",
+    generate: "Generate video",
+    generating: "Submitting…",
+    resultTitle: "Result",
+    resultSubtitle: "Status: queued / running / succeeded / failed. Review the hosted video here on success.",
+    noJob: "No job yet. Fill in the first frame and click Generate video.",
+    statusLabel: "Status",
+    statusText: (status: string) =>
+      status === "queued"
+        ? "Queued"
+        : status === "running"
+          ? "Running"
+          : status === "succeeded"
+            ? "Succeeded"
+            : status === "failed"
+              ? "Failed"
+              : status,
+    firstFrameShown: "First frame",
+    urlLabel: "Video URL",
+    reviewHint: "v1 is review-only; nothing is pushed to Ozon.",
+    msgFirstFrameRequired: "Enter a first-frame image URL first.",
+    msgCreating: "Creating the video job…",
+    msgCreated: (id: string) => `Video job created: ${id}`,
+    msgCreateFailed: (err: string) => `Create failed: ${err} (if no video provider is configured, add a cloud_video provider in the model registry)`,
+    msgSucceeded: "Video is ready — review it on the right.",
+    msgFailed: (err: string) => `Video generation failed: ${err}`
   },
   poster: {
     title: "Product poster workspace",

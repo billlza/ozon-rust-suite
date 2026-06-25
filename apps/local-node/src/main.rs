@@ -241,6 +241,8 @@ fn skill_router(state: LocalState) -> Router {
             post(module3_recognize),
         )
         .route("/tools/ozon.module3.push", post(module3_push))
+        .route("/tools/ozon.video.create", post(video_create))
+        .route("/tools/ozon.video.get/{id}", get(video_get))
         .route("/poster/brief", post(poster_brief))
         .route("/poster/handoff", post(poster_handoff))
         .route("/poster/generate", post(poster_generate))
@@ -420,6 +422,7 @@ struct LocalState {
     http_client: reqwest::Client,
     schedules: ScheduleStore,
     openclaw_pairings: OpenClawPairingStore,
+    video_jobs: VideoJobStore,
 }
 
 impl LocalState {
@@ -475,6 +478,7 @@ impl LocalState {
                 .map_err(|error| anyhow::anyhow!("failed to build HTTP client: {error}"))?,
             schedules,
             openclaw_pairings: Arc::new(RwLock::new(HashMap::new())),
+            video_jobs: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 }
@@ -766,6 +770,22 @@ async fn openclaw_manifest(State(state): State<LocalState>) -> Json<OpenClawMani
                 risk: "write",
                 approval_required: true,
                 description: "Write a reviewed module-3 copy proposal (title/description/attributes) back to the LIVE Ozon store. Always returns a dry-run preview (before->after, matched + dropped attributes); only writes when called with confirm=true after operator review. Attribute names/values are re-matched against the Ozon category dictionary and any unmatched item is dropped (never written with a guessed id)",
+            },
+            OpenClawTool {
+                name: "ozon.video.create",
+                method: "POST",
+                path: "/tools/ozon.video.create",
+                risk: "read_only",
+                approval_required: false,
+                description: "Module 6 cloud image-to-video: create an async generation job from a first-frame image URL (and optional last-frame) plus a prompt. Read-only — nothing is written to Ozon in v1; returns our local job id immediately while a bounded background poller tracks the provider job. Requires a video provider configured in the model registry",
+            },
+            OpenClawTool {
+                name: "ozon.video.get",
+                method: "GET",
+                path: "/tools/ozon.video.get/{job_id}",
+                risk: "read_only",
+                approval_required: false,
+                description: "Module 6: read one cloud image-to-video job status (Queued/Running/Succeeded/Failed) and, when succeeded, the hosted video URL for operator review. No Ozon write",
             },
             OpenClawTool {
                 name: "ozon.relist.export",
@@ -3943,6 +3963,462 @@ async fn chat_completion(
         .ok_or_else(|| ApiError::bad_gateway("chat completion returned no content"))
 }
 
+// --------------------------------------------------------------------------- //
+// Module 6 ("video") — cloud image-to-video (M6-PR1).                         //
+//                                                                             //
+// SECOND consumer of the PR2 model-router seam (module 3 chat was the first). //
+// Image-to-video is ASYNC: create-job -> poll -> hosted video URL (seconds to //
+// minutes). We model the lifecycle explicitly with a job store + a BOUNDED    //
+// background poller (explicit deadline + max attempts; never leaks/loops      //
+// forever). First/last frame are PUBLIC image URLs from module 2 (new images) //
+// passed BY REFERENCE — we never download or re-host them here.               //
+//                                                                             //
+// v1 SCOPE: generation only. We do NOT push the video to Ozon; we return the  //
+// hosted video URL for operator review (a gated push is a future follow-up).  //
+//                                                                             //
+// Provider JSON shape is UNKNOWN: the structs below are OpenAI-compatible      //
+// DEFAULTS with tolerant (#[serde(default)]) parsing. Adapting to a chosen     //
+// vendor = tweak these structs + the JSON field paths; the operator configures //
+// the provider (kind=cloud_video) in the model registry.                      //
+// --------------------------------------------------------------------------- //
+
+/// Maximum clip length we will request, in seconds. Operator input is clamped to
+/// this ceiling (default is `VIDEO_DEFAULT_DURATION_SECS`).
+const VIDEO_MAX_DURATION_SECS: u32 = 15;
+/// Default clip length when the caller omits `duration_seconds`.
+const VIDEO_DEFAULT_DURATION_SECS: u32 = 8;
+/// Poller cadence: how often the background task asks the provider for status.
+const VIDEO_POLL_INTERVAL_SECS: u64 = 5;
+/// Poller ceiling: the background task gives up after this many attempts and
+/// marks the job `Failed("timed out")`. With a 5s cadence this is ~10 minutes.
+const VIDEO_POLL_MAX_ATTEMPTS: u32 = 120;
+
+/// Lifecycle state of a cloud image-to-video job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VideoStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl VideoStatus {
+    fn is_terminal(self) -> bool {
+        matches!(self, VideoStatus::Succeeded | VideoStatus::Failed)
+    }
+}
+
+/// One tracked cloud image-to-video job. Stored in `LocalState.video_jobs` keyed
+/// by our own `id` (NOT the provider's job id).
+#[derive(Debug, Clone, Serialize)]
+struct VideoJob {
+    id: Uuid,
+    status: VideoStatus,
+    /// The provider's own job id, learned from the create response.
+    provider_job_id: Option<String>,
+    /// The hosted video URL, populated once the job succeeds.
+    video_url: Option<String>,
+    error: Option<String>,
+    created_at: String,
+    updated_at: String,
+    first_frame_url: String,
+    last_frame_url: Option<String>,
+    prompt: String,
+    duration_seconds: u32,
+}
+
+/// In-memory job store. Sibling to the other `LocalState` caches; jobs are
+/// ephemeral (process-lifetime) — review the hosted URL, then it can be dropped.
+type VideoJobStore = Arc<RwLock<HashMap<Uuid, VideoJob>>>;
+
+// --- OpenAI-compatible cloud-video codec (async create + poll) ------------- //
+
+/// A frame reference (public image URL passed by reference, never re-hosted).
+#[derive(Debug, Serialize)]
+struct VideoFrameRef {
+    url: String,
+}
+
+/// Create-job request body. OpenAI-compatible DEFAULT shape; adapt per vendor.
+#[derive(Debug, Serialize)]
+struct VideoCreateRequest {
+    model: String,
+    prompt: String,
+    first_frame: VideoFrameRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_frame: Option<VideoFrameRef>,
+    duration_seconds: u32,
+}
+
+/// Create-job response. Tolerant: a provider job id is read from a few common
+/// default JSON paths (`id`, or `job_id`). Adapt the paths per vendor.
+#[derive(Debug, Default, Deserialize)]
+struct VideoCreateResponse {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    job_id: Option<String>,
+}
+
+impl VideoCreateResponse {
+    fn provider_job_id(&self) -> Option<String> {
+        self.id
+            .clone()
+            .or_else(|| self.job_id.clone())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+}
+
+/// Status-poll response. Tolerant: `status` is mapped through `map_video_status`,
+/// and the hosted URL is read from a few common default paths.
+#[derive(Debug, Default, Deserialize)]
+struct VideoStatusResponse {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    video_url: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    output_url: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+impl VideoStatusResponse {
+    fn hosted_url(&self) -> Option<String> {
+        self.video_url
+            .clone()
+            .or_else(|| self.output_url.clone())
+            .or_else(|| self.url.clone())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+}
+
+/// Map a vendor status string to our lifecycle enum. Tolerant of the common
+/// vendor vocabularies; an unknown string is treated as still `Running` so the
+/// poller keeps going until a terminal status or the deadline.
+fn map_video_status(raw: &str) -> VideoStatus {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "queued" | "pending" | "created" | "accepted" => VideoStatus::Queued,
+        "running" | "processing" | "in_progress" | "in-progress" | "started" => {
+            VideoStatus::Running
+        }
+        "succeeded" | "success" | "completed" | "complete" | "done" | "finished" => {
+            VideoStatus::Succeeded
+        }
+        "failed" | "failure" | "error" | "errored" | "canceled" | "cancelled" => {
+            VideoStatus::Failed
+        }
+        _ => VideoStatus::Running,
+    }
+}
+
+/// Clamp a caller-supplied duration to `[1, VIDEO_MAX_DURATION_SECS]`, defaulting
+/// to `VIDEO_DEFAULT_DURATION_SECS` when absent or zero.
+fn clamp_video_duration(requested: Option<u32>) -> u32 {
+    match requested {
+        Some(value) if value > 0 => value.min(VIDEO_MAX_DURATION_SECS),
+        _ => VIDEO_DEFAULT_DURATION_SECS,
+    }
+}
+
+/// Resolve the `cloud_video` provider via the PR2 seam. NO gating here (the
+/// handler gates first); mirrors `chat_completion`'s NotConfigured / wrong-kind
+/// errors so the UI can surface a clear "configure a video provider" message.
+async fn resolve_cloud_video(
+    state: &LocalState,
+) -> Result<(String, String, String, model_router::AuthStyle), ApiError> {
+    match resolve_capability(state, Capability::VideoGen).await? {
+        ResolvedProvider::Generic {
+            kind: ProviderKind::CloudVideo,
+            base_url,
+            model,
+            api_key,
+            auth,
+        } => Ok((base_url, model, api_key, auth)),
+        ResolvedProvider::Generic { .. } => Err(ApiError::bad_request(
+            "configured video provider is not a cloud_video provider",
+        )),
+        ResolvedProvider::NotConfigured { reason, .. } => Err(ApiError::bad_request(format!(
+            "video provider is not configured: {reason}"
+        ))),
+        ResolvedProvider::OpenAiImage(_) => {
+            Err(ApiError::bad_request("video provider is not configured"))
+        }
+    }
+}
+
+/// Create an async generation job at the provider and return its job id.
+///
+/// POSTs the OpenAI-compatible create body to `endpoint_for(CloudVideo, base)`
+/// via `apply_auth` (so Header/Query-keyed providers also work). The JSON field
+/// paths are sensible OpenAI-ish DEFAULTS — adapting to a chosen vendor = tweak
+/// `VideoCreateRequest` / `VideoCreateResponse`.
+async fn video_create_job(
+    state: &LocalState,
+    prompt: &str,
+    first_frame_url: &str,
+    last_frame_url: Option<&str>,
+    duration_seconds: u32,
+) -> Result<String, ApiError> {
+    let (base_url, model, api_key, auth) = resolve_cloud_video(state).await?;
+
+    let request = VideoCreateRequest {
+        model,
+        prompt: prompt.to_string(),
+        first_frame: VideoFrameRef {
+            url: first_frame_url.to_string(),
+        },
+        last_frame: last_frame_url.map(|url| VideoFrameRef {
+            url: url.to_string(),
+        }),
+        duration_seconds,
+    };
+
+    let endpoint = endpoint_for(ProviderKind::CloudVideo, &base_url);
+    let builder = state.http_client.post(endpoint).json(&request);
+    let response = apply_auth(builder, &auth, &api_key)
+        .send()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("video create request failed: {error}")))?;
+
+    if !response.status().is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "unknown error".to_string());
+        return Err(ApiError::bad_gateway(format!(
+            "video create failed: {}",
+            summarize_openai_error(&body)
+        )));
+    }
+
+    let payload: VideoCreateResponse = response
+        .json()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("invalid video create response: {error}")))?;
+
+    payload
+        .provider_job_id()
+        .ok_or_else(|| ApiError::bad_gateway("video create returned no job id"))
+}
+
+/// Poll one job's status at the provider. GETs `endpoint_for(CloudVideo, base) +
+/// "/{provider_job_id}"` via `apply_auth` and returns `(status, video_url?)`.
+/// The status string is mapped tolerantly; the URL is read from common paths.
+async fn video_poll_status(
+    state: &LocalState,
+    provider_job_id: &str,
+) -> Result<(VideoStatus, Option<String>, Option<String>), ApiError> {
+    let (base_url, _model, api_key, auth) = resolve_cloud_video(state).await?;
+    let endpoint = format!(
+        "{}/{}",
+        endpoint_for(ProviderKind::CloudVideo, &base_url),
+        provider_job_id
+    );
+    let builder = state.http_client.get(endpoint);
+    let response = apply_auth(builder, &auth, &api_key)
+        .send()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("video poll request failed: {error}")))?;
+
+    if !response.status().is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "unknown error".to_string());
+        return Err(ApiError::bad_gateway(format!(
+            "video poll failed: {}",
+            summarize_openai_error(&body)
+        )));
+    }
+
+    let payload: VideoStatusResponse = response
+        .json()
+        .await
+        .map_err(|error| ApiError::bad_gateway(format!("invalid video status response: {error}")))?;
+
+    let status = payload
+        .status
+        .as_deref()
+        .map(map_video_status)
+        // No status field but a URL came back -> treat as succeeded.
+        .unwrap_or(if payload.hosted_url().is_some() {
+            VideoStatus::Succeeded
+        } else {
+            VideoStatus::Running
+        });
+
+    Ok((status, payload.hosted_url(), payload.error.clone()))
+}
+
+// --- Module 6 handlers ----------------------------------------------------- //
+
+#[derive(Debug, Deserialize)]
+struct VideoCreateRequestBody {
+    first_frame_url: String,
+    #[serde(default)]
+    last_frame_url: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    duration_seconds: Option<u32>,
+}
+
+/// POST /tools/ozon.video.create — create a cloud image-to-video job.
+///
+/// Gated (bridge/operator token + a valid lease with `OzonRead`; generation is
+/// read-only). Caps duration, calls `video_create_job`, inserts a `Queued`
+/// `VideoJob`, and SPAWNS a BOUNDED background poller that updates the job and
+/// stops on a terminal status OR the deadline. Returns our job id immediately.
+async fn video_create(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Json(input): Json<VideoCreateRequestBody>,
+) -> Result<Json<VideoJob>, ApiError> {
+    require_bridge_or_operator_token(&state, &headers)?;
+    require_valid_lease_with_feature(&state, Feature::OzonRead).await?;
+
+    let first_frame_url = input.first_frame_url.trim().to_string();
+    if first_frame_url.is_empty() {
+        return Err(ApiError::bad_request("first_frame_url is required"));
+    }
+    let last_frame_url = input
+        .last_frame_url
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let prompt = input
+        .prompt
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let duration_seconds = clamp_video_duration(input.duration_seconds);
+
+    // Create the provider job FIRST so a misconfigured provider surfaces a clear
+    // error synchronously (NotConfigured -> bad_request, like chat_completion).
+    let provider_job_id = video_create_job(
+        &state,
+        &prompt,
+        &first_frame_url,
+        last_frame_url.as_deref(),
+        duration_seconds,
+    )
+    .await?;
+
+    let now = Utc::now().to_rfc3339();
+    let job = VideoJob {
+        id: Uuid::new_v4(),
+        status: VideoStatus::Queued,
+        provider_job_id: Some(provider_job_id.clone()),
+        video_url: None,
+        error: None,
+        created_at: now.clone(),
+        updated_at: now,
+        first_frame_url,
+        last_frame_url,
+        prompt,
+        duration_seconds,
+    };
+    let job_id = job.id;
+    state.video_jobs.write().await.insert(job_id, job.clone());
+
+    spawn_video_poller(state.clone(), job_id, provider_job_id);
+
+    Ok(Json(job))
+}
+
+/// Spawn the BOUNDED background poller for one job. It polls every
+/// `VIDEO_POLL_INTERVAL_SECS` up to `VIDEO_POLL_MAX_ATTEMPTS` attempts, updates
+/// the stored job on each tick, and STOPS on a terminal status OR when the
+/// attempt budget is exhausted (writing `Failed("timed out")`). It cannot loop
+/// forever or leak: the attempt counter is the explicit deadline, and it also
+/// exits early if the job disappears from the store. Mirrors the scheduler poll
+/// loop (`tokio::spawn` + `tokio::time::interval`); `reqwest` is async so the
+/// poller uses `tokio::time`, NOT `spawn_blocking`.
+fn spawn_video_poller(state: LocalState, job_id: Uuid, provider_job_id: String) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(VIDEO_POLL_INTERVAL_SECS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Burn the immediate first tick so we wait one interval before polling
+        // (the create call just returned; the job is unlikely to be ready).
+        ticker.tick().await;
+
+        for _ in 0..VIDEO_POLL_MAX_ATTEMPTS {
+            ticker.tick().await;
+
+            // If the job is gone (process state reset), stop — never leak.
+            if !state.video_jobs.read().await.contains_key(&job_id) {
+                return;
+            }
+
+            match video_poll_status(&state, &provider_job_id).await {
+                Ok((status, video_url, provider_error)) => {
+                    let mut jobs = state.video_jobs.write().await;
+                    let Some(job) = jobs.get_mut(&job_id) else {
+                        return;
+                    };
+                    job.status = status;
+                    job.updated_at = Utc::now().to_rfc3339();
+                    if let Some(url) = video_url {
+                        job.video_url = Some(url);
+                    }
+                    if status == VideoStatus::Failed {
+                        job.error = Some(
+                            provider_error
+                                .unwrap_or_else(|| "provider reported failure".to_string()),
+                        );
+                    }
+                    if status.is_terminal() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    // A transient poll error does not kill the job; record it and
+                    // keep trying until the attempt budget is exhausted.
+                    let mut jobs = state.video_jobs.write().await;
+                    if let Some(job) = jobs.get_mut(&job_id) {
+                        job.error = Some(error.message.clone());
+                        job.updated_at = Utc::now().to_rfc3339();
+                    }
+                }
+            }
+        }
+
+        // Deadline reached without a terminal status -> mark timed out.
+        let mut jobs = state.video_jobs.write().await;
+        if let Some(job) = jobs.get_mut(&job_id) {
+            if !job.status.is_terminal() {
+                job.status = VideoStatus::Failed;
+                job.error = Some("timed out waiting for the video provider".to_string());
+                job.updated_at = Utc::now().to_rfc3339();
+            }
+        }
+    });
+}
+
+/// GET /tools/ozon.video.get/{id} — read one video job (status + hosted URL when
+/// succeeded).
+async fn video_get(
+    State(state): State<LocalState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<VideoJob>, ApiError> {
+    require_bridge_or_operator_token(&state, &headers)?;
+    require_valid_lease_with_feature(&state, Feature::OzonRead).await?;
+    let job = state
+        .video_jobs
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("video job not found"))?;
+    Ok(Json(job))
+}
+
 /// Strip one enclosing markdown code fence and/or one enclosing quote pair, then
 /// parse the JSON into a `Module3Fields`. Mirrors `textgen.py:53-56` quote
 /// stripping plus tolerant fenced-block handling.
@@ -5662,6 +6138,67 @@ mod tests {
     use reqwest::header::HeaderValue as ReqwestHeaderValue;
 
     use super::*;
+
+    #[test]
+    fn map_video_status_handles_common_vendor_strings() {
+        assert_eq!(map_video_status("queued"), VideoStatus::Queued);
+        assert_eq!(map_video_status("PENDING"), VideoStatus::Queued);
+        assert_eq!(map_video_status(" processing "), VideoStatus::Running);
+        assert_eq!(map_video_status("running"), VideoStatus::Running);
+        assert_eq!(map_video_status("succeeded"), VideoStatus::Succeeded);
+        assert_eq!(map_video_status("Completed"), VideoStatus::Succeeded);
+        assert_eq!(map_video_status("done"), VideoStatus::Succeeded);
+        assert_eq!(map_video_status("failed"), VideoStatus::Failed);
+        assert_eq!(map_video_status("error"), VideoStatus::Failed);
+        // Unknown -> keep polling (Running), not a false terminal.
+        assert_eq!(map_video_status("weird-vendor-state"), VideoStatus::Running);
+        assert!(!VideoStatus::Running.is_terminal());
+        assert!(VideoStatus::Succeeded.is_terminal());
+        assert!(VideoStatus::Failed.is_terminal());
+    }
+
+    #[test]
+    fn clamp_video_duration_caps_and_defaults() {
+        assert_eq!(clamp_video_duration(None), VIDEO_DEFAULT_DURATION_SECS);
+        assert_eq!(clamp_video_duration(Some(0)), VIDEO_DEFAULT_DURATION_SECS);
+        assert_eq!(clamp_video_duration(Some(5)), 5);
+        assert_eq!(
+            clamp_video_duration(Some(999)),
+            VIDEO_MAX_DURATION_SECS,
+            "duration must be clamped to the ceiling"
+        );
+        assert_eq!(
+            clamp_video_duration(Some(VIDEO_MAX_DURATION_SECS)),
+            VIDEO_MAX_DURATION_SECS
+        );
+    }
+
+    #[test]
+    fn video_create_response_reads_tolerant_job_id_paths() {
+        let from_id: VideoCreateResponse =
+            serde_json::from_str(r#"{"id":"job_123"}"#).expect("parse id");
+        assert_eq!(from_id.provider_job_id().as_deref(), Some("job_123"));
+        let from_job_id: VideoCreateResponse =
+            serde_json::from_str(r#"{"job_id":"jb_9"}"#).expect("parse job_id");
+        assert_eq!(from_job_id.provider_job_id().as_deref(), Some("jb_9"));
+        let empty: VideoCreateResponse = serde_json::from_str(r#"{}"#).expect("parse empty");
+        assert_eq!(empty.provider_job_id(), None);
+    }
+
+    #[test]
+    fn video_status_response_reads_tolerant_url_paths() {
+        let a: VideoStatusResponse =
+            serde_json::from_str(r#"{"status":"succeeded","video_url":"https://v/a.mp4"}"#)
+                .expect("parse a");
+        assert_eq!(a.hosted_url().as_deref(), Some("https://v/a.mp4"));
+        let b: VideoStatusResponse =
+            serde_json::from_str(r#"{"status":"done","output_url":"https://v/b.mp4"}"#)
+                .expect("parse b");
+        assert_eq!(b.hosted_url().as_deref(), Some("https://v/b.mp4"));
+        let c: VideoStatusResponse =
+            serde_json::from_str(r#"{"url":"https://v/c.mp4"}"#).expect("parse c");
+        assert_eq!(c.hosted_url().as_deref(), Some("https://v/c.mp4"));
+    }
 
     fn dict_attr(id: u64, name: &str, dictionary_id: u64) -> OzonCategoryAttribute {
         OzonCategoryAttribute {
