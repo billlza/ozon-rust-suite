@@ -38,6 +38,34 @@ const DEFAULT_LOCAL_API = import.meta.env.VITE_LOCAL_SKILL_API ?? "http://127.0.
 const DEFAULT_AGENT_API = import.meta.env.VITE_LOCAL_AGENT_API ?? "http://127.0.0.1:17870";
 const DEFAULT_LOCAL_TOKEN = import.meta.env.VITE_LOCAL_TOKEN ?? "dev-local-token";
 
+// Module 2 acceptance state persists locally only (the user's own review
+// convenience — never synced to the cloud) so a refresh/restart does not lose
+// the generated before/after results and which ones were adopted.
+const ACCEPTANCE_STORAGE_KEY = "ozon-local-acceptance";
+
+type StoredAcceptance = {
+  results: RelistItem[] | null;
+  adopt: Record<string, boolean>;
+  pushResults: RelistPushResult[] | null;
+};
+
+function loadStoredAcceptance(): StoredAcceptance {
+  try {
+    const raw = window.localStorage.getItem(ACCEPTANCE_STORAGE_KEY);
+    if (!raw) {
+      return { results: null, adopt: {}, pushResults: null };
+    }
+    const parsed = JSON.parse(raw) as Partial<StoredAcceptance>;
+    return {
+      results: parsed.results ?? null,
+      adopt: parsed.adopt ?? {},
+      pushResults: parsed.pushResults ?? null
+    };
+  } catch {
+    return { results: null, adopt: {}, pushResults: null };
+  }
+}
+
 type RuntimeConfig = {
   skill_api: string;
   agent_api: string;
@@ -454,11 +482,13 @@ function App() {
   const [cockpitRefreshing, setCockpitRefreshing] = useState(false);
   const [relistProducts, setRelistProducts] = useState<Product[]>([]);
   const [relistSelected, setRelistSelected] = useState<Record<string, boolean>>({});
-  const [relistResults, setRelistResults] = useState<RelistItem[] | null>(null);
-  const [relistAdopt, setRelistAdopt] = useState<Record<string, boolean>>({});
+  const [relistResults, setRelistResults] = useState<RelistItem[] | null>(() => loadStoredAcceptance().results);
+  const [relistAdopt, setRelistAdopt] = useState<Record<string, boolean>>(() => loadStoredAcceptance().adopt);
   const [relistBusy, setRelistBusy] = useState(false);
   const [relistPushing, setRelistPushing] = useState(false);
-  const [relistPushResults, setRelistPushResults] = useState<RelistPushResult[] | null>(null);
+  const [relistPushResults, setRelistPushResults] = useState<RelistPushResult[] | null>(
+    () => loadStoredAcceptance().pushResults
+  );
   const [module3Products, setModule3Products] = useState<Product[]>([]);
   const [module3Selected, setModule3Selected] = useState<Record<string, boolean>>({});
   const [module3Results, setModule3Results] = useState<Module3Item[] | null>(null);
@@ -654,6 +684,23 @@ function App() {
     window.localStorage.setItem("ozon-local-locale", locale);
     document.documentElement.lang = locale;
   }, [locale]);
+
+  // Persist module 2 acceptance state (results + adopted + push outcomes) locally
+  // so the review survives a refresh/restart. Best-effort; never blocks the UI.
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        ACCEPTANCE_STORAGE_KEY,
+        JSON.stringify({
+          results: relistResults,
+          adopt: relistAdopt,
+          pushResults: relistPushResults
+        })
+      );
+    } catch {
+      // localStorage may be unavailable or full; persistence is non-critical.
+    }
+  }, [relistResults, relistAdopt, relistPushResults]);
 
   async function api(path: string, init: RequestInit = {}) {
     return fetch(`${runtime.skill_api}${path}`, {
