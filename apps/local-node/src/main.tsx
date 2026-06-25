@@ -3405,14 +3405,14 @@ function buildCockpitNodes(c: LocalNodeCopy, sig: CockpitSignals): CockpitNode[]
     {
       id: 4,
       lane: "pipeline",
-      status: "isolated",
-      runtime: "off",
+      status: "live",
+      runtime: sig.nodeUp ? "ok" : "off",
       title: m.m4.title,
       role: m.m4.role,
       next: m.m4.next,
       gaps: m.m4.gaps,
       backing: m.m4.backing,
-      chips: [chip(ch.excelEngine, "ok"), chip(ch.verifier, "ok"), chip(ch.httpExpose, "gap")]
+      chips: [chip(ch.excelEngine, "ok"), chip(ch.verifier, "ok"), chip(ch.httpExpose, "ok")]
     },
     {
       id: 5,
@@ -3434,14 +3434,14 @@ function buildCockpitNodes(c: LocalNodeCopy, sig: CockpitSignals): CockpitNode[]
     {
       id: 6,
       lane: "branch",
-      status: "missing",
+      status: "partial",
       runtime: "off",
       title: m.m6.title,
       role: m.m6.role,
       next: m.m6.next,
       gaps: m.m6.gaps,
       backing: m.m6.backing,
-      chips: [chip(ch.firstLastFrame, "gap"), chip(ch.videoApi, "gap"), chip(ch.videoPush, "gap")]
+      chips: [chip(ch.firstLastFrame, "ok"), chip(ch.videoApi, "wip"), chip(ch.videoPush, "gap")]
     }
   ];
 }

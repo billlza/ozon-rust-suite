@@ -598,23 +598,23 @@ const zhCN = {
       m4: {
         title: "导出 / 交付",
         role: "主流程终点 · 官方模板外科式写入",
-        next: "用 std::process::Command 把 Python 引擎暴露成 /tools/ozon.relist.export。",
-        gaps: ["引擎是独立 Python CLI，未被助手调用", "无 HTTP 端点", "Python 运行时需双端打包"],
-        backing: ["ozon-excel-core writer.py(只改映射单元格)", "verifier.py(证明只改了该改的列)"]
+        next: "可选:把副图(画廊图)也填进交付行;打包版捆 Python 运行时。",
+        gaps: ["UI 暂只填主图(副图后端已支持,待接)", "打包版需捆 Python 运行时(dev 用 .venv)"],
+        backing: ["/tools/ozon.relist.export(spawn_blocking 调 process --verify)", "ozon_excel_core inject + writer + verifier"]
       },
       m5: {
         title: "发动机 / 后端",
         role: "底座 · 授权 / 密钥 / 模型路由，支撑全部",
-        next: "把写死的单端点重构成模型路由 + 能力注册表(模块 3 / 6 都要挂)。",
-        gaps: ["模型路由写死单端点", "无能力注册表", "单店铺(无多店槽)"],
-        backing: ["main.rs lease 校验 + 设备绑定", "secret-store LayeredSecretStore(keychain + 文件)"]
+        next: "可选:加失败转移(failover)+ 非 OpenAI 错误摘要;真多店槽。",
+        gaps: ["有序 Vec 取首个 enabled,无 failover", "summarize_openai_error 仅 OpenAI", "单店铺(无多店槽)"],
+        backing: ["model_router.rs 注册表 + resolve_capability", "/config/registry + secret_ref 间接(裸 key 不入库)"]
       },
       m6: {
         title: "AI 视频",
-        role: "实验轨 · 给自己立的 flag",
-        next: "拿新图做首 / 尾帧 → 接云视频 API(~8-9s，~0.6-0.7 元/条)，每品一条。",
-        gaps: ["能力 100% 空白", "无视频 API 接入", "无视频 UI"],
-        backing: ["(暂无；纯云生成，不碰本地 ffmpeg)"]
+        role: "实验轨 · 图生视频(首 / 尾帧用新图)",
+        next: "在注册表配一个 cloud_video provider 即可生成;可选:加推回 Ozon 的 gated 工具。",
+        gaps: ["需配 cloud_video provider(codec 是 OpenAI 兼容默认,按厂商调)", "v1 不推回 Ozon"],
+        backing: ["/tools/ozon.video.create + get(有界轮询)", "resolve_capability(VideoGen)→Generic + endpoint_for / apply_auth"]
       }
     }
   },
@@ -1223,23 +1223,23 @@ const enUS: typeof zhCN = {
       m4: {
         title: "Export / Delivery",
         role: "Pipeline end · surgical write into the official template",
-        next: "Expose the Python engine as /tools/ozon.relist.export via std::process::Command.",
-        gaps: ["Engine is a standalone Python CLI, not called by the helper", "No HTTP endpoint", "Python runtime must be bundled on both OSes"],
-        backing: ["ozon-excel-core writer.py (mutates only mapped cells)", "verifier.py (proves only mapped columns changed)"]
+        next: "Optional: feed gallery (additional) images into export rows; bundle a Python runtime for the shipped installer.",
+        gaps: ["UI fills the primary image only (backend already supports additional images)", "Shipped installer must bundle a Python runtime (dev uses the .venv)"],
+        backing: ["/tools/ozon.relist.export (spawn_blocking runs process --verify)", "ozon_excel_core inject + writer + verifier"]
       },
       m5: {
         title: "Engine / Backend",
         role: "Foundation · auth / secrets / model routing, underpins all",
-        next: "Refactor the hardcoded single endpoint into model routing + a capability registry (modules 3 / 6 both hang off it).",
-        gaps: ["Model routing hardcoded to a single endpoint", "No capability registry", "Single shop (no multi-shop slots)"],
-        backing: ["main.rs lease verification + device binding", "secret-store LayeredSecretStore (keychain + file)"]
+        next: "Optional: add failover + non-OpenAI error summaries; real multi-shop slots.",
+        gaps: ["Ordered Vec picks the first enabled entry (no failover)", "summarize_openai_error is OpenAI-only", "Single shop (no multi-shop slots)"],
+        backing: ["model_router.rs registry + resolve_capability", "/config/registry + secret_ref indirection (no raw keys stored)"]
       },
       m6: {
         title: "AI Video",
-        role: "Experimental track · a flag set for myself",
-        next: "Take new images as first / last frame → cloud video API (~8-9s, ~0.6-0.7 RMB each), one per product.",
-        gaps: ["Capability 100% absent", "No video API wired", "No video UI"],
-        backing: ["(none yet; cloud-only generation, no local ffmpeg)"]
+        role: "Experimental track · image-to-video (first/last frame from new images)",
+        next: "Configure a cloud_video provider in the registry to generate; optional: a gated push-to-Ozon tool.",
+        gaps: ["Needs a cloud_video provider configured (codec is OpenAI-compatible default, tweak per vendor)", "v1 does not push to Ozon"],
+        backing: ["/tools/ozon.video.create + get (bounded poller)", "resolve_capability(VideoGen)->Generic + endpoint_for/apply_auth"]
       }
     }
   },
