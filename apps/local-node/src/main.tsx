@@ -3907,26 +3907,26 @@ function buildCockpitNodes(c: LocalNodeCopy, sig: CockpitSignals): CockpitNode[]
     {
       id: 1,
       lane: "pipeline",
-      status: "partial",
+      status: "live",
       runtime: sig.ozon ? "ok" : sig.nodeUp ? "warn" : "off",
       title: m.m1.title,
       role: m.m1.role,
       next: m.m1.next,
       gaps: m.m1.gaps,
       backing: m.m1.backing,
-      chips: [chip(ch.ozonRead, sig.ozon ? "ok" : "gap"), chip(ch.excelReader, "gap"), chip(ch.dropImport, "gap")]
+      chips: [chip(ch.ozonRead, sig.ozon ? "ok" : "gap"), chip(ch.excelReader, "ok"), chip(ch.dropImport, "ok")]
     },
     {
       id: 2,
       lane: "pipeline",
-      status: "partial",
+      status: "live",
       runtime: sig.ozon && sig.posterReady ? "ok" : sig.nodeUp ? "warn" : "off",
       title: m.m2.title,
       role: m.m2.role,
       next: m.m2.next,
       gaps: m.m2.gaps,
       backing: m.m2.backing,
-      chips: [chip(ch.genChain, "ok"), chip(ch.adoptUi, "ok"), chip(ch.persist, "gap")]
+      chips: [chip(ch.genChain, "ok"), chip(ch.adoptUi, "ok"), chip(ch.persist, "ok")]
     },
     {
       id: 3,

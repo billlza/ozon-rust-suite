@@ -623,17 +623,17 @@ const zhCN = {
       },
       m1: {
         title: "产品输入",
-        role: "主流程起点 · 取旧品素材",
-        next: "把 Excel 读取器 + 拖拽入图接进前端，统一成一个「骨架」对象。",
-        gaps: ["前端拖拽入图路径", "Excel 读取器仍是 Python CLI", "统一骨架对象"],
-        backing: ["main.rs ozon.products.list / get(读取已通)", "tools/ozon-excel-core extract.py(未接入)"]
+        role: "主流程起点 · 取旧品素材(Ozon / Excel / 拖图)",
+        next: "可选:Excel 拖拽用磁盘路径(Tauri 暴露 file.path);把导入行打通推回。",
+        gaps: ["Excel 走磁盘路径(浏览器纯字节需 Tauri 暴露路径)", "导入行无 Ozon product_id,不参与推回"],
+        backing: ["ozon.products.list / get + /tools/ozon.relist.extract(读 Excel)", "/tools/ozon.relist.import-image(拖图托管)"]
       },
       m2: {
         title: "张大帅 · 验收",
-        role: "主流程 · AI 出图 + 逐项采用 + 推回",
-        next: "出图链已全通；把「采用」状态落地到本地(刷新不丢)。",
-        gaps: ["验收状态零持久化(刷新即丢)", "候选库 / 一品多候选"],
-        backing: ["main.rs ozon.relist.generate / push", "main.tsx 采用 UI + tasks / approvals"]
+        role: "主流程 · AI 出图(每品 3 候选)+ 逐项采用 + 推回",
+        next: "已端到端;可选:候选并行生成降延迟、候选去重。",
+        gaps: ["每品 3 候选串行,延迟 / 成本 ×3", "暂无候选去重"],
+        backing: ["main.rs relist.generate(候选 Vec)+ push", "main.tsx 候选选择 + adopt 本地持久化"]
       },
       m3: {
         title: "张小帅 · 文案",
@@ -1300,17 +1300,17 @@ const enUS: typeof zhCN = {
       },
       m1: {
         title: "Product Input",
-        role: "Pipeline start · pull old-product material",
-        next: "Wire the Excel reader + drag-drop import into the frontend, unified into one 'skeleton' object.",
-        gaps: ["Frontend drag-drop import path", "Excel reader still a Python CLI", "Unified skeleton object"],
-        backing: ["main.rs ozon.products.list / get (read works)", "tools/ozon-excel-core extract.py (not wired)"]
+        role: "Pipeline start · pull old-product material (Ozon / Excel / drop)",
+        next: "Optional: Excel drop uses a disk path (Tauri exposes file.path); wire imported rows into push.",
+        gaps: ["Excel intake is path-based (a plain-browser drop needs a Tauri-exposed path)", "Imported rows have no Ozon product_id, excluded from push"],
+        backing: ["ozon.products.list / get + /tools/ozon.relist.extract (read Excel)", "/tools/ozon.relist.import-image (host a dropped image)"]
       },
       m2: {
         title: "Zhang Dashuai · Acceptance",
-        role: "Pipeline · AI image gen + per-item adopt + push",
-        next: "Image chain is fully wired; persist the 'adopt' state locally (survive refresh).",
-        gaps: ["Acceptance state has zero persistence (lost on refresh)", "Candidate library / multiple candidates per product"],
-        backing: ["main.rs ozon.relist.generate / push", "main.tsx adopt UI + tasks / approvals"]
+        role: "Pipeline · AI image gen (3 candidates/product) + per-item adopt + push",
+        next: "End-to-end now; optional: parallel candidate generation, candidate de-dup.",
+        gaps: ["3 candidates per product are generated serially (3x latency/cost)", "No candidate de-dup yet"],
+        backing: ["main.rs relist.generate (candidate Vec) + push", "main.tsx candidate picker + local adopt persistence"]
       },
       m3: {
         title: "Zhang Xiaoshuai · Copy",
